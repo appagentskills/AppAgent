@@ -105,7 +105,7 @@ The tool does **NOT** touch the iframe. **The agent decides what to do.** Typica
 2. **Wait.** Google clears in ~2 min automatically. Sleep then re-invoke with `queries: <response>.remaining`.
 3. **Open the URL in the iframe panel** (heavyweight — only when the user needs a specific result *now*):
    ```
-   iframe_tool { action: "navigate", url: <blocked_url>, wait: true }
+   iframe_tool { action: "navigate", url: <blocked_url>, wait: true, tab_id: "new" }   // reuse the returned tab_id for get_visible_text
    ```
    For Google: the iframe runs on a different fingerprint so it usually shows real results. The agent can `get_visible_text` and parse manually as a one-off, then ideally re-invoke `web_search` after the cooldown.
    For DDG: ask the user to solve the duck CAPTCHA (`prompt_user`), then re-invoke with `queries: remaining`.

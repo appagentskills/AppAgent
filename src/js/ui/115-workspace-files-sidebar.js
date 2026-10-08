@@ -116,6 +116,7 @@ function _wsfRefreshOwnedRows() {
             try {
                 var rows = await getWorkspaceOwnedFileSummaries();
                 if (!Array.isArray(rows)) throw new Error('Workspace ownership snapshot unavailable');
+                rows = await _wsfDropIgnoredRows(rows);
                 var changed = JSON.stringify(rows) !== JSON.stringify(_wsfOwnedRows);
                 _wsfOwnedRows = rows;
                 if (changed && typeof renderVersionSidebar === 'function') renderVersionSidebar();
@@ -123,6 +124,24 @@ function _wsfRefreshOwnedRows() {
         } while (_wsfOwnedRerun);
     }).finally(function() { _wsfOwnedLoading = null; });
     return _wsfOwnedLoading;
+}
+// Gitignored paths (e.g. dist/ build output written by Reload/extension_build)
+// are not chat work: `workspace status` hides them by default and the cross-
+// chat lock exempts them. Apply the same local .gitignore filter
+// (wsGetIgnoreFilterLocal — never hydrates, no network) per workspace.
+async function _wsfDropIgnoredRows(rows) {
+    if (!Array.isArray(rows) || !rows.length || typeof wsGetIgnoreFilterLocal !== 'function') return rows;
+    var filters = Object.create(null);
+    for (var i = 0; i < rows.length; i++) {
+        var wk = rows[i].wsKey;
+        if (wk && !filters[wk]) {
+            try { filters[wk] = await wsGetIgnoreFilterLocal(wk); } catch (e) { filters[wk] = null; }
+        }
+    }
+    return rows.filter(function(r) {
+        var isIgnored = r.wsKey && filters[r.wsKey];
+        return !(typeof isIgnored === 'function' && isIgnored(r.path));
+    });
 }
 function _wsfOwnedForChat(chat) {
     if (_wsfOwnedRows === null && !_wsfOwnedLoading) _wsfRefreshOwnedRows();

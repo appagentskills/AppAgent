@@ -23,17 +23,21 @@ Everything below (and in `select2.md` / `native-inputs.md` / …) targets **ligh
 - **🔢 `match_count` is reliable on the current build:** `get_properties` pierces shadow, so `0` means **genuinely absent** (e.g. the editable fields are 0 on the read-only **Overview** tab — click **Details** first) and `N` means present. ⚠️ it **counts hidden matches**, so read the **`visible`** property for visibility. (*Historical:* an older build computed the count from a non-piercing `querySelectorAll` while resolving `properties` via piercing `findElement`, so `0` could be a false negative — that's fixed; this once made an attempt think selectors were dead and detour to coordinates.)
 - **🔑 Stable selectors only:** element ids (`now-id`, `form-field-…`, `tab_…`, option ids) are **regenerated every load** — anchor on **`aria-label`** / **`role`** / stable **`now-*` class** (`button.now-tab`, `input.now-input-native`, `button.now-select-trigger`, `input.now-typeahead-native-input`). Read a choice's value from the **trigger's `textContent`**, a text field's from **`.value`**. Full recipes (tabs/views, record picker, now-input/textarea, choice, pills, switch, grid row-open, read-back) live in **`now-experience.md`** — **no coordinates needed**.
 
-## ⚠️ ALWAYS pin the tab first (`tab_id`)
+## ⚠️ `tab_id` is REQUIRED on every browser call
 
-Without a pinned tab, `iframe_tool` can silently read the **WRONG browser tab** — observed live: `get_visible_text` returned an unrelated GitHub page instead of the incident form. Every driver script MUST pin its tab:
+Every `iframe_tool` browser action (everything except widget actions with `widget_id`, and `close`) and every `take_screenshot` with `target: "browser"` / `"element"` **must** pass an explicit `tab_id` — there is **no fallback** to the active tab or a remembered chat tab; a missing id is an error.
 
-1. `list_instances` → read `activeTabs[].id` for the instance.
-2. The `navigate` result **message contains the tab id** ("…background tab (id N)") — capture it.
-3. Pass `tab_id` on **EVERY** subsequent call — bake it into the helper so it can't be forgotten:
+1. `list_instances` → pick `instances[].activeTabs[].id` for the instance — or `navigate` with `tab_id: "new"` to open a fresh background tab (`"new"` is valid **only** on navigate).
+2. Every result carries **`tab_id`** — capture it from the navigate result and reuse it.
+3. Bake it into the helper so it can't be forgotten:
    ```javascript
+   const nav = await executeTool("iframe_tool", {instance, action: "navigate", url, wait: true, tab_id: "new"});
+   const TAB = nav.tab_id;
    const ift = a => executeTool("iframe_tool", Object.assign({instance, tab_id: TAB}, a));
+   const shot = name => executeTool("take_screenshot", {target: "browser", tab_id: TAB, name});
    ```
-4. If reads look unrelated to the page you think you're on → **STOP**, `list_instances` (it always re-probes live; `refresh` is a deprecated no-op), re-pin.
+4. The agent's own tab (`selfTabId` / `extensionTabs` from `list_instances`) can be read and screenshotted but **never navigated** (that would unload the agent UI).
+5. A "not an open tab" error means the tab was closed → `list_instances` (it always re-probes live) and pick a current id, or navigate with `tab_id: "new"`.
 
 ## The approach: write a disposable driver script each time
 

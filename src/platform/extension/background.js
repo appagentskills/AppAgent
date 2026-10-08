@@ -1764,6 +1764,14 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
 
     // Side panel requests browser action -> forward to content script in active tab
     if (message.type === 'browser-action') {
+        // Every browser action except 'close' needs an explicit target tab. There is
+        // deliberately NO fallback to the active tab (it silently hijacked whatever
+        // tab the user happened to be looking at).
+        if (message.action !== 'close' && !(typeof message.targetTabId === 'number' && isFinite(message.targetTabId))
+            && !(message.action === 'navigate' && message.targetTabId === 'new')) {
+            sendResponse({ error: BROWSER_ACTION_TAB_REQUIRED_ERROR });
+            return;
+        }
         if (message.action === 'navigate') {
             handleNavigate(message.args, message.targetTabId, sendResponse);
             return true;
@@ -1777,9 +1785,12 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
         if (message.action === 'resize') {
             (async function() {
                 try {
-                    var tabId = message.targetTabId || await getActiveTabId();
-                    if (!tabId) { sendResponse({ error: 'No tab found.' }); return; }
-                    var tab = await chrome.tabs.get(tabId);
+                    var tabId = message.targetTabId;
+                    var tab;
+                    try { tab = await chrome.tabs.get(tabId); } catch (_rtErr) {
+                        sendResponse({ error: 'tab_id ' + tabId + ' is not an open tab. Get a current id from list_instances (instances[].activeTabs[].id) or a previous result.' });
+                        return;
+                    }
                     var win = await chrome.windows.get(tab.windowId);
                     // Compensate for chrome UI + sidebar: window size - tab viewport = overhead
                     var overheadW = win.width - (tab.width || 0);
@@ -1816,33 +1827,33 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
                             });
                         } catch(e) {}
                     }
-                    sendResponse({ success: true, actualWidth: actualW, actualHeight: actualH, emulated: emulated });
+                    sendResponse({ success: true, tabId: tabId, actualWidth: actualW, actualHeight: actualH, emulated: emulated });
                 } catch(e) { sendResponse({ error: e.message }); }
             })();
             return true;
         }
 
         if (message.action === 'close') {
+            // An explicit tab id means "close that Chrome tab": remove it for real and
+            // only report success once it is gone. Without one, close stays the
+            // legacy no-op (the page side collapses the side panel).
+            if (typeof message.targetTabId === 'number' && isFinite(message.targetTabId)) {
+                handleCloseTab(message.targetTabId, sendResponse);
+                return true;
+            }
             sendResponse({ success: true });
             return;
         }
 
-        // Forward to content script in chat's target tab (or active tab as fallback)
+        // Forward to content script in the explicit target tab (no active-tab fallback)
         (async function() {
-            var tabId = null;
-            if (message.targetTabId) {
-                try { await chrome.tabs.get(message.targetTabId); tabId = message.targetTabId; } catch(e) {
-                    sendResponse({ error: 'Target tab was closed. Use navigate to open a new page.' });
-                    return;
-                }
-            } else {
-                tabId = await getActiveTabId();
-            }
-            if (!tabId) {
-                sendResponse({ error: 'No active tab found.' });
+            var tabId = message.targetTabId;
+            try { await chrome.tabs.get(tabId); } catch(e) {
+                sendResponse({ error: 'tab_id ' + tabId + ' is not an open tab (it may have been closed). Get a current id from list_instances (instances[].activeTabs[].id) or use navigate with tab_id:"new".' });
                 return;
             }
             chrome.tabs.sendMessage(tabId, message, function(response) {
+                if (response && typeof response === 'object' && response.tabId == null) response.tabId = tabId;
                 if (chrome.runtime.lastError) {
                     // Content script not injected (e.g. extension reloaded) — inject and retry once
                     injectAgentScripts(tabId).then(function() {
@@ -1850,6 +1861,7 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
                             if (chrome.runtime.lastError) {
                                 sendResponse({ error: chrome.runtime.lastError.message });
                             } else {
+                                if (resp2 && typeof resp2 === 'object' && resp2.tabId == null) resp2.tabId = tabId;
                                 sendResponse(resp2);
                             }
                         });
@@ -2198,6 +2210,47 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
 
 // --- Navigation handlers ---
 
+var BROWSER_ACTION_TAB_REQUIRED_ERROR = 'tab_id is required for browser actions (no fallback to the active tab). '
+    + 'Get ids from list_instances (instances[].activeTabs[].id; selfTabId / extensionTabs for the agent\'s own tab), '
+    + 'reuse the tabId returned by a previous browser action, or use navigate with tab_id:"new" to open a new tab.';
+var OWN_TAB_NAVIGATE_ERROR = 'Refusing to navigate the extension\'s own tab (it would unload the agent UI). '
+    + 'Pick another tab_id from list_instances, or use navigate with tab_id:"new". Screenshots and reads of the own tab are allowed.';
+
+function isExtensionOwnTabUrl(u) {
+    if (!u || typeof u !== 'string') return false;
+    try {
+        var _base = chrome.runtime.getURL('');
+        return !!_base && u.indexOf(_base) === 0;
+    } catch (e) { return false; }
+}
+
+// Close an explicit Chrome tab. Refuses the extension's own tab; responds with
+// success only after chrome.tabs.get confirms the tab no longer exists.
+async function handleCloseTab(targetTabId, sendResponse) {
+    var tab;
+    try { tab = await chrome.tabs.get(targetTabId); } catch (e) { tab = null; }
+    if (!tab) {
+        sendResponse({ error: 'tab_id ' + targetTabId + ' is not an open tab (it may already be closed). Get a current id from list_instances (instances[].activeTabs[].id).' });
+        return;
+    }
+    if (isExtensionOwnTabUrl(tab.url || tab.pendingUrl)) {
+        sendResponse({ error: 'Refusing to close tab ' + targetTabId + ': it is the extension\'s own tab (closing it would kill the agent UI).' });
+        return;
+    }
+    try { await chrome.tabs.remove(targetTabId); } catch (e) {
+        sendResponse({ error: 'Failed to close tab ' + targetTabId + ': ' + ((e && e.message) || e) });
+        return;
+    }
+    var still = null;
+    try { still = await chrome.tabs.get(targetTabId); } catch (e) { still = null; }
+    if (still) {
+        sendResponse({ error: 'chrome.tabs.remove(' + targetTabId + ') returned but the tab is still open.' });
+        return;
+    }
+    sendResponse({ success: true, closed: true, tabId: targetTabId, message: 'Closed tab ' + targetTabId });
+}
+// --- end handleCloseTab ---
+
 async function handleNavigate(args, targetTabId, sendResponse) {
     if (!args || !args.url) { sendResponse({ error: 'Missing url argument.' }); return; }
     var url = args.url;
@@ -2211,18 +2264,31 @@ async function handleNavigate(args, targetTabId, sendResponse) {
         url = data.instanceUrl + url;
     }
 
-    // Use chat's target tab if provided, otherwise fall back to active tab
+    // Explicit target only: a numeric tab id, or 'new' to open a fresh background tab.
+    // No fallback to the active tab.
     var tabId = null;
-    if (targetTabId) {
-        try { await chrome.tabs.get(targetTabId); tabId = targetTabId; } catch(e) {
-            sendResponse({ error: 'Target tab was closed. Use navigate to open a new page.' });
+    var _openedNew = false;
+    if (targetTabId === 'new') {
+        try {
+            var _newTab = await chrome.tabs.create({ url: 'about:blank', active: false });
+            tabId = _newTab.id;
+            _openedNew = true;
+        } catch (e) {
+            sendResponse({ error: 'Could not open a new tab: ' + (e && e.message || e) });
+            return;
+        }
+    } else if (typeof targetTabId === 'number' && isFinite(targetTabId)) {
+        var _navTarget;
+        try { _navTarget = await chrome.tabs.get(targetTabId); tabId = targetTabId; } catch(e) {
+            sendResponse({ error: 'tab_id ' + targetTabId + ' is not an open tab (it may have been closed). Get a current id from list_instances (instances[].activeTabs[].id) or use tab_id:"new".' });
+            return;
+        }
+        if (isExtensionOwnTabUrl(_navTarget && (_navTarget.url || _navTarget.pendingUrl))) {
+            sendResponse({ error: OWN_TAB_NAVIGATE_ERROR });
             return;
         }
     } else {
-        tabId = await getActiveTabId();
-    }
-    if (!tabId) {
-        sendResponse({ error: 'No active tab found.' });
+        sendResponse({ error: BROWSER_ACTION_TAB_REQUIRED_ERROR });
         return;
     }
 
@@ -2266,7 +2332,7 @@ async function handleNavigate(args, targetTabId, sendResponse) {
         }
         if (_waitMs <= 0) {
             // Fire-and-forget: response immediately, listener will inject on complete
-            sendResponse({ success: true, tabId: tab.id, url: url });
+            sendResponse({ success: true, tabId: tab.id, url: url, openedNewTab: _openedNew || undefined });
             return;
         }
         // Wait for page to finish loading (with timeout + same-URL fallback)
@@ -2274,12 +2340,12 @@ async function handleNavigate(args, targetTabId, sendResponse) {
             if (_waitResolved) return;
             _waitResolved = true;
             _navCleanup();
-            sendResponse({ success: true, tabId: tab.id, url: url, timedOut: true });
+            sendResponse({ success: true, tabId: tab.id, url: url, timedOut: true, openedNewTab: _openedNew || undefined });
         }, _waitMs);
         _waitResolve = function(reason) {
             clearTimeout(_to);
             clearTimeout(_sameUrlCheck);
-            sendResponse({ success: true, tabId: tab.id, url: url });
+            sendResponse({ success: true, tabId: tab.id, url: url, openedNewTab: _openedNew || undefined });
         };
         if (_completeFired) { _waitResolved = true; _waitResolve('complete'); return; }
         // Same-URL no-op detection: if after 1.5s no 'loading' event has fired AND
@@ -2312,13 +2378,51 @@ async function injectAgentScripts(tabId) {
 }
 
 async function handleScreenshot(targetTabId, sendResponse) {
+    // Remember what had focus BEFORE we activate/focus anything for the
+    // capture, so we can hand focus back afterwards (the user's previously
+    // active tab in each touched window + the previously focused window).
+    var _prevActiveByWindow = {};
+    var _prevFocusedWindowId = null;
+    try {
+        var _lf = await chrome.windows.getLastFocused();
+        if (_lf && _lf.focused) _prevFocusedWindowId = _lf.id;
+    } catch (e) {}
+    var _rememberActive = async function(winId) {
+        if (winId == null || Object.prototype.hasOwnProperty.call(_prevActiveByWindow, winId)) return;
+        try {
+            var _a = await chrome.tabs.query({ active: true, windowId: winId });
+            _prevActiveByWindow[winId] = (_a && _a[0]) ? _a[0].id : null;
+        } catch (e) { _prevActiveByWindow[winId] = null; }
+    };
+    var _restoreFocus = async function(capturedWindowId) {
+        var _wins = Object.keys(_prevActiveByWindow);
+        for (var _i = 0; _i < _wins.length; _i++) {
+            var _prevTabId = _prevActiveByWindow[_wins[_i]];
+            if (_prevTabId == null) continue;
+            try {
+                var _cur = await chrome.tabs.query({ active: true, windowId: Number(_wins[_i]) });
+                if (!_cur || !_cur[0] || _cur[0].id !== _prevTabId) {
+                    await chrome.tabs.update(_prevTabId, { active: true });
+                }
+            } catch (e) { /* previous tab may have been closed */ }
+        }
+        if (_prevFocusedWindowId != null && _prevFocusedWindowId !== capturedWindowId) {
+            try { await chrome.windows.update(_prevFocusedWindowId, { focused: true }); } catch (e) {}
+        }
+    };
+    var _capWindowId = null;
     try {
         var windowId = null;
         var tabWidth = 1280, tabHeight = 900;
         var targetTab = null;
 
-        // Ensure chat's target tab is active and visible before capture
-        if (targetTabId) {
+        // Explicit target tab only (no active-tab fallback). The extension's own
+        // tab is a valid target. Ensure it is active and visible before capture.
+        if (!(typeof targetTabId === 'number' && isFinite(targetTabId))) {
+            sendResponse({ error: BROWSER_ACTION_TAB_REQUIRED_ERROR });
+            return;
+        }
+        {
             try {
                 targetTab = await chrome.tabs.get(targetTabId);
                 windowId = targetTab.windowId;
@@ -2326,6 +2430,7 @@ async function handleScreenshot(targetTabId, sendResponse) {
                 tabHeight = targetTab.height || 900;
 
                 if (!targetTab.active) {
+                    await _rememberActive(windowId);
                     await chrome.tabs.update(targetTabId, { active: true });
                     // Wait for tab activation event, then a short compositing delay
                     await new Promise(function(resolve) {
@@ -2344,23 +2449,17 @@ async function handleScreenshot(targetTabId, sendResponse) {
                     });
                 }
             } catch(e) {
-                sendResponse({ error: 'Target tab was closed. Use navigate to open a new page.' });
+                sendResponse({ error: 'tab_id ' + targetTabId + ' is not an open tab (it may have been closed). Get a current id from list_instances (instances[].activeTabs[].id, selfTabId for the agent\'s own tab).' });
                 return;
             }
         }
 
-        var tabUrl = '', tabTitle = '';
-        if (targetTabId) {
-            tabUrl = targetTab.url || ''; tabTitle = targetTab.title || '';
-        } else {
-            var aid = await getActiveTabId();
-            if (aid) { try { var at = await chrome.tabs.get(aid); tabUrl = at.url || ''; tabTitle = at.title || ''; } catch(e) {} }
-        }
+        var tabUrl = targetTab.url || '', tabTitle = targetTab.title || '';
         // Cold-start: on the very first capture the activeTab permission may not
         // be in effect yet ('activeTab permission is not in effect'). Proactively
         // focus the target window, and on that specific error re-activate+focus
         // the tab and retry once.
-        var _capWindowId = windowId;
+        _capWindowId = windowId;
         var _doCapture = async function() {
             try { if (_capWindowId != null) await chrome.windows.update(_capWindowId, { focused: true }); } catch (e) {}
             return await chrome.tabs.captureVisibleTab(_capWindowId, { format: 'png' });
@@ -2372,10 +2471,11 @@ async function handleScreenshot(targetTabId, sendResponse) {
             var _capMsg = (capErr && capErr.message) || String(capErr);
             if (/activeTab|not in effect/i.test(_capMsg)) {
                 try {
-                    var _capTabId = targetTabId || await getActiveTabId();
-                    if (_capTabId) {
-                        await chrome.tabs.update(_capTabId, { active: true });
+                    var _capTabId = targetTabId;
+                    {
                         var _capTab = await chrome.tabs.get(_capTabId);
+                        await _rememberActive(_capTab.windowId);
+                        await chrome.tabs.update(_capTabId, { active: true });
                         _capWindowId = _capTab.windowId;
                         await chrome.windows.update(_capWindowId, { focused: true });
                     }
@@ -2386,8 +2486,10 @@ async function handleScreenshot(targetTabId, sendResponse) {
                 throw capErr;
             }
         }
-        sendResponse({ success: true, base64: dataUrl, width: tabWidth, height: tabHeight, url: tabUrl, title: tabTitle });
+        await _restoreFocus(_capWindowId);
+        sendResponse({ success: true, tabId: targetTabId, base64: dataUrl, width: tabWidth, height: tabHeight, url: tabUrl, title: tabTitle });
     } catch (e) {
+        await _restoreFocus(_capWindowId);
         sendResponse({ error: 'Screenshot failed: ' + e.message });
     }
 }
@@ -5887,7 +5989,8 @@ var ANTHROPIC_THINKING_BINDING_BETAS = ['thinking-binding-controls-2026-08-01', 
 // (ADAPTIVE_ONLY_CLAUDE_RE / isAdaptiveOnlyClaude in src/js/core/030-config.js,
 // loaded here via importScripts('sw-bundle.js') like isFable51Plus) is a
 // superset of this — transformToAnthropic ORs the two. Anything else
-// (Sonnet/Opus ≤4.5, Haiku, 3.x) is treated as LEGACY and gets budget-style
+// (Sonnet/Opus ≤4.5, Haiku 4.x, 3.x — Haiku 5.5+ is adaptive-only and comes
+// in via ADAPTIVE_ONLY_CLAUDE_RE) is treated as LEGACY and gets budget-style
 // thinking:{type:'enabled', budget_tokens} — deliberately conservative: a
 // budget is accepted by every pre-adaptive model, `adaptive` is not.
 var ADAPTIVE_CAPABLE_CLAUDE_RE = /claude-(?:opus|sonnet)-4[.-](?:[6-9]|\d{2,})/;
@@ -5996,11 +6099,15 @@ function transformToAnthropic(body) {
     if (body.tools && body.tools.length > 0) {
         result.tools = body.tools.map(function(t) {
             if (t.type === 'function' && t.function) {
-                return {
+                var at = {
                     name: t.function.name,
                     description: t.function.description || '',
                     input_schema: t.function.parameters || { type: 'object', properties: {} }
                 };
+                // Carry the tools-block breakpoint (set on the last tool by
+                // callOpenRouterStreaming) — it was silently dropped before.
+                if (t.cache_control) at.cache_control = t.cache_control;
+                return at;
             }
             return t;
         });
@@ -6030,7 +6137,9 @@ function transformToAnthropic(body) {
     //                 adaptive object below. Sonnet 5.5+ on this OAuth path DOES
     //                 receive it and maps it to {type:'between_tools'} via
     //                 thinkingOffShapeFor — the only bound model with an off-ish
-    //                 mode. Never 'disabled' for any bound model.
+    //                 mode. Haiku 5.5+ also receives it (both paths) and maps
+    //                 it to {type:'disabled'} (valid at effort ≤ high). Never
+    //                 'disabled' for any other bound model.
     var thinkingBound = isThinkingBindingModel(body.model);
     var thinkingOff = !!(body.reasoning && body.reasoning.enabled === false);
     var effort = (body.reasoning && !thinkingOff) ? body.reasoning.effort : null;
@@ -6048,7 +6157,10 @@ function transformToAnthropic(body) {
     // Never 'disabled'.
     var offShape = (thinkingOff && typeof thinkingOffShapeFor === 'function')
         ? thinkingOffShapeFor(modelLower, body.reasoning.effort) : null;
-    if (thinkingBound && offShape && offShape.type === 'between_tools') {
+    // Haiku 5.5+ (thinkingOffShapeFor → {type:'disabled'}, accepted at effort
+    // ≤ high): same handling — bare shape (no display/block_binding) and the
+    // same prefix-stable strip of replayed earlier-turn thinking.
+    if (thinkingBound && offShape && (offShape.type === 'between_tools' || offShape.type === 'disabled')) {
         result.thinking = offShape;
         stripReplayedThinkingBeforeLastUserTurn(merged);
     } else if (thinkingBound) {
@@ -6099,8 +6211,66 @@ function transformToAnthropic(body) {
         else if (budget) result.output_config = { effort: 'high' };
     }
 
+    capAnthropicCacheBreakpoints(result);
     result.metadata = { user_id: 'appagent_extension' };
     return result;
+}
+
+// Final safety cap on an Anthropic Messages body: at most
+// ANTHROPIC_MAX_CACHE_BREAKPOINTS (core/030-config.js; 4 = API limit, a 5th
+// is a 400) cache_control markers across tools + system + messages.
+// Keep priority: stable prefix (tools, system — earliest first), then the
+// last message's marker, then the remaining message markers most-recent
+// first; drop the rest. Then enforce the mixed-TTL rule (a 1h entry must
+// not follow a 5m one) by downgrading any later 1h marker to 5m.
+// Mutates and returns body.
+function capAnthropicCacheBreakpoints(body) {
+    if (!body) return body;
+    var max = (typeof ANTHROPIC_MAX_CACHE_BREAKPOINTS === 'number') ? ANTHROPIC_MAX_CACHE_BREAKPOINTS : 4;
+    var marks = []; // prefix order: { holder, stable, msgIdx }
+    (Array.isArray(body.tools) ? body.tools : []).forEach(function(t) {
+        if (t && t.cache_control) marks.push({ holder: t, stable: true, msgIdx: -1 });
+    });
+    (Array.isArray(body.system) ? body.system : []).forEach(function(b) {
+        if (b && b.cache_control) marks.push({ holder: b, stable: true, msgIdx: -1 });
+    });
+    (Array.isArray(body.messages) ? body.messages : []).forEach(function(m, mi) {
+        if (!m || !Array.isArray(m.content)) return;
+        m.content.forEach(function(b) {
+            if (!b || typeof b !== 'object') return;
+            if (b.cache_control) marks.push({ holder: b, stable: false, msgIdx: mi });
+            if (Array.isArray(b.content)) b.content.forEach(function(nb) { // tool_result inner blocks
+                if (nb && typeof nb === 'object' && nb.cache_control) marks.push({ holder: nb, stable: false, msgIdx: mi });
+            });
+        });
+    });
+    if (marks.length > max) {
+        var lastMsg = (Array.isArray(body.messages) ? body.messages.length : 0) - 1;
+        var order = [];
+        marks.forEach(function(k) { if (k.stable) order.push(k); });
+        for (var i = marks.length - 1; i >= 0; i--) {
+            if (!marks[i].stable && marks[i].msgIdx === lastMsg) { order.push(marks[i]); break; }
+        }
+        for (var j = marks.length - 1; j >= 0; j--) {
+            if (!marks[j].stable && order.indexOf(marks[j]) === -1) order.push(marks[j]);
+        }
+        var keep = order.slice(0, max);
+        marks = marks.filter(function(k) {
+            if (keep.indexOf(k) !== -1) return true;
+            delete k.holder.cache_control;
+            return false;
+        });
+    }
+    var seenShort = false;
+    marks.forEach(function(k) {
+        var cc = k.holder.cache_control;
+        if (cc.ttl === '1h') {
+            if (seenShort) { var c2 = Object.assign({}, cc); delete c2.ttl; k.holder.cache_control = c2; }
+        } else {
+            seenShort = true;
+        }
+    });
+    return body;
 }
 
 // One stored reasoning_details entry → Anthropic thinking block, or null when

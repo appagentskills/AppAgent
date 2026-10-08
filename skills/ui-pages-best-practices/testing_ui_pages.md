@@ -8,11 +8,13 @@ Define the test scenarios for the UI page before starting to test. What should t
 
 ## Available Tools
 
+> **`tab_id` is REQUIRED** on every `iframe_tool` browser action and on `take_screenshot` `target: "browser"`/`"element"` (no active-tab fallback). Get it from `list_instances` (`instances[].activeTabs[].id`) or open a tab with `navigate` + `tab_id: "new"` and reuse the returned `tab_id`. Never navigate the agent's own tab (`selfTabId`).
+
 ### Inspection Tools
 
 | Tool | Action | Description |
 |------|--------|-------------|
-| `take_screenshot` | - | Capture a real PNG screenshot for visual analysis |
+| `take_screenshot` | - | Capture a real PNG screenshot for visual analysis (`target: "browser"` + `tab_id`) |
 | `iframe_tool` | `get_visible_text` | Extract visible text content. Use `deep: true` for structured output with rect, selector, id |
 | `iframe_tool` | `get_dom` | Get the full DOM/HTML structure of the page |
 | `iframe_tool` | `get_console_logs` | Get browser console log output |
@@ -23,7 +25,7 @@ Define the test scenarios for the UI page before starting to test. What should t
 
 | Tool | Action | Description |
 |------|--------|-------------|
-| `iframe_tool` | `navigate` | Open a URL in the browser panel |
+| `iframe_tool` | `navigate` | Open a URL in the tab given by `tab_id` (`"new"` opens a tab; the result carries its `tab_id`) |
 | `iframe_tool` | `click` | Click an element by CSS selector |
 | `iframe_tool` | `fill` | Fill an input field by CSS selector and value |
 | `iframe_tool` | `select_option` | Select a dropdown option by `value` or visible `text` |
@@ -47,8 +49,8 @@ Define the test scenarios for the UI page before starting to test. What should t
 Navigate to the UI page and capture it visually:
 
 ```
-iframe_tool({ action: "navigate", url: "/<page_name>.do" })
-take_screenshot()
+TAB = iframe_tool({ action: "navigate", url: "/<page_name>.do", tab_id: "new" }).tab_id   // or an existing instance tab id; reuse TAB below
+take_screenshot({ target: "browser", tab_id: TAB })
 ```
 
 Verify that the page loads correctly and displays the expected content.
@@ -86,11 +88,11 @@ After form submissions, use `servicenow_api` to query the target table and confi
 Use `resize` with presets to check different viewport sizes:
 
 ```
-iframe_tool({ action: "resize", preset: "mobile" })
-take_screenshot()
-iframe_tool({ action: "resize", preset: "tablet" })
-take_screenshot()
-iframe_tool({ action: "resize", preset: "desktop" })
+iframe_tool({ action: "resize", preset: "mobile", tab_id: TAB })
+take_screenshot({ target: "browser", tab_id: TAB })
+iframe_tool({ action: "resize", preset: "tablet", tab_id: TAB })
+take_screenshot({ target: "browser", tab_id: TAB })
+iframe_tool({ action: "resize", preset: "desktop", tab_id: TAB })
 ```
 
 ### 6. Fix Issues Found

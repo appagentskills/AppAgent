@@ -34,7 +34,18 @@ function navigateIframe(url) {
     if (browserUrl) browserUrl.value = url;
 
     var resolvedUrl = Platform.resolveUrl(url);
-    Platform.sendBrowserAction('navigate', { url: resolvedUrl }).catch(function(e) {
-        console.warn('Navigation error:', e.message);
+    // User-driven (sidepanel URL bar): target the tab the user is looking at,
+    // resolved here explicitly — background.js no longer falls back to it.
+    (async function() {
+        var _tabId = null;
+        try {
+            var _act = await chrome.tabs.query({ active: true, currentWindow: true });
+            if (_act && _act[0]) _tabId = _act[0].id;
+        } catch (e) {}
+        if (_tabId == null) { console.warn('Navigation error: no active tab'); return; }
+        var _r = await Platform.sendBrowserAction('navigate', { url: resolvedUrl }, _tabId);
+        if (_r && _r.error) console.warn('Navigation error:', _r.error);
+    })().catch(function(e) {
+        console.warn('Navigation error:', e && e.message);
     });
 }

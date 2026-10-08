@@ -1,6 +1,23 @@
 # Changelog
 
+## v1.1.36
+
+### New
+- OpenRouter presets updated to GLM 5.3 and Gemini 3.8 Flash.
+- Browser actions and screenshots now target an explicit tab.
+
+### Fixes
+- Screenshots restore the previously focused tab and window.
+- Closing a browser tab by ID now closes the Chrome tab.
+- Image loading in scripts no longer hangs.
+- Better prompt caching for Anthropic models.
+
+---
+
 ## v1.1.35
+
+### New
+- Claude Haiku 5.5 is available (Claude login and OpenRouter), with its adaptive thinking and 128K output handled automatically.
 
 ### Fixes
 - Dev-tier instances no longer prompt for approval on calls targeting them.

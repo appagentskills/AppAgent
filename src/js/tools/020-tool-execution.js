@@ -222,6 +222,36 @@ async function _validModelImageRows(rows, resultObj) {
     return out;
 }
 
+// list_instances helper: the extension's own tabs + selfTabId (the full-tab
+// app page hosting the agent UI). selfTabId: chrome.tabs.getCurrent() when
+// this code runs inside that tab; null in the sidepanel; otherwise (SW /
+// offscreen) the single plain app.html?mode=tab page if exactly one is open,
+// else null. Never throws.
+async function _liExtensionTabInfo() {
+    var out = { selfTabId: null, extensionTabs: [] };
+    try {
+        if (typeof chrome === 'undefined' || !chrome || !chrome.tabs || !chrome.runtime || typeof chrome.runtime.getURL !== 'function') return out;
+        var base = chrome.runtime.getURL('');
+        var all = (typeof chrome.tabs.query === 'function') ? (await chrome.tabs.query({})) : [];
+        var plain = [];
+        (all || []).forEach(function(t) {
+            var u = t && t.id != null ? String(t.url || t.pendingUrl || '') : '';
+            if (!base || u.indexOf(base) !== 0) return;
+            out.extensionTabs.push({ id: t.id, title: t.title || '', url: u, active: !!t.active, windowId: t.windowId });
+            if (/app\.html\?(.*&)?mode=tab(&|$)/.test(u) && !/[?&](widget|doc|standalone)=|print/i.test(u)) plain.push(t.id);
+        });
+        var cur = null;
+        if (typeof chrome.tabs.getCurrent === 'function') {
+            try { cur = await chrome.tabs.getCurrent(); } catch (e) { cur = null; }
+        }
+        var inSidepanel = false;
+        try { inSidepanel = typeof document !== 'undefined' && document && document.body && document.body.classList && document.body.classList.contains('sidepanel-mode'); } catch (e) {}
+        if (cur && cur.id != null) out.selfTabId = cur.id;
+        else if (!inSidepanel && plain.length === 1) out.selfTabId = plain[0];
+    } catch (e) { /* unknown → defaults */ }
+    return out;
+}
+
 // Execute set_chat_title tool
 // SW context: currentChatId is always null (page-only global). Threading the
 // chatId through options lets the agent loop tell us which chat to title;
@@ -2177,8 +2207,15 @@ async function _executeToolInner(name, args, messageIndex, options) {
                 } catch (e) { _liFresh[inst.url] = { error: 'roles lookup failed: ' + (e && e.message) }; }
             }));
         }
+        // The extension's own tabs (app.html pages) and selfTabId = the tab hosting
+        // this agent UI in full-tab mode (null in the sidepanel / unknown). Browser
+        // actions REQUIRE an explicit tab_id; the own tab may be screenshotted /
+        // read but never navigated.
+        var _liExt = await _liExtensionTabInfo();
         return {
             success: true,
+            selfTabId: _liExt.selfTabId,
+            extensionTabs: _liExt.extensionTabs,
             instances: Platform.instances.filter(function(inst) { return !_liDisabledMap[_liNorm(inst.url)]; }).map(function(inst) {
                 var _fr = _liFresh[inst.url];
                 if (_fr) return {
@@ -2623,8 +2660,9 @@ async function _executeToolInner(name, args, messageIndex, options) {
     } else if (name === 'servicenow_diff_edit') {
         return await executeDiffEdit(args, messageIndex, options);
     } else if (name === 'iframe_tool') {
-        // Pass options so the RUNNING chat (options.chatId, set by the offscreen
-        // exec-tool bridge) is used for targetTabId routing — not the VIEWED chat.
+        // Browser actions target ONLY the explicit args.tab_id (validated in
+        // executeIframeTool); options carries the running chat id for chat-scoped
+        // bookkeeping only — chats no longer pin a tab.
         return await executeIframeTool(args, options);
     } else if (name === 'set_chat_title') {
         return executeSetChatTitle(args, options);
@@ -3358,7 +3396,7 @@ async function _wsConflictDecision(wk, filePath, file, chatId, force) {
     if (filePath) {
         try {
             var isIgnored = await wsGetIgnoreFilter(wk);
-            if (isIgnored(filePath)) return { block: null, warn: null }; // gitignored: never gated, never marked force-taken
+            if (isIgnored(filePath)) return { block: null, warn: null, ignored: true }; // gitignored: never gated, never marked force-taken
         } catch (e) { /* ignore filter failure — fall through to normal check */ }
     }
     if (force) {
@@ -4047,8 +4085,10 @@ async function wsWrite(repo, filePath, content, chatId, chatTitle, force) {
         // #1079: a write after a push leaves the PR stamp but flags the row
         // as diverged from what was pushed (badge "changed since push").
         changed_since_push: (existing && !wasDeleted && existing.pushed_pr) ? ((existing.changed_since_push || content !== existing.content) ? true : null) : null,
-        last_modified_by_chat_id: _isDirty ? (chatId || null) : null,
-        last_modified_by_chat_title: _isDirty ? (chatTitle || null) : null,
+        // Gitignored output (e.g. dist/ from extension_build) is not chat
+        // work: never stamp ownership on it (sidebar / sub-agent handoff).
+        last_modified_by_chat_id: (_isDirty && !_wWriteDecision.ignored) ? (chatId || null) : null,
+        last_modified_by_chat_title: (_isDirty && !_wWriteDecision.ignored) ? (chatTitle || null) : null,
         last_modified_at: _isDirty ? Date.now() : null,
         force_taken_from: _isDirty ? _wsNextForceTakenFrom(_wWriteDecision, existing && existing.force_taken_from, chatId) : null
     });

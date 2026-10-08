@@ -866,11 +866,8 @@ async function screenshotUIPage(pageName) {
         chrome.tabs.onUpdated.addListener(onUpdated);
         var fb = setTimeout(function() { chrome.tabs.onUpdated.removeListener(onUpdated); resolve(); }, 8000);
     });
-    var chat = chats[currentChatId];
-    var origTabId = chat && chat.targetTabId;
-    if (chat) chat.targetTabId = tab.id;
-    var result = await Platform.sendBrowserAction('take_screenshot', {});
-    if (chat) chat.targetTabId = origTabId;
+    // Capture the temp tab explicitly (chats no longer store a linked tab).
+    var result = await Platform.sendBrowserAction('take_screenshot', {}, tab.id);
     try { chrome.tabs.remove(tab.id); } catch(e) {}
     if (result.error) { showSnackbar(t('Screenshot failed'), 'error'); return; }
     var link = document.createElement('a');

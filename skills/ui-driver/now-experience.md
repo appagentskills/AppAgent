@@ -87,7 +87,9 @@ A recently-visited (warm/cached) record re-hydrates in **~7 s**. So **poll a rea
 > ⚠️ **Resize the viewport BEFORE navigating.** Verified live: at the default (small) iframe size a **cold** workspace load served the text wave but **never mounted the interactive wave** (>110s, `button.now-tab` stayed 0, and the List→record round-trip didn't unstick it); after `iframe_tool resize preset:"fullhd"` and a fresh `navigate`, the same record hydrated in **7s**. Make `resize` (desktop/fullhd) the first step of any workspace session.
 
 ```javascript
-async function ift(a){ return await executeTool("iframe_tool", Object.assign({status_message:"x"}, a)); }
+// tab_id is REQUIRED on every browser action: TAB = list_instances instances[].activeTabs[].id, or the tab_id returned by
+// executeTool("iframe_tool", {action:"navigate", url, wait:true, tab_id:"new"}). Reuse it for every call (resize/navigate included).
+async function ift(a){ return await executeTool("iframe_tool", Object.assign({status_message:"x", tab_id:TAB}, a)); }
 async function gp(sel){ const r = await ift({action:"get_properties", selector:sel}); return { n:r.match_count||0, p:r.properties||null }; }
 const sleep = ms => new Promise(r=>setTimeout(r, ms));
 
@@ -236,7 +238,8 @@ const after  = (await gp(SW)).p.checked;
 
 ## 8. Verified helper block (copy into your `js_eval`)
 ```javascript
-async function ift(a){ return await executeTool("iframe_tool", Object.assign({status_message:"drive"}, a)); }
+// TAB = an explicit tab id (list_instances activeTabs[].id, or the tab_id returned by navigate with tab_id:"new") — required.
+async function ift(a){ return await executeTool("iframe_tool", Object.assign({status_message:"drive", tab_id:TAB}, a)); }
 const sleep = ms => new Promise(r=>setTimeout(r, ms));
 async function gp(sel){ const r = await ift({action:"get_properties", selector:sel}); return { n:r.match_count||0, p:r.properties||null }; }
 async function txt(){ return (await ift({action:"get_visible_text"})).text || ""; }       // pierces shadow

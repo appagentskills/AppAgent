@@ -46,6 +46,59 @@ window.sleep = function(ms) {
 };
 window.delay = window.sleep;
 
+// Safe HTMLImageElement.prototype.decode. This frame lives in the hidden
+// offscreen document, where Chrome defers native img.decode() indefinitely
+// (measured: still pending after 10 s while drawImage on the same, fully
+// loaded image worked in 25 ms). The wrapper settles from the element's own
+// state instead: resolve when already complete with pixels (or on 'load'),
+// reject on 'error' / a complete-but-empty image, and keep the native decode
+// as a race so visible hosts still get its early resolution. Never relies on
+// timers (also throttled here), never hangs on a loaded image.
+window._installSafeImageDecode = function(win) {
+    var Img = win && win.HTMLImageElement;
+    var proto = Img && Img.prototype;
+    if (!proto || typeof proto.decode !== 'function') return false;
+    if (proto.decode.__appagentSafeDecode) return true;
+    var nativeDecode = proto.decode;
+    function encodingError(cause) {
+        var msg = 'The source image cannot be decoded.';
+        try { if (typeof win.DOMException === 'function') return new win.DOMException(msg, 'EncodingError'); } catch (_) {}
+        var e = new Error(msg); e.name = 'EncodingError'; if (cause) e.cause = cause; return e;
+    }
+    var safeDecode = function decode() {
+        var img = this;
+        return new Promise(function(resolve, reject) {
+            var settled = false;
+            function finish(ok, err) {
+                if (settled) return;
+                settled = true;
+                try { img.removeEventListener('load', onLoad); img.removeEventListener('error', onError); } catch (_) {}
+                if (ok) resolve(); else reject(err || encodingError());
+            }
+            function onLoad() { finish(true); }
+            function onError() { finish(false, encodingError()); }
+            function settleFromState(nativeErr) {
+                if (!img.complete) return false; // still loading: wait for load/error
+                if (img.naturalWidth > 0) finish(true);
+                else finish(false, nativeErr || encodingError()); // no src / broken image
+                return true;
+            }
+            try { img.addEventListener('load', onLoad); img.addEventListener('error', onError); } catch (_) {}
+            var p;
+            try { p = nativeDecode.call(img); } catch (_) { p = null; }
+            if (p && typeof p.then === 'function') {
+                p.then(function() { finish(true); }, function(err) { settleFromState(err); });
+            }
+            settleFromState(null);
+        });
+    };
+    safeDecode.__appagentSafeDecode = true;
+    safeDecode.__nativeDecode = nativeDecode;
+    proto.decode = safeDecode;
+    return true;
+};
+try { window._installSafeImageDecode(window); } catch (_) {}
+
 // Workspace file loading — bridge to the `run_js_file` tool (impl:
 // src/js/tools/160-run-tests.js executeRunJsFile). loadFile returns the RAW
 // file text (not the line-numbered `workspace read` view); runFile evaluates

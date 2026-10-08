@@ -307,17 +307,17 @@ var _PERM_SN_INSTANCE_TOOLS = ['servicenow_api', 'servicenow_run_script', 'servi
 // host alone decides. iframe_tool (every action) unions everything it might
 // touch, resolved the way tools/010-iframe-tool.js + background.js route:
 //  - the active instance host;
-//  - the tab it drives — full-tab: tab_id → chat-pinned targetTabId → active
-//    tab; sidepanel: tab_id is IGNORED (010:113-115, 177-178), pinned → active
-//    tab (platform-bridge.js sendBrowserAction, background.js getActiveTabId);
-//    both tab.url and tab.pendingUrl; unknown mode → both modes' candidates;
+//  - the tab it drives: ONLY the explicit numeric args.tab_id (both modes —
+//    browser actions require it and there is no chat-pinned / active-tab
+//    fallback, 010-iframe-tool.js resolveBrowserTabTarget); both tab.url and
+//    tab.pendingUrl. tab_id:"new" (navigate only) opens a fresh tab, so only
+//    the navigate URL's host matters. Missing tab_id → no tab candidate (the
+//    tool itself rejects the call);
 //  - navigate: an absolute URL's host; a relative URL's base (full-tab:
 //    args.instance or the active instance; sidepanel: the STORED instanceUrl,
 //    background.js handleNavigate, which ignores args.instance);
 //  - args.instance when given (it can only add strictness here).
-// Pins of BOTH the gate's chat and currentChatId are considered: the tool
-// falls back to currentChatId when options.chatId is unknown (010:109-111),
-// while the gate may have used activeStreamingChatId.
+// chatId is accepted for signature compatibility; chats no longer pin a tab.
 async function resolvePermissionTargetHosts(toolName, args, chatId) {
     var connected = (typeof getConnectedInstanceHost === 'function') ? getConnectedInstanceHost() : null;
     var explicit = resolvePermissionTargetHost(args); // undefined | host | null
@@ -330,19 +330,13 @@ async function resolvePermissionTargetHosts(toolName, args, chatId) {
     var navUrl = isNav && typeof args.url === 'string' ? args.url : null;
     var relNav = !!(navUrl && navUrl.charAt(0) === '/');
     if (isNav && !relNav) hosts.push(navUrl && /^https?:\/\//i.test(navUrl) ? _permKnownHostOrNull(navUrl) : null);
-    // Tabs the action may drive (null entry = the active tab).
+    // The tab the action drives: only an explicit numeric tab_id counts.
     var tabIds = [];
-    if (!args.widget_id) {
-        if (args.tab_id != null && mode !== 'sidepanel') tabIds.push(args.tab_id);
-        if (args.tab_id == null || mode !== 'tab') {
-            var chatIds = [chatId];
-            if (typeof currentChatId !== 'undefined' && currentChatId && currentChatId !== chatId) chatIds.push(currentChatId);
-            for (var ci = 0; ci < chatIds.length; ci++) {
-                var c = (typeof chats !== 'undefined' && chats && chatIds[ci]) ? chats[chatIds[ci]] : null;
-                var pin = c && c.targetTabId != null ? c.targetTabId : null;
-                if (tabIds.indexOf(pin) === -1) tabIds.push(pin);
-            }
-        }
+    if (!args.widget_id && args.tab_id != null && args.tab_id !== 'new') {
+        var _ptid = args.tab_id;
+        if (typeof _ptid === 'string' && /^\d+$/.test(_ptid.trim())) _ptid = Number(_ptid.trim());
+        if (typeof _ptid === 'number' && isFinite(_ptid)) tabIds.push(_ptid);
+        else hosts.push(null); // invalid id → unknown host (the tool rejects it anyway)
     }
     var needStored = relNav && mode !== 'tab';
     if (!tabIds.length && needStored) tabIds.push(undefined); // storage only

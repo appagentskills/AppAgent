@@ -32,13 +32,17 @@ Navigate to the elevation dialog:
 ### Using js_eval
 ```javascript
 // In js_eval:
-await executeTool("iframe_tool", {
+// tab_id is REQUIRED on every browser action ("new" = open a background tab; navigate only)
+var nav = await executeTool("iframe_tool", {
   action: "navigate",
-  url: "/elevated_role_dialog.do"
+  url: "/elevated_role_dialog.do",
+  tab_id: "new"
 });
+var TAB = nav.tab_id;
 
 // Wait until the dialog's checkbox is actually visible (don't use a fixed delay)
 await executeTool("iframe_tool", {
+  tab_id: TAB,
   action: "wait_for",
   selector_visible: "input#security_admin",
   timeout: 10000
@@ -46,12 +50,14 @@ await executeTool("iframe_tool", {
 
 // Check the security_admin checkbox (target the named role row, not "the first checkbox")
 await executeTool("iframe_tool", {
+  tab_id: TAB,
   action: "click",
   selector: "input#security_admin"
 });
 
 // Click OK to elevate
 await executeTool("iframe_tool", {
+  tab_id: TAB,
   action: "click",
   selector: "#ok_button"
 });
@@ -145,13 +151,17 @@ ServiceNow intentionally blocks programmatic role elevation for security reasons
 // In js_eval:
 
 // 1. Navigate to elevation dialog
-await executeTool("iframe_tool", {
+// tab_id is REQUIRED on every browser action ("new" = open a background tab; navigate only)
+var nav = await executeTool("iframe_tool", {
   action: "navigate",
-  url: "/elevated_role_dialog.do"
+  url: "/elevated_role_dialog.do",
+  tab_id: "new"
 });
+var TAB = nav.tab_id;
 
 // 2. Wait until the dialog's checkbox is visible (don't use a fixed delay)
 await executeTool("iframe_tool", {
+  tab_id: TAB,
   action: "wait_for",
   selector_visible: "input#security_admin",
   timeout: 10000
@@ -159,12 +169,14 @@ await executeTool("iframe_tool", {
 
 // 3. Check the security_admin checkbox
 await executeTool("iframe_tool", {
+  tab_id: TAB,
   action: "click",
   selector: "input#security_admin"
 });
 
 // 4. Click OK to confirm elevation
 await executeTool("iframe_tool", {
+  tab_id: TAB,
   action: "click",
   selector: "#ok_button"
 });

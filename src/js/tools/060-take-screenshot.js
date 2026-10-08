@@ -129,9 +129,8 @@ async function downscaleImageHighQuality(source, scale) {
     return { base64: out, width: newW, height: newH };
 }
 
-// `options.chatId` (when the caller threads executeTool's options through) is the
-// chat this capture RUNS for; browser-tab routing must use its targetTabId, not
-// the VIEWED chat's. Falls back to currentChatId when options is absent.
+// target 'browser' and 'element' REQUIRE an explicit args.tab_id (no active-tab or
+// chat-stored fallback). The extension's own tab is a valid target.
 async function executeTakeScreenshot(args, options) {
     var _ssChatId = (options && options.chatId && typeof chats !== 'undefined' && chats[options.chatId])
         ? options.chatId
@@ -151,13 +150,20 @@ async function executeTakeScreenshot(args, options) {
         return { success: false, error: 'target is required. Use "browser", "widget", or "element"' };
     }
 
+    var _ssTabId = null;
+    if (target === 'browser' || target === 'element') {
+        var _ssTgt = await resolveBrowserTabTarget(args.tab_id, 'take_screenshot', { toolLabel: 'take_screenshot target "' + target + '"' });
+        if (_ssTgt.error) return { success: false, error: _ssTgt.error };
+        _ssTabId = _ssTgt.tabId;
+    }
+
     try {
         var elementToCapture = null;
         var captureDescription = '';
 
         if (target === 'browser') {
             // Use Chrome Debugger API via background service worker
-            var ssResult = await Platform.sendBrowserAction('take_screenshot', {}, _ssChatId);
+            var ssResult = await Platform.sendBrowserAction('take_screenshot', {}, _ssTabId);
             if (ssResult.error) {
                 return { success: false, error: ssResult.error };
             }
@@ -217,8 +223,9 @@ async function executeTakeScreenshot(args, options) {
             return {
                 success: true,
                 screenshot_id: ssId,
+                tab_id: _ssTabId,
                 url: ssUrl,
-                message: 'Screenshot captured: browser tab at ' + ssUrl,
+                message: 'Screenshot captured: browser tab ' + _ssTabId + ' at ' + ssUrl,
                 dimensions: ssWidth + 'x' + ssHeight,
                 size_bytes: Math.round(ssBase64.length * 0.75),
                 note: 'The screenshot image is now attached to this conversation. I can see it and will analyze the visual content. Use screenshot_id "' + ssId + '" with screenshot_by_id tool to retrieve the image data.',
@@ -421,12 +428,8 @@ async function executeTakeScreenshot(args, options) {
                     if (!_wssRenderedViaSignal) {
                         await new Promise(function(r){ setTimeout(r, 700); });
                     }
-                    // Temporarily point sendBrowserAction at the widget tab
-                    var _wssChat = chats[_ssChatId];
-                    var _wssOrigTabId = _wssChat && _wssChat.targetTabId;
-                    if (_wssChat) _wssChat.targetTabId = _wssTab.id;
-                    var _wssResult = await Platform.sendBrowserAction('take_screenshot', {}, _ssChatId);
-                    if (_wssChat) _wssChat.targetTabId = _wssOrigTabId;
+                    // Capture the temp widget tab explicitly (no chat mutation).
+                    var _wssResult = await Platform.sendBrowserAction('take_screenshot', {}, _wssTab.id);
                     if (_wssResult.error) {
                         return { success: false, error: 'Widget screenshot failed: ' + _wssResult.error };
                     }
@@ -505,7 +508,7 @@ async function executeTakeScreenshot(args, options) {
             }
 
             // Get element rect from tab, take full screenshot, then crop
-            var elProps = await Platform.sendBrowserAction('get_properties', { selector: selector }, _ssChatId);
+            var elProps = await Platform.sendBrowserAction('get_properties', { selector: selector }, _ssTabId);
             if (elProps.error || !elProps.properties) {
                 return { success: false, error: 'Element not found: ' + selector };
             }
@@ -515,7 +518,7 @@ async function executeTakeScreenshot(args, options) {
             }
 
             // Take full page screenshot
-            var fullSs = await Platform.sendBrowserAction('take_screenshot', {}, _ssChatId);
+            var fullSs = await Platform.sendBrowserAction('take_screenshot', {}, _ssTabId);
             if (fullSs.error) {
                 return { success: false, error: fullSs.error };
             }
@@ -561,6 +564,7 @@ async function executeTakeScreenshot(args, options) {
             return {
                 success: true,
                 screenshot_id: elSsId,
+                tab_id: _ssTabId,
                 url: elUrl,
                 message: 'Screenshot captured: element ' + selector,
                 dimensions: cropW + 'x' + cropH,

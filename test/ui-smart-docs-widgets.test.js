@@ -882,14 +882,13 @@ describe('ui html_widget › dashboard deactivate + screenshot fallback', functi
     test('screenshot fallback cleans up when capture fails (A6A2-01)', async function() {
         var x = await loadWidgets();
         var sc = x.m.__scope, ch = x.s.chrome, removed = [], sent = [];
-        sc.chats.c1.targetTabId = 5;
         sc.getWidgetIframe = function() { return { contentDocument: null }; };
         ch.tabs.create = function() { return Promise.resolve({ id: 77 }); };
         ch.tabs.remove = function(id) { removed.push(id); };
         ch.tabs.onUpdated.addListener = function(fn) { setTimeout(function() { fn(77, { status: 'complete' }); }, 0); };
         ch.runtime.sendMessage = function(msg) { sent.push(msg); throw new Error('Extension context invalidated.'); };
         await x.m.screenshotWidget('widget_a');
-        assert.strictEqual(sc.chats.c1.targetTabId, 5, 'viewed chat tab target untouched');
+        assert.strictEqual(sc.chats.c1.targetTabId, undefined, 'no tab stored on the chat');
         assert.strictEqual(sent.length, 1);
         assert.strictEqual(sent[0].targetTabId, 77, 'temp tab targeted explicitly');
         assert.deepStrictEqual(removed, [77], 'temp tab closed');

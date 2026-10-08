@@ -147,8 +147,10 @@ Before testing, ensure the UI has data to display. Empty pages with no data hide
 
 Get a complete picture of the entire UI before testing anything specific.
 
-1. **Navigate to the page** - Use `iframe_tool` with action `navigate` to open the UI page.
-2. **Take a full screenshot** - Use `take_screenshot` to capture the initial state.
+> **`tab_id` is REQUIRED** on every `iframe_tool` browser action and on `take_screenshot` `target: "browser"/"element"` — there is no active-tab fallback. Get it from `list_instances` (`instances[].activeTabs[].id`) or navigate with `tab_id: "new"` and reuse the `tab_id` the result returns for every later call in this test. The agent's own tab (`selfTabId`) may be screenshotted/read but never navigated.
+
+1. **Navigate to the page** - Use `iframe_tool` with action `navigate` (`tab_id: "new"` or an existing instance tab id) to open the UI page; keep the returned `tab_id`.
+2. **Take a full screenshot** - Use `take_screenshot` (`target: "browser"`, same `tab_id`) to capture the initial state.
 3. **Extract visible text** - Use `iframe_tool` with action `get_visible_text` (with `deep: true`) to get a structured view of all visible elements.
 4. **Scroll and capture everything** - If the page extends beyond the viewport:
    - Use `iframe_tool` (scroll) with `y: 500` to scroll down (or `position: "bottom"` to jump to end)
@@ -324,7 +326,7 @@ For every bug found during testing, document it with the following format:
 
 | Tool | Purpose |
 |------|---------|
-| `iframe_tool` (navigate) | Open a URL in the browser panel |
+| `iframe_tool` (navigate) | Open a URL in the tab given by `tab_id` (`"new"` = new background tab) — every browser action needs `tab_id` |
 | `iframe_tool` (get_visible_text) | Extract all visible text and elements (use `deep: true`) |
 | `iframe_tool` (get_dom) | Get the full HTML structure |
 | `iframe_tool` (click) | Click an element by CSS selector |
@@ -338,7 +340,7 @@ For every bug found during testing, document it with the following format:
 | `iframe_tool` (get_properties) | Read computed styles, dimensions, values, attributes of elements |
 | `iframe_tool` (set_style) | Apply CSS styles or toggle classes on elements |
 | `iframe_tool` (impersonate) | Impersonate a user for persona testing via the REST API (`user: "stop"` to end) — never the UI impersonation menu |
-| `take_screenshot` | Capture the browser panel or a specific element as PNG |
+| `take_screenshot` | Capture a tab (`target: "browser"`, `tab_id` required) or a specific element (`target: "element"`, `tab_id` + `selector`) as PNG |
 | `servicenow_api` | Query, create, update, delete ServiceNow records — the default for all setup, teardown and backend verification |
 
 ## Key Principles

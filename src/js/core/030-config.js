@@ -14,8 +14,9 @@
 // adaptive-only-Claude legacy branch in app/010-llm-streaming.js which
 // keys off the RAW stored thinkingBudget to send an explicit default
 // effort.
-// 64000 = highest safe universal max_tokens: it sits under Gemini 3.5
-// Flash's 65,536 completion cap on OpenRouter — endpoints 400-error rather
+// 64000 = highest safe universal max_tokens: it sits under Gemini 3.8
+// Flash's 65,536 completion cap on OpenRouter (verified 2026-10-07 in
+// openrouter.ai/api/v1/models/google/gemini-3.8-flash/endpoints) — endpoints 400-error rather
 // than clamp when max_tokens exceeds the model's limit, so the default must
 // be under the lowest cap among the default models.
 // 32000 = doc-recommended reasoning budget ceiling (batch processing is
@@ -45,10 +46,11 @@ var globalMaxTokensExplicit = false;
 var globalThinkingBudget = DEFAULT_THINKING_BUDGET;
 
 // Built-in (non-user) max_tokens default for a model id: 128000 for Opus
-// 5.5+ and Sonnet 5.5+, DEFAULT_MAX_TOKENS for everything else.
+// 5.5+, Sonnet 5.5+ and Haiku 5.5+ (documented 128K output cap; thinking
+// tokens count toward it), DEFAULT_MAX_TOKENS for everything else.
 function getDefaultMaxTokensForModel(model) {
     var m = String(model || '').toLowerCase();
-    return (OPUS_5_5_PLUS_RE.test(m) || SONNET_5_5_PLUS_RE.test(m))
+    return (OPUS_5_5_PLUS_RE.test(m) || SONNET_5_5_PLUS_RE.test(m) || HAIKU_5_5_PLUS_RE.test(m))
         ? OPUS_5_5_DEFAULT_MAX_TOKENS
         : DEFAULT_MAX_TOKENS;
 }
@@ -142,13 +144,17 @@ async function saveDeferredToolsEnabled(value) {
 // above (getGlobalMaxTokens / getGlobalThinkingBudget) apply to all.
 var DEFAULT_API_PROVIDERS = [
     {
-        name: 'GLM 5.2',
-        model: 'z-ai/glm-5.2',
+        // GLM 5.3 (OpenRouter added 2026-08-18) replaces the GLM 5.2 default
+        // (untouched copies are renamed by loadApiProviders,
+        // core/130-indexeddb.js). 1M context. Routing is pinned to
+        // first-party Z.AI (provider below): its z-ai/fp8 endpoint allows
+        // 131,072 completion tokens (verified 2026-10-07 in
+        // openrouter.ai/api/v1/models/z-ai/glm-5.3/endpoints) — the global
+        // 64k default is safely under it
+        name: 'GLM 5.3',
+        model: 'z-ai/glm-5.3',
         endpoint: 'https://openrouter.ai/api/v1/chat/completions',
         apiKey: '',
-        // Routing is pinned to first-party Z.AI (provider below), whose
-        // endpoint allows 131,072 completion tokens — the global 64k default
-        // is safely under it
         provider: 'z-ai'
     },
     {
@@ -165,6 +171,16 @@ var DEFAULT_API_PROVIDERS = [
         effort: 'high'
     },
     {
+        // Haiku 5.5 (2026-10-07) on OpenRouter (id verified in
+        // openrouter.ai/api/v1/models: 1M context, 128K completion). Option
+        // only — not a default/migration target. 'medium' = model default effort.
+        name: 'haiku-5.5',
+        model: 'anthropic/claude-haiku-5.5',
+        endpoint: 'https://openrouter.ai/api/v1/chat/completions',
+        apiKey: '',
+        effort: 'medium'
+    },
+    {
         // GPT-6.1 Sol (2026-09-30) replaces the gpt-6-sol OpenRouter default
         // (untouched copies are renamed by loadApiProviders, core/130-indexeddb.js).
         // 1.05M context, 128K max output (OpenRouter + developers.openai.com/
@@ -178,12 +194,17 @@ var DEFAULT_API_PROVIDERS = [
         effort: 'low'
     },
     {
-        name: 'Gemini 3.5 Flash',
-        model: 'google/gemini-3.5-flash',
+        // Gemini 3.8 Flash (Stable/GA, OpenRouter added 2026-09-02) replaces
+        // the Gemini 3.5 Flash default, now legacy per Google (untouched
+        // copies are renamed by loadApiProviders, core/130-indexeddb.js).
+        // 1M context. OpenRouter caps its completions at 65,536 tokens on
+        // every endpoint (verified 2026-10-07 in
+        // openrouter.ai/api/v1/models/google/gemini-3.8-flash/endpoints) —
+        // the global 64k default was chosen to fit under exactly this cap
+        name: 'Gemini 3.8 Flash',
+        model: 'google/gemini-3.8-flash',
         endpoint: 'https://openrouter.ai/api/v1/chat/completions',
         apiKey: ''
-        // OpenRouter caps Gemini 3.5 Flash completions at 65,536 tokens —
-        // the global 64k default was chosen to fit under exactly this cap
     },
     {
         // Opus 5.5 (Sept 2026, Claude Code 2.1.280+) — dateless pinned id, 1M
@@ -224,6 +245,20 @@ var DEFAULT_API_PROVIDERS = [
         endpoint: 'https://api.anthropic.com/v1/messages',
         apiKey: 'oauth',
         effort: 'high',
+        isClaudeOAuth: true
+    },
+    {
+        // Haiku 5.5 (2026-10-07) — fixed id (no date suffix, no alias), 1M
+        // context, 128K max output, adaptive thinking by default (default
+        // effort medium). Bound thinking + adaptive-only (HAIKU_5_5_PLUS_RE
+        // below). Added as an option only — NOT the default provider and not
+        // a migration target for old Haiku entries.
+        // Docs: https://platform.claude.com/docs/en/models/haiku-5-5/overview
+        name: 'Haiku 5.5',
+        model: 'claude-haiku-5-5',
+        endpoint: 'https://api.anthropic.com/v1/messages',
+        apiKey: 'oauth',
+        effort: 'medium',
         isClaudeOAuth: true
     },
     {
@@ -350,7 +385,8 @@ var DEFAULT_API_PROVIDER = {
 // visible to callOpenRouterStreaming everywhere. transformToAnthropic in
 // src/platform/extension/background.js keeps a related (4.8+ only) regex for
 // mid-conversation system support — keep the two in sync when models change.
-var ADAPTIVE_ONLY_CLAUDE_RE = /claude-(?:fable|mythos|opus-(?:[5-9]|\d{2,}|4[.-](?:[7-9]|\d{2,}))|sonnet-(?:[5-9]|\d{2,}))/;
+// Haiku joins at 5.5 (Oct 2026: budget_tokens → 400); Haiku 4.x stays legacy.
+var ADAPTIVE_ONLY_CLAUDE_RE = /claude-(?:fable|mythos|opus-(?:[5-9]|\d{2,}|4[.-](?:[7-9]|\d{2,}))|sonnet-(?:[5-9]|\d{2,})|haiku-(?:5[.-](?:[5-9]|[1-9]\d)(?!\d)|[6-9]|\d{2,}))/;
 function isAdaptiveOnlyClaude(model) {
     return ADAPTIVE_ONLY_CLAUDE_RE.test(String(model || '').toLowerCase());
 }
@@ -414,8 +450,24 @@ var SONNET_5_5_PLUS_RE = /claude-sonnet-(?:5[.-](?:[5-9]|[1-9]\d)(?!\d)|[6-9]|\d
 function isSonnet55Plus(model) {
     return SONNET_5_5_PLUS_RE.test(String(model || '').toLowerCase());
 }
+// Haiku 5.5+ (2026-10-07) — same bound-thinking family (blocks bound to the
+// conversation prefix; drop_block under thinking-binding-controls), adaptive
+// thinking on by default (default effort medium), 1M context / 128K output.
+// Breaking vs Haiku 4.5: budget_tokens → 400 (adaptive-only), non-default
+// temperature/top_p/top_k → 400 (never sent for Claude), assistant prefill →
+// 400 (the app never sends one), computer_20250124 → 400 (not used). UNLIKE
+// Sonnet 5.5, thinking:{type:'disabled'} IS accepted at effort ≤ high, so
+// the thinking-OFF switch maps to 'disabled' (thinkingOffShapeFor below) on
+// both the OAuth and OpenRouter paths. Same regex shape as SONNET_5_5_PLUS_RE;
+// does NOT match Haiku 4.x (claude-haiku-4-5, claude-haiku-4-5-20251001).
+// Docs: https://platform.claude.com/docs/en/models/haiku-5-5/whats-new-haiku-5-5
+//       https://platform.claude.com/docs/en/models/haiku-5-5/migration-guide
+var HAIKU_5_5_PLUS_RE = /claude-haiku-(?:5[.-](?:[5-9]|[1-9]\d)(?!\d)|[6-9]|\d{2,})/;
+function isHaiku55Plus(model) {
+    return HAIKU_5_5_PLUS_RE.test(String(model || '').toLowerCase());
+}
 // Every model whose thinking blocks are conversation-bound (see above).
-var THINKING_BINDING_RE = new RegExp(FABLE_5_1_PLUS_RE.source + '|' + OPUS_5_5_PLUS_RE.source + '|' + SONNET_5_5_PLUS_RE.source);
+var THINKING_BINDING_RE = new RegExp(FABLE_5_1_PLUS_RE.source + '|' + OPUS_5_5_PLUS_RE.source + '|' + SONNET_5_5_PLUS_RE.source + '|' + HAIKU_5_5_PLUS_RE.source);
 function isThinkingBindingModel(model) {
     return THINKING_BINDING_RE.test(String(model || '').toLowerCase());
 }
@@ -431,12 +483,35 @@ var BETWEEN_TOOLS_THINKING_EFFORTS = ['low', 'medium', 'high'];
 // has NO effort and then replaces reasoning with exactly {enabled:false}, so
 // the app never sends off + xhigh/max today. Kept so a future caller that
 // combines them can't produce a between_tools 400.
+// Haiku 5.5+: 'disabled' is accepted at the same efforts (≤ high) →
+// {type:'disabled'}; xhigh/max → adaptive (same defensive guard).
 function thinkingOffShapeFor(model, effort) {
-    if (!isSonnet55Plus(model)) return null;
+    var haiku = isHaiku55Plus(model);
+    if (!haiku && !isSonnet55Plus(model)) return null;
     if (effort && BETWEEN_TOOLS_THINKING_EFFORTS.indexOf(String(effort).toLowerCase()) === -1) {
         return { type: 'adaptive' };
     }
-    return { type: 'between_tools' };
+    return haiku ? { type: 'disabled' } : { type: 'between_tools' };
+}
+
+// Anthropic prompt-cache policy — ONE place for the breakpoint budget and
+// TTLs (shared into the SW bundle; background.js reads it typeof-guarded).
+// Docs: platform.claude.com/docs/en/build-with-claude/prompt-caching —
+// max 4 explicit breakpoints per request (a 5th is a 400); default TTL 5m
+// (writes 1.25x); ttl:'1h' is opt-in, GA (no beta header), writes 2x; when
+// mixing, 1h entries must appear BEFORE any 5m entry. Prefix order is
+// tools -> system -> messages, so 1h goes only on the stable prefix
+// (tools + system: system prompt is frozen per chat — see
+// expandSystemPromptPlaceholders, core/110) and messages stay 5m.
+// Set ANTHROPIC_STABLE_PREFIX_CACHE_TTL to null to revert to 5m everywhere.
+var ANTHROPIC_MAX_CACHE_BREAKPOINTS = 4;
+var ANTHROPIC_STABLE_PREFIX_CACHE_TTL = '1h';
+// kind: 'stable' (tools/system) or 'message'. Fresh object per call.
+function anthropicCacheControl(kind) {
+    if (kind === 'stable' && ANTHROPIC_STABLE_PREFIX_CACHE_TTL) {
+        return { type: 'ephemeral', ttl: ANTHROPIC_STABLE_PREFIX_CACHE_TTL };
+    }
+    return { type: 'ephemeral' };
 }
 
 var currentProvider = 'Opus 5.5'; // Default provider name (must match a provider in DEFAULT_API_PROVIDERS)
@@ -470,7 +545,13 @@ var PROVIDER_RENAMES = {
     // to Sonnet 5.5: the old Sonnet 5 targets were retired in Sept 2026)
     'sonnet-4.5': 'sonnet-5.5',
     'sonnet-4.6': 'sonnet-5.5',
-    'Kimi K2.5': 'GLM 5.2',
+    // (Kimi K2.5 chain-collapses straight to GLM 5.3: the GLM 5.2 target
+    // retired 2026-10-07)
+    'Kimi K2.5': 'GLM 5.3',
+    // Oct 7 2026: GLM 5.3 / Gemini 3.8 Flash supersede the GLM 5.2 /
+    // Gemini 3.5 Flash OpenRouter defaults
+    'GLM 5.2': 'GLM 5.3',
+    'Gemini 3.5 Flash': 'Gemini 3.8 Flash',
     // (gpt-5.2 / gpt-5.5 / gpt-5.6-sol chain-collapse straight to gpt-6.1-sol:
     // the old gpt-5.5 / gpt-5.6-sol / gpt-6-sol targets no longer exist in the
     // defaults)
@@ -479,7 +560,7 @@ var PROVIDER_RENAMES = {
     'gpt-5.6-sol': 'gpt-6.1-sol',
     // Sept 30 2026: GPT-6.1 Sol supersedes the gpt-6-sol OpenRouter default
     'gpt-6-sol': 'gpt-6.1-sol',
-    'Gemini 3 Flash Preview': 'Gemini 3.5 Flash',
+    'Gemini 3 Flash Preview': 'Gemini 3.8 Flash',
     'Sonnet 4.6 OAuth': 'Sonnet 5.5',
     // July 2026: the ' OAuth' suffix was dropped from the user-facing
     // default names (same providers, friendlier labels)
@@ -530,6 +611,9 @@ var TIER_ALIAS_SAME = '__same__';
 // it (e.g. 'Fable 5' showing up in runs with a different current model).
 // Users who want a specific large model pick it in Settings → Sub-Agent
 // Model Tiers.
+// NOTE (Oct 2026): 'Haiku 5.5' (built for subagent/routing work) is a
+// candidate for `small`, deliberately NOT switched yet — changing it would
+// silently move every existing tier:'small' spawn to a new model.
 var DEFAULT_TIER_ALIASES = {
     small: 'Sonnet 5.5',
     medium: 'Opus 5.5',

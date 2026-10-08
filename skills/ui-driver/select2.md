@@ -34,7 +34,9 @@ When open, select2 promotes the active dropdown to a single body-level node **`#
 ## Shared helpers (define once; reused by every ui-driver file)
 
 ```javascript
-async function ift(a){ return await executeTool("iframe_tool", Object.assign({status_message:"drive"}, a)); }
+// tab_id is REQUIRED on every browser action (no active-tab fallback): take an id from list_instances
+// (instances[].activeTabs[].id) or open one: const TAB = (await executeTool("iframe_tool", {action:"navigate", url, wait:true, tab_id:"new"})).tab_id;
+async function ift(a){ return await executeTool("iframe_tool", Object.assign({status_message:"drive", tab_id:TAB}, a)); }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function gp(sel, inc){
   // get_properties now returns success:true + match_count:0 + properties:null on a no-match;

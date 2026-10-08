@@ -594,17 +594,12 @@
 
     // Browser action proxy - routes iframe_tool actions through background service worker
     // All actions (including screenshot) go through background so it can target the correct tab
-    // targetTabId is read from the chat that OWNS the action so each chat targets its
-    // own tested tab. Callers running on behalf of a non-viewed chat (sub-agents /
-    // background chats dispatched via the offscreen exec-tool bridge) pass chatId;
-    // otherwise the viewed chat (currentChatId) is used, as before.
-    Platform.sendBrowserAction = function(action, args, chatId) {
-        var targetTabId = null;
-        if (typeof chats !== 'undefined') {
-            var _baChatId = (chatId && chats[chatId]) ? chatId
-                : ((typeof currentChatId !== 'undefined') ? currentChatId : null);
-            if (_baChatId && chats[_baChatId]) targetTabId = chats[_baChatId].targetTabId || null;
-        }
+    // The caller MUST pass the explicit target tabId (chats no longer store a linked
+    // tab, and background.js never falls back to the active tab). A missing tabId is
+    // forwarded as null and background.js answers with a clear 'tab_id is required' error.
+    Platform.sendBrowserAction = function(action, args, tabId) {
+        // 'new' is forwarded for navigate (background opens a new tab).
+        var targetTabId = ((typeof tabId === 'number' && isFinite(tabId)) || tabId === 'new') ? tabId : null;
         return new Promise(function(resolve) {
             chrome.runtime.sendMessage({
                 type: 'browser-action',

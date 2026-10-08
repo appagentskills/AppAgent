@@ -141,7 +141,7 @@ test('getTargetedToolPermission: iframe_tool unions every host it may hit; stric
             // Prod active: no iframe write is Dev-allowed, whatever tab/instance is named.
             assert.strictEqual((await T('iframe_tool','click',{action:'click',instance:'dev1',tab_id:7})).permission, 'ask', w+'fake instance on prod tab');
             assert.strictEqual((await T('iframe_tool','click',{action:'click',tab_id:8})).permission, 'ask', w+'dev tab, prod active');
-            assert.strictEqual((await T('iframe_tool','fill',{action:'fill'},'root')).permission, 'ask', w+'pinned dev tab, prod active');
+            assert.strictEqual((await T('iframe_tool','fill',{action:'fill'},'root')).permission, 'ask', w+'legacy chat pin ignored, prod active');
             assert.strictEqual((await T('iframe_tool','navigate',{action:'navigate',url:'/x',instance:'dev1'})).permission, 'allow', w+'navigate is a read');
             // servicenow_api routes by instance (unchanged).
             var r = await T('servicenow_api','DELETE',{instance:'dev1',confirm:true});
@@ -151,11 +151,16 @@ test('getTargetedToolPermission: iframe_tool unions every host it may hit; stric
             // ── Dev active from here on ──
             plat.instanceUrl = 'https://dev1.service-now.com';
             assert.strictEqual((await T('iframe_tool','click',{action:'click',tab_id:7})).permission, 'ask', w+'prod tab under dev active');
-            // H1: unpinned action runs on the ACTIVE tab — prod active tab → ask.
-            assert.strictEqual((await T('iframe_tool','click',{action:'click'})).permission, 'ask', w+'H1 no tab, dev active, prod active tab');
-            active.id = 8;
+            // H1: no tab_id → NO tab candidate (no active-tab fallback; the tool
+            // itself rejects the call), so the prod active tab is not consulted.
             r = await T('iframe_tool','click',{action:'click'});
-            assert.strictEqual(r.permission, 'allow', w+'H1 no tab, dev active tab'); assert.strictEqual(r.host, 'dev1.service-now.com');
+            assert.strictEqual(r.permission, 'allow', w+'H1 no tab_id ignores prod active tab'); assert.strictEqual(r.host, 'dev1.service-now.com');
+            // Legacy chat pin (root → tab 8) is never read.
+            active.id = 8;
+            assert.deepStrictEqual(await H({action:'click'}, 'root'), ['dev1.service-now.com'], w+'no chat-pin candidates');
+            // tab_id:"new" (navigate only) → only the URL host matters.
+            assert.deepStrictEqual(await H({action:'navigate',url:'https://dev1.service-now.com/x',tab_id:'new'}), ['dev1.service-now.com','dev1.service-now.com'], w+'new tab: url host only');
+            assert.ok((await H({action:'click',tab_id:'abc'})).indexOf(null) !== -1, w+'invalid tab_id → unknown host');
             assert.strictEqual((await T('iframe_tool','click',{action:'click',instance:'prod.service-now.com'})).permission, 'ask', w+'instance only adds strictness');
             // M2: url OR pendingUrl on prod → ask; url empty but pendingUrl dev → allow.
             assert.strictEqual((await T('iframe_tool','click',{action:'click',tab_id:9})).permission, 'ask', w+'M2 pendingUrl prod');
@@ -166,35 +171,35 @@ test('getTargetedToolPermission: iframe_tool unions every host it may hit; stric
             assert.strictEqual((await T('iframe_tool','click',{action:'click',tab_id:99})).permission, 'ask', w+'closed tab');
             assert.ok((await H({action:'navigate',url:'https://evil.example/x'})).indexOf(null) !== -1, w+'M1 absolute unknown → null');
             assert.ok((await H({action:'navigate',url:'https://dev1.service-now.com/x'})).indexOf('dev1.service-now.com') !== -1);
-            // H2 sidepanel: tab_id is IGNORED (tool routes to pinned/active), relative
-            // navigate uses the STORED instanceUrl, not args.instance.
+            // H2 sidepanel: tab_id is honored too (sendBrowserAction forwards it);
+            // relative navigate uses the STORED instanceUrl, not args.instance.
             doc.body.classList.contains = function(c){ return c === 'sidepanel-mode'; };
             active.id = 7;
-            assert.strictEqual((await T('iframe_tool','click',{action:'click',tab_id:8})).permission, 'ask', w+'H2 sidepanel ignores dev tab_id; active tab prod');
+            assert.strictEqual((await T('iframe_tool','click',{action:'click',tab_id:8})).permission, 'allow', w+'H2 sidepanel honors dev tab_id; active prod tab ignored');
             active.id = 8;
-            assert.strictEqual((await T('iframe_tool','click',{action:'click',tab_id:7})).permission, 'allow', w+'H2 sidepanel ignores prod tab_id');
+            assert.strictEqual((await T('iframe_tool','click',{action:'click',tab_id:7})).permission, 'ask', w+'H2 sidepanel honors prod tab_id');
             var hs = await H({action:'navigate',url:'/x',instance:'dev1'});
             assert.ok(hs.indexOf('prod.service-now.com') !== -1, w+'H2 sidepanel relative → stored base');
             stored.instanceUrl = null;
             assert.ok((await H({action:'navigate',url:'/x'})).indexOf(null) !== -1, w+'no stored base → null');
             stored.instanceUrl = 'https://prod.service-now.com';
-            // H2 full-tab: tab_id wins over the pin and the active tab.
+            // H2 full-tab: tab_id is the only tab candidate.
             doc.body.classList.contains = function(){ return false; }; loc.search = '?mode=tab';
             active.id = 7;
             assert.strictEqual((await T('iframe_tool','click',{action:'click',tab_id:8},'root')).permission, 'allow', w+'full-tab tab_id dev');
             assert.ok((await H({action:'navigate',url:'/x',instance:'dev1'},'root')).indexOf('prod.service-now.com') === -1, w+'full-tab relative ignores stored base');
-            // L1: the tool falls back to currentChatId — its pin counts too.
+            // L1: a currentChatId pin (legacy targetTabId) no longer counts.
             f.m.__scope.currentChatId = 'pinprod'; f.g.chats.pinprod = {targetTabId:7}; active.id = 8;
-            assert.strictEqual((await T('iframe_tool','click',{action:'click'},'root')).permission, 'ask', w+'L1 currentChatId pin on prod');
+            assert.strictEqual((await T('iframe_tool','click',{action:'click'},'root')).permission, 'allow', w+'L1 currentChatId pin ignored');
             f.m.__scope.currentChatId = undefined; delete f.g.chats.pinprod;
             loc.search = '';
             // Offscreen worker path: no chrome.tabs → SW message (background perm-target-info).
             delete chromeStub.tabs; delete chromeStub.storage;
             chromeStub.runtime = {sendMessage:function(msg, cb){ var t = msg.activeTab ? tabs[msg.tabId != null ? msg.tabId : active.id] : null; cb({ok:true, tab: t ? {url:t.url||null, pendingUrl:t.pendingUrl||null} : null, instanceUrl: stored.instanceUrl}); }};
-            assert.strictEqual((await T('iframe_tool','click',{action:'click'})).permission, 'allow', w+'msg path dev active tab');
+            assert.strictEqual((await T('iframe_tool','click',{action:'click',tab_id:8})).permission, 'allow', w+'msg path dev tab');
             assert.strictEqual((await T('iframe_tool','click',{action:'click',tab_id:7})).permission, 'ask', w+'msg path prod tab');
             chromeStub.runtime = {sendMessage:function(msg, cb){ cb(undefined); }};
-            assert.strictEqual((await T('iframe_tool','click',{action:'click'})).permission, 'ask', w+'no tab info → manual');
+            assert.strictEqual((await T('iframe_tool','click',{action:'click',tab_id:8})).permission, 'ask', w+'no tab info → manual');
         }
     });
     test('page gate: fake instance on iframe write prompts; host stamped; Always allow saves to target host', async function() {
@@ -207,9 +212,9 @@ test('getTargetedToolPermission: iframe_tool unions every host it may hit; stric
             saveInstancePermissions:function(){ saved++; }, saveToolPermissions:function(){}, renderToolPermissions:function(){}});
         var gate = await loadModules(['src/js/ui/150-tool-approval.js','src/js/ui/130-data-management.js'], {lenient:true, globals:Object.assign(f.g, f.m,
             {saveInstancePermissions:function(){ saved++; }, saveToolPermissions:function(){}, renderToolPermissions:function(){}})});
-        var res = await gate.requestProgrammaticToolApproval('iframe_tool', {action:'click', instance:'dev1'}, {chatId:'other'});
+        var res = await gate.requestProgrammaticToolApproval('iframe_tool', {action:'click', instance:'dev1', tab_id:5}, {chatId:'other'});
         assert.strictEqual(prompts.length, 1, 'fake dev instance on iframe write still prompts');
-        assert.strictEqual(prompts[0], null, 'active tab unknown (no chrome) → null host, nothing to save');
+        assert.strictEqual(prompts[0], null, 'target tab unknown (no chrome) → null host, nothing to save');
         res = await gate.requestProgrammaticToolApproval('servicenow_api', {method:'DELETE', instance:'dev1', confirm:true}, {chatId:'other'});
         assert.strictEqual(res.allowed, true); assert.strictEqual(prompts.length, 1, 'dev target never prompts');
         f.g.instancePermissions['dev1.service-now.com'].tier = 'manual';
@@ -238,7 +243,7 @@ test('getTargetedToolPermission: iframe_tool unions every host it may hit; stric
         assert.strictEqual(row2.status, 'always_allowed');
         assert.deepStrictEqual(saves[0], ['browser:click','allow','dev1.service-now.com']);
     });
-    test('worker gate (worker/120): iframe_tool on Dev auto-allows only when the active tab is Dev', async function() {
+    test('worker gate (worker/120): iframe_tool on Dev auto-allows only when the explicit tab_id is Dev', async function() {
         var tabs = {7:{url:'https://prod.service-now.com/x'}, 8:{url:'https://dev1.service-now.com/y'}}, active = {id:8};
         var plat = {instanceUrl:'https://dev1.service-now.com', instances:[{shortName:'dev1',url:'https://dev1.service-now.com'}]};
         plat.resolveInstanceUrl = function(n){ return n === 'dev1' ? 'https://dev1.service-now.com' : null; };
@@ -251,12 +256,11 @@ test('getTargetedToolPermission: iframe_tool unions every host it may hit; stric
                 activeStreamingChatId:null, _swPermsDirty:{}, parkedToolCallsByChatId:{}, getToolDisplayName:function(t){ return t; }})});
         var gate = m.__scope.requestProgrammaticToolApproval;
         assert.strictEqual(typeof gate, 'function', 'worker gate installed');
-        var res = await gate('iframe_tool', {action:'click', confirm:true}, {chatId:'other'});
-        assert.strictEqual(res.allowed, true, 'dev active + dev active tab → allowed even with confirm:true');
-        active.id = 7;
-        var settled = await Promise.race([gate('iframe_tool', {action:'click'}, {chatId:'other'}).then(function(r){ return r; }, function(){ return {allowed:false}; }),
+        var res = await gate('iframe_tool', {action:'click', tab_id:8, confirm:true}, {chatId:'other'});
+        assert.strictEqual(res.allowed, true, 'dev active + dev tab_id → allowed even with confirm:true');
+        var settled = await Promise.race([gate('iframe_tool', {action:'click', tab_id:7}, {chatId:'other'}).then(function(r){ return r; }, function(){ return {allowed:false}; }),
             new Promise(function(r){ setTimeout(function(){ r('pending'); }, 50); })]);
-        assert.ok(settled === 'pending' || settled.allowed !== true, 'prod active tab → not auto-allowed');
+        assert.ok(settled === 'pending' || settled.allowed !== true, 'prod tab_id → not auto-allowed');
     });
     test('profile union is core-first, stable, deduplicated, and ignores unknown names', async function() {
         var f = await fixture(true), m=f.m;

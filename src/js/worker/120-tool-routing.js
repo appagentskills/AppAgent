@@ -1517,13 +1517,9 @@ executeTool = async function(name, args, messageIndex, options) {
             }
             delete result._widget_persist;
         }
-        // iframe_tool navigate sets chat.targetTabId page-side. Without this
-        // mirror, the SW's chat snapshot wipes targetTabId in the panel and
-        // the next take_screenshot / iframe_tool call targets the wrong tab.
-        if (result._target_tab_persist != null) {
-            chats[chatId].targetTabId = result._target_tab_persist;
-            delete result._target_tab_persist;
-        }
+        // Chats no longer store a linked tab (tab_id is explicit on every browser
+        // action). Defensively strip the retired marker so it never reaches the model.
+        if (result._target_tab_persist !== undefined) delete result._target_tab_persist;
         // #16: update_action_state ran on the page (read-only chat mirror);
         // apply its "this chat has a progress card" stamp to the authoritative
         // chat so the agent loop's progress nudge stays quiet. Strip the

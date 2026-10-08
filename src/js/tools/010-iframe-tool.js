@@ -70,9 +70,56 @@ function _ifInputEvent(win, data) {
     return new win.Event('input', { bubbles: true });
 }
 
-// Tab ids currently being adopted/navigated by a navigate call in this context.
-// Guards against two concurrent navigates (e.g. two chats) adopting the same tab.
-var _adoptionInFlight = new Set();
+// Browser actions (no widget_id) that drive a real Chrome tab and therefore REQUIRE
+// an explicit tab_id. 'close' is a no-op/sidepanel-collapse and needs none.
+var IFRAME_TAB_ACTIONS = ['navigate', 'get_visible_text', 'get_dom', 'click', 'fill', 'type', 'wait_for',
+    'scroll', 'get_console_logs', 'get_network_requests', 'dispatch_event', 'select_option',
+    'get_properties', 'set_style', 'get_page_info', 'resize'];
+
+var IFRAME_TAB_REQUIRED_HINT = 'Get ids from list_instances (instances[].activeTabs[].id; selfTabId / extensionTabs for the agent\'s own tab) '
+    + 'or reuse the tab_id returned by a previous browser action / take_screenshot.';
+
+// True for any page of THIS extension (app.html in a tab, offscreen, etc.).
+function _isExtensionOwnUrl(u) {
+    if (!u || typeof u !== 'string') return false;
+    try {
+        var _base = (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.getURL) ? chrome.runtime.getURL('') : '';
+        return !!_base && u.indexOf(_base) === 0;
+    } catch (e) { return false; }
+}
+
+// Validate an explicit browser-action target. Returns {tabId} (a number, or 'new'
+// for navigate only), or {error}. There is NO fallback to the active tab or to any
+// chat-stored tab: chats no longer remember a linked tab.
+async function resolveBrowserTabTarget(rawTabId, action, opts) {
+    opts = opts || {};
+    var label = opts.toolLabel || ('iframe_tool ' + action);
+    if (rawTabId == null || rawTabId === '') {
+        return { error: 'tab_id is required for ' + label + ' (there is no fallback to the active tab). '
+            + IFRAME_TAB_REQUIRED_HINT + (action === 'navigate' ? ' Use tab_id:"new" to open a new tab.' : '') };
+    }
+    if (rawTabId === 'new') {
+        if (action === 'navigate') return { tabId: 'new' };
+        return { error: 'tab_id:"new" is only valid for navigate. ' + IFRAME_TAB_REQUIRED_HINT };
+    }
+    var tid = rawTabId;
+    if (typeof tid === 'string' && /^\d+$/.test(tid.trim())) tid = Number(tid.trim());
+    if (typeof tid !== 'number' || !isFinite(tid) || Math.floor(tid) !== tid || tid < 0) {
+        return { error: 'Invalid tab_id ' + JSON.stringify(rawTabId) + ' for ' + label + ': expected an integer tab id'
+            + (action === 'navigate' ? ' or "new"' : '') + '. ' + IFRAME_TAB_REQUIRED_HINT };
+    }
+    var tab = null;
+    if (typeof chrome !== 'undefined' && chrome.tabs && chrome.tabs.get) {
+        try { tab = await chrome.tabs.get(tid); }
+        catch (e) { tab = null; }
+        if (!tab) return { error: 'tab_id ' + tid + ' is not an open tab (it may have been closed). ' + IFRAME_TAB_REQUIRED_HINT };
+    }
+    if (action === 'navigate' && tab && _isExtensionOwnUrl(tab.url || tab.pendingUrl)) {
+        return { error: 'Refusing to navigate tab ' + tid + ': it is the extension\'s own tab (navigating it would unload the agent UI). '
+            + 'Pick another tab_id or use tab_id:"new". Screenshots and reads of the own tab are allowed.' };
+    }
+    return { tabId: tid, tab: tab };
+}
 
 // Send a DOM query to a cross-origin widget iframe via postMessage and wait for response
 function queryWidgetViaPostMessage(iframe, action, args) {
@@ -94,71 +141,45 @@ function queryWidgetViaPostMessage(iframe, action, args) {
     });
 }
 
-// Public entry point. Thin wrapper around the implementation that handles the
-// explicit tab_id pin: it validates the tab ONCE and, after the action runs,
-// mirrors the pin to the service-worker chat snapshot via _target_tab_persist
-// for EVERY browser action. navigate sets its own _target_tab_persist; without
-// this, the page-side chats[].targetTabId write for NON-navigate actions is
-// wiped by the next agent-event, so the "pins subsequent browser actions in
-// this chat to that tab" contract was broken for everything except navigate.
-// `options` (from executeTool) may carry chatId — the chat the tool is RUNNING
-// for (offscreen exec-tool bridge). Browser-action routing must use THAT chat's
-// targetTabId, not the chat the user is currently VIEWING (currentChatId), or a
-// sub-agent/background chat drives the wrong tab. Falls back to currentChatId.
+// Public entry point. Every browser action (no widget_id) REQUIRES an explicit
+// tab_id, validated here once; the resolved id is passed explicitly to the
+// implementation and stamped on the result as tab_id. Chats no longer store a
+// linked tab, so there is no pin to persist and no active-tab fallback.
+// `options` (from executeTool) may carry chatId — only used for chat-scoped
+// bookkeeping (e.g. sidepanel close waiting for the run to finish).
 async function executeIframeTool(args, options) {
     var _ifChatId = (options && options.chatId && typeof chats !== 'undefined' && chats[options.chatId])
         ? options.chatId
         : ((typeof currentChatId !== 'undefined') ? currentChatId : undefined);
-    var _pinTab = null;
-    if (args && args.tab_id != null && !args.widget_id &&
-        typeof chrome !== 'undefined' && chrome.tabs &&
-        typeof document !== 'undefined' && !document.body.classList.contains('sidepanel-mode')) {
-        try { await chrome.tabs.get(args.tab_id); }
-        catch (e) { return { success: false, error: 'tab_id ' + args.tab_id + ' is not an open tab. Use list_instances to see open tab ids.' }; }
-        _pinTab = args.tab_id;
-    }
-    // No-pin guard: when NO tab is targeted (neither an explicit tab_id nor a
-    // chat targetTabId), non-navigate browser actions silently fall back to
-    // the ACTIVE tab (background.js getActiveTabId) — which can be a totally
-    // unrelated tab the user happens to be looking at. Detect that case up
-    // front, stamp the result with which tab/URL was actually used
-    // (unpinned_tab), and add a prominent tab_warning when that tab is not on
-    // the connected instance. Full-tab mode only — in sidepanel mode the
-    // active tab IS the intended target. Pinning behavior is unchanged.
-    var _noPinTab = null;
-    var _NOPIN_ACTIONS = ['get_visible_text', 'get_dom', 'click', 'fill', 'type', 'wait_for',
-        'scroll', 'get_console_logs', 'get_network_requests', 'dispatch_event', 'select_option',
-        'get_properties', 'set_style', 'get_page_info'];
-    if (args && !args.widget_id && args.tab_id == null && _NOPIN_ACTIONS.indexOf(args.action) !== -1 &&
-        typeof chrome !== 'undefined' && chrome.tabs && chrome.tabs.query &&
-        typeof document !== 'undefined' && !document.body.classList.contains('sidepanel-mode') &&
-        !(typeof chats !== 'undefined' && _ifChatId !== undefined &&
-          chats[_ifChatId] && chats[_ifChatId].targetTabId)) {
-        try {
-            // Same query background.js getActiveTabId uses (currentWindow), so
-            // the stamped unpinned_tab matches the tab the action actually hit.
-            var _actTabs = await chrome.tabs.query({ active: true, currentWindow: true });
-            if (_actTabs && _actTabs[0] && _actTabs[0].url) _noPinTab = { id: _actTabs[0].id, url: _actTabs[0].url };
-        } catch (e) { /* tabs API unavailable — skip the guard */ }
-    }
-    var _ftResult = await _executeIframeToolImpl(args, _ifChatId, options);
-    if (_noPinTab && _ftResult && typeof _ftResult === 'object' && _ftResult.success) {
-        _ftResult.unpinned_tab = { tab_id: _noPinTab.id, url: _noPinTab.url };
-        var _instOrigin = null, _tabOrigin = null;
-        try { if (typeof Platform !== 'undefined' && Platform.instanceUrl) _instOrigin = new URL(Platform.instanceUrl).origin; } catch (e) {}
-        try { _tabOrigin = new URL(_noPinTab.url).origin; } catch (e) {}
-        if (_instOrigin && _tabOrigin && _tabOrigin !== _instOrigin) {
-            _ftResult.tab_warning = 'WARNING: no tab is pinned for this chat, so this action ran against the ACTIVE browser tab (tab_id ' + _noPinTab.id + ', ' + _noPinTab.url + '), which is NOT on the connected instance (' + _instOrigin + '). If this is the wrong tab, pass tab_id (see list_instances activeTabs) or navigate first to pin the right tab.';
+    var _ifTabId = null;
+    var _needsTab = !!(args && !args.widget_id && IFRAME_TAB_ACTIONS.indexOf(args.action) !== -1);
+    if (_needsTab) {
+        var _tgt = await resolveBrowserTabTarget(args.tab_id, args.action);
+        if (_tgt.error) return { success: false, error: _tgt.error };
+        _ifTabId = _tgt.tabId;
+    } else if (args && !args.widget_id && args.action === 'close' && args.tab_id != null && args.tab_id !== '') {
+        // close with an explicit tab_id closes THAT Chrome tab (never silently ignored).
+        var _ctgt = await resolveBrowserTabTarget(args.tab_id, 'close');
+        if (_ctgt.error) return { success: false, error: _ctgt.error };
+        if (_ctgt.tab && _isExtensionOwnUrl(_ctgt.tab.url || _ctgt.tab.pendingUrl)) {
+            return { success: false, error: 'Refusing to close tab ' + _ctgt.tabId + ': it is the extension\'s own tab (closing it would kill the agent UI).' };
         }
+        _ifTabId = _ctgt.tabId;
+    } else if (args && !args.widget_id && args.tab_id != null && /^\d+$/.test(String(args.tab_id))) {
+        _ifTabId = Number(args.tab_id);   // optional target (e.g. impersonate reload)
     }
-    if (_pinTab != null && _ftResult && typeof _ftResult === 'object' && _ftResult._target_tab_persist == null) {
-        _ftResult._target_tab_persist = _pinTab;
+    var _ftResult = await _executeIframeToolImpl(args, _ifChatId, options, _ifTabId);
+    if (_needsTab && _ftResult && typeof _ftResult === 'object' && _ftResult.tab_id == null && typeof _ifTabId === 'number') {
+        _ftResult.tab_id = _ifTabId;
     }
     return _ftResult;
 }
 
-async function _executeIframeToolImpl(args, _ifChatId, options) {
+// _ifTabId: the explicit, already-validated target tab (number, or 'new' for
+// navigate) resolved by executeIframeTool. Widget actions ignore it.
+async function _executeIframeToolImpl(args, _ifChatId, options, _ifTabId) {
     if (_ifChatId === undefined && typeof currentChatId !== 'undefined') _ifChatId = currentChatId;
+    if (_ifTabId === undefined) _ifTabId = null;
     var action = args.action;
     var widgetId = args.widget_id;
 
@@ -170,19 +191,11 @@ async function _executeIframeToolImpl(args, _ifChatId, options) {
     // Route browser actions through the real Chrome tab (not an embedded iframe)
     // Widget actions still use local iframes in the extension page
     if (!widgetId) {
-        // Explicit tab_id: pin every browser action in this chat to that exact Chrome
-        // tab (e.g. an id from list_instances' activeTabs), so the caller can drive /
-        // reuse a specific tab. Full-tab mode only (real tabs). A non-existent id is a
-        // hard error rather than silently falling back to a new tab.
-        if (args.tab_id != null && typeof chrome !== 'undefined' && chrome.tabs &&
-            typeof document !== 'undefined' && !document.body.classList.contains('sidepanel-mode')) {
-            // tab_id already validated by the executeIframeTool wrapper, which also
-            // mirrors this pin to the SW chat snapshot (_target_tab_persist), so a
-            // subsequent browser action that omits tab_id stays pinned to this tab.
-            if (chats[_ifChatId]) {
-                chats[_ifChatId].targetTabId = args.tab_id;
-                if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
-            }
+        // Every action below targets the explicit _ifTabId (validated by the
+        // executeIframeTool wrapper). Nothing is stored on the chat. Defense in
+        // depth for direct callers: never fall back to some other tab.
+        if (IFRAME_TAB_ACTIONS.indexOf(action) !== -1 && _ifTabId == null) {
+            return { success: false, error: 'tab_id is required for iframe_tool ' + action + ' (there is no fallback to the active tab). ' + IFRAME_TAB_REQUIRED_HINT };
         }
         var extBrowserActions = ['navigate', 'get_visible_text', 'get_dom', 'click', 'fill', 'type', 'wait_for',
             'scroll', 'close', 'get_console_logs', 'get_network_requests',
@@ -193,7 +206,7 @@ async function _executeIframeToolImpl(args, _ifChatId, options) {
             if (args.preset && presets[args.preset]) { rw = presets[args.preset].w; rh = presets[args.preset].h; }
             else { rw = args.width; rh = args.height; }
             if (!rw && !rh) return { success: false, error: 'Provide width/height or a preset (mobile, tablet, desktop, fullhd)' };
-            var extResize = await Platform.sendBrowserAction('resize', { width: rw, height: rh }, _ifChatId);
+            var extResize = await Platform.sendBrowserAction('resize', { width: rw, height: rh }, _ifTabId);
             if (extResize.error) return { success: false, error: extResize.error };
             var resizeMsg = 'Resized to ' + rw + 'x' + rh;
             if (extResize.emulated) {
@@ -206,7 +219,7 @@ async function _executeIframeToolImpl(args, _ifChatId, options) {
                 var _settleDeadline = Date.now() + 1500;
                 while (Date.now() < _settleDeadline) {
                     var _pi;
-                    try { _pi = await Platform.sendBrowserAction('get_page_info', {}, _ifChatId); } catch (e) { _pi = null; }
+                    try { _pi = await Platform.sendBrowserAction('get_page_info', {}, _ifTabId); } catch (e) { _pi = null; }
                     if (_pi && !_pi.error) {
                         var _wOk = !rw || Math.abs((_pi.viewportWidth || 0) - rw) <= 2;
                         var _hOk = !rh || Math.abs((_pi.viewportHeight || 0) - rh) <= 2;
@@ -215,7 +228,7 @@ async function _executeIframeToolImpl(args, _ifChatId, options) {
                     await new Promise(function(r){ setTimeout(r, 100); });
                 }
             }
-            return { success: true, message: resizeMsg };
+            return { success: true, message: resizeMsg, tab_id: _ifTabId };
         }
         if (extBrowserActions.indexOf(action) !== -1) {
             try {
@@ -231,96 +244,18 @@ async function _executeIframeToolImpl(args, _ifChatId, options) {
                         }
                     }
 
-                    // Full-tab mode: open target page in a background tab (app stays alive)
-                    // Reuses existing target tab if valid, otherwise creates a new one
-                    // Tab ID is saved to chat so all actions target the right tab
+                    // Full-tab mode: navigate exactly the tab the caller named (tab_id),
+                    // or open a new background tab for tab_id:"new" (app stays alive).
+                    // Nothing is saved on the chat; the result carries tab_id.
                     if (!document.body.classList.contains('sidepanel-mode')) {
                         var fullTabNavUrl = args.url;
                         if (fullTabNavUrl.startsWith('/')) {
                             var _baseUrl = _navInstanceUrl || Platform.instanceUrl;
                             if (_baseUrl) fullTabNavUrl = _baseUrl + fullTabNavUrl;
                         }
-                        var _ftChat = chats[_ifChatId];
-                        var _existingTabId = _ftChat && _ftChat.targetTabId;
-                        var _reuseTab = false;
-                        // If targeting a different instance, try to find an existing tab on it first
-                        if (_navInstanceUrl && Platform.getTabForInstance) {
-                            var _instanceTabId = Platform.getTabForInstance(_navInstanceUrl, fullTabNavUrl);
-                            if (_instanceTabId && _instanceTabId !== _existingTabId) {
-                                _existingTabId = _instanceTabId;
-                            }
-                        }
-                        // An explicit tab_id wins over instance-based tab discovery and the
-                        // adoption guard: navigate exactly the tab the caller named (already
-                        // validated + pinned to the chat above).
-                        if (args.tab_id != null) _existingTabId = args.tab_id;
-                        // Validate the recorded / cross-instance tab still exists.
-                        if (_existingTabId) {
-                            try { await chrome.tabs.get(_existingTabId); _reuseTab = true; } catch(e) { _existingTabId = null; }
-                        }
-                        // No live tab to reuse yet? Adopt an already-open tab that is already
-                        // sitting on the *same* page instead of spawning a duplicate. We only
-                        // adopt when an open tab has the same origin + path AND already contains
-                        // every query param of the target URL, so we never hijack a tab showing a
-                        // different record / catalog item. This lets iframe_tool drive a tab the
-                        // user already had open (previously, navigating to a page the user already
-                        // had open always created a second background tab).
-                        var _adoptedTab = null;
-                        if (!_reuseTab) {
-                            try {
-                                var _tgtU = new URL(fullTabNavUrl);
-                                var _tgtPath = _tgtU.pathname.replace(/\/+$/, '');
-                                // Tab ids already owned by OTHER chats — never steal those.
-                                var _otherChatTabIds = {};
-                                try {
-                                    Object.keys(chats || {}).forEach(function(_cid) {
-                                        if (_cid !== _ifChatId && chats[_cid] && chats[_cid].targetTabId) {
-                                            _otherChatTabIds[chats[_cid].targetTabId] = true;
-                                        }
-                                    });
-                                } catch (e) {}
-                                // Focused window id — used to skip the tab the user is looking at.
-                                var _focusedWinId = null;
-                                try {
-                                    if (chrome.windows && chrome.windows.getLastFocused) {
-                                        var _focusedWin = await chrome.windows.getLastFocused();
-                                        if (_focusedWin) _focusedWinId = _focusedWin.id;
-                                    }
-                                } catch (e) {}
-                                var _openTabs = await chrome.tabs.query({});
-                                for (var _oti = 0; _oti < _openTabs.length; _oti++) {
-                                    var _cand = _openTabs[_oti];
-                                    if (!_cand || !_cand.url) continue;
-                                    // Never adopt pinned/incognito/discarded tabs, tabs another
-                                    // chat owns, or tabs another navigate is currently adopting.
-                                    if (_cand.pinned || _cand.incognito || _cand.discarded) continue;
-                                    if (_adoptionInFlight.has(_cand.id) || _otherChatTabIds[_cand.id]) continue;
-                                    // Skip the tab the user is actively looking at (active tab of
-                                    // the focused window). If we can't tell which window is
-                                    // focused, err on the side of skipping every active tab.
-                                    if (_cand.active && (_focusedWinId === null || _cand.windowId === _focusedWinId)) continue;
-                                    var _candU;
-                                    try { _candU = new URL(_cand.url); } catch (e) { continue; }
-                                    if (_candU.origin !== _tgtU.origin) continue;
-                                    if (_candU.pathname.replace(/\/+$/, '') !== _tgtPath) continue;
-                                    // Require EXACT query equality (both directions) so we never
-                                    // hijack a tab showing a more specific page (e.g. target
-                                    // /incident.do must not adopt /incident.do?sys_id=X).
-                                    var _paramsMatch = true;
-                                    _tgtU.searchParams.forEach(function(v, k) {
-                                        if (_candU.searchParams.get(k) !== v) _paramsMatch = false;
-                                    });
-                                    _candU.searchParams.forEach(function(v, k) {
-                                        if (_tgtU.searchParams.get(k) !== v) _paramsMatch = false;
-                                    });
-                                    if (!_paramsMatch) continue;
-                                    _existingTabId = _cand.id;
-                                    _adoptedTab = _cand;
-                                    _reuseTab = true;
-                                    break;
-                                }
-                            } catch (e) { /* fall through and create a new tab */ }
-                        }
+                        var _isNewTab = (_ifTabId === 'new');
+                        var _existingTabId = _isNewTab ? null : _ifTabId;
+                        var _reuseTab = !_isNewTab && _existingTabId != null;
                         // Pre-register load listener BEFORE initiating navigation to avoid
                         // missing the 'complete' event for fast loads / cached pages.
                         var _waitMs = (typeof args.wait === 'number') ? args.wait : (args.wait ? 15000 : 0);
@@ -337,51 +272,12 @@ async function _executeIframeToolImpl(args, _ifChatId, options) {
                         }
 
                         var _targetTab;
-                        if (_reuseTab && _existingTabId != null) _adoptionInFlight.add(_existingTabId);
-                        try {
-                            // If the adopted tab is already sitting on the exact target URL
-                            // (ignoring hash / trailing slash), don't force a reload — a
-                            // tabs.update would destroy the user's in-page state.
-                            var _normNavUrl = function(u) {
-                                try { var _x = new URL(u); return _x.origin + _x.pathname.replace(/\/+$/, '') + _x.search; }
-                                catch (e) { return String(u || '').split('#')[0].replace(/\/+$/, ''); }
-                            };
-                            if (_reuseTab && _adoptedTab && _adoptedTab.url && _normNavUrl(_adoptedTab.url) === _normNavUrl(fullTabNavUrl)) {
-                                _targetTab = _adoptedTab;
-                            } else if (_reuseTab) {
-                                _targetTab = await chrome.tabs.update(_existingTabId, { url: fullTabNavUrl });
-                            } else {
-                                _targetTab = await chrome.tabs.create({ url: fullTabNavUrl, active: false });
-                                if (_earlyListener) _navTabIdEarly = _targetTab.id;
-                            }
-                            if (_ftChat) {
-                                _ftChat.targetTabId = _targetTab.id;
-                                saveChatsToStorage();
-                            }
-                        } finally {
-                            if (_existingTabId != null) _adoptionInFlight.delete(_existingTabId);
+                        if (_reuseTab) {
+                            _targetTab = await chrome.tabs.update(_existingTabId, { url: fullTabNavUrl });
+                        } else {
+                            _targetTab = await chrome.tabs.create({ url: fullTabNavUrl, active: false });
+                            if (_earlyListener) _navTabIdEarly = _targetTab.id;
                         }
-                        // Adopted tabs were opened by the user (not the agent), so the
-                        // content script may not be injected yet — inject eagerly so the
-                        // very next action doesn't fail. Idempotent; mirrors the pattern
-                        // background.js uses in getSnTabList.
-                        if (_adoptedTab) {
-                            try {
-                                if (chrome.scripting && chrome.scripting.executeScript) {
-                                    await chrome.scripting.executeScript({ target: { tabId: _targetTab.id }, files: ['content-script.js'] });
-                                } else {
-                                    chrome.runtime.sendMessage({ type: 'ensure-content-script', tabId: _targetTab.id });
-                                }
-                            } catch (e) {
-                                try { chrome.runtime.sendMessage({ type: 'ensure-content-script', tabId: _targetTab.id }); } catch (e2) {}
-                            }
-                        }
-                        // Mirror to SW: when the agent loop runs in the SW, its
-                        // chat snapshot doesn't know about this page-side write,
-                        // so the next agent-event would replace chats[chatId] in
-                        // the panel and wipe targetTabId. tool-routing.js applies
-                        // _target_tab_persist back onto the SW's chat object.
-                        var _ftPersist = _targetTab.id;
                         // If wait requested, wait for the tab to finish loading then inject scripts
                         // Otherwise ask background to inject when page loads (non-blocking)
                         if (_waitMs > 0) {
@@ -408,7 +304,7 @@ async function _executeIframeToolImpl(args, _ifChatId, options) {
                                     (async function _pollReady() {
                                         while (Date.now() < _readyDeadline) {
                                             try {
-                                                var _ping = await Platform.sendBrowserAction('get_page_info', {}, _ifChatId);
+                                                var _ping = await Platform.sendBrowserAction('get_page_info', {}, _targetTab.id);
                                                 if (_ping && !_ping.error) { resolve(); return; }
                                             } catch (e) { /* not ready yet */ }
                                             await new Promise(function(r){ setTimeout(r, 150); });
@@ -452,7 +348,7 @@ async function _executeIframeToolImpl(args, _ifChatId, options) {
                         var _navMsg = _reuseTab
                             ? 'Navigated the existing tab (id ' + _targetTab.id + ') to ' + fullTabNavUrl + ' \u2014 same tab reused in place, not brought to the foreground'
                             : 'Opened ' + fullTabNavUrl + ' in a new background tab (id ' + _targetTab.id + ')';
-                        return { success: true, message: _navMsg, _target_tab_persist: _ftPersist };
+                        return { success: true, message: _navMsg, tab_id: _targetTab.id, opened_new_tab: !_reuseTab };
                     }
 
                     // For sidepanel mode with instance targeting, resolve URL before sending
@@ -467,6 +363,15 @@ async function _executeIframeToolImpl(args, _ifChatId, options) {
                 }
 
                 // Side panel mode close: expand back to full page after response completes
+                if (action === 'close' && typeof _ifTabId === 'number') {
+                    var _closeRes;
+                    try { _closeRes = await Platform.sendBrowserAction('close', args, _ifTabId); }
+                    catch (e) { _closeRes = { error: 'Extension browser action failed: ' + e.message }; }
+                    if (!_closeRes || _closeRes.error || !_closeRes.closed) {
+                        return { success: false, error: (_closeRes && _closeRes.error) || ('Tab ' + _ifTabId + ' was not closed (no confirmation from the background).'), tab_id: _ifTabId };
+                    }
+                    return { success: true, closed: true, tab_id: _ifTabId, message: _closeRes.message || ('Closed tab ' + _ifTabId) };
+                }
                 if (action === 'close' && document.body.classList.contains('sidepanel-mode')) {
                     var _expandCheck = setInterval(function() {
                         if (typeof isChatRunning !== 'function' || !isChatRunning(_ifChatId)) {
@@ -489,7 +394,7 @@ async function _executeIframeToolImpl(args, _ifChatId, options) {
                 };
                 var extResult;
                 try {
-                    extResult = await Platform.sendBrowserAction(action, args, _ifChatId);
+                    extResult = await Platform.sendBrowserAction(action, args, _ifTabId);
                 } catch (e) {
                     extResult = { error: 'Extension browser action failed: ' + e.message };
                 }
@@ -502,13 +407,11 @@ async function _executeIframeToolImpl(args, _ifChatId, options) {
                     while (_portAttempt < _maxPortRetries && extResult && extResult.error && _isPortError(extResult.error)) {
                         _portAttempt++;
                         try {
-                            var _retryChat = chats[_ifChatId];
-                            var _retryTabId = _retryChat && _retryChat.targetTabId;
-                            if (_retryTabId) chrome.runtime.sendMessage({ type: 'setup-tab-injection', tabId: _retryTabId });
+                            if (typeof _ifTabId === 'number') chrome.runtime.sendMessage({ type: 'setup-tab-injection', tabId: _ifTabId });
                         } catch (e) { /* defensive */ }
                         await new Promise(function(r){ setTimeout(r, 300 * _portAttempt); });
                         try {
-                            extResult = await Platform.sendBrowserAction(action, args, _ifChatId);
+                            extResult = await Platform.sendBrowserAction(action, args, _ifTabId);
                         } catch (e2) {
                             extResult = { error: 'Extension browser action failed: ' + e2.message };
                         }
@@ -517,17 +420,9 @@ async function _executeIframeToolImpl(args, _ifChatId, options) {
                 if (extResult.error) {
                     return { success: false, error: extResult.error };
                 }
-                // Persist target tab ID on the chat so it survives restarts
-                var _spPersist = null;
-                if (action === 'navigate' && extResult.tabId) {
-                    var _navChat = chats[_ifChatId];
-                    if (_navChat) {
-                        _navChat.targetTabId = extResult.tabId;
-                        saveChatsToStorage();
-                    }
-                    // See full-tab branch above for why we mirror to the SW.
-                    _spPersist = extResult.tabId;
-                }
+                // The tab actually used (navigate with tab_id:"new" reports the new id).
+                var _usedTabId = (typeof extResult.tabId === 'number') ? extResult.tabId
+                    : (typeof _ifTabId === 'number' ? _ifTabId : null);
                 // Map content script response to tool result format
                 if (action === 'get_visible_text') {
                     // Deep mode returns visibleElements array; simple mode returns text
@@ -575,7 +470,8 @@ async function _executeIframeToolImpl(args, _ifChatId, options) {
                     return { success: true, message: extResult.message || ('Styled ' + (extResult.count || '?') + ' element(s)') };
                 }
                 var _defaultRet = { success: true, message: extResult.message || 'Action completed' };
-                if (_spPersist) _defaultRet._target_tab_persist = _spPersist;
+                if (_usedTabId != null) _defaultRet.tab_id = _usedTabId;
+                if (action === 'navigate' && extResult.openedNewTab) _defaultRet.opened_new_tab = true;
                 return _defaultRet;
             } catch (e) {
                 return { success: false, error: 'Extension browser action failed: ' + e.message };
@@ -1207,7 +1103,7 @@ async function _executeIframeToolImpl(args, _ifChatId, options) {
                         if (!stopRes.ok) return { success: false, error: 'Failed to stop impersonation: HTTP ' + stopRes.status };
                         impersonateOriginalUserSysId = null;
                         appStorage.removeItem('impersonateOriginalUserSysId');
-                        Platform.sendBrowserAction('reload', {}, _ifChatId);
+                        if (typeof _ifTabId === 'number') Platform.sendBrowserAction('reload', {}, _ifTabId);
                         return { success: true, message: 'Impersonation ended. Switched back to original user. Iframe reloaded.' };
                     }
                     // Store original user sys_id before first impersonation
@@ -1243,7 +1139,7 @@ async function _executeIframeToolImpl(args, _ifChatId, options) {
                     if (!impRes.ok) {
                         return { success: false, error: 'Impersonation failed: HTTP ' + impRes.status };
                     }
-                    Platform.sendBrowserAction('reload', {}, _ifChatId);
+                    if (typeof _ifTabId === 'number') Platform.sendBrowserAction('reload', {}, _ifTabId);
                     return { success: true, message: 'Now impersonating user (sys_id: ' + userSysId + '). Iframe reloaded.' };
                 } catch(e) {
                     return { success: false, error: 'Impersonate failed: ' + e.message };

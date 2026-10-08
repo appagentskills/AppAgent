@@ -2867,10 +2867,10 @@ async function loadApiProviders() {
                     // field, including unmatched endpointId rows and credentials.
                     if (legacyInline.changed) await saveAllApiProviders();
                     // One-shot migration for renamed/removed/retuned defaults.
-                    // July 2026 alignment: Kimi K2.5 → GLM 5.2, sonnet-4.6 →
+                    // July 2026 alignment: Kimi K2.5 → GLM 5.2 (now → GLM 5.3), sonnet-4.6 →
                     // sonnet-5, gpt-5.2 → gpt-6.1-sol (chain-collapsed through the
                     // retired gpt-5.5 / gpt-5.6-sol / gpt-6-sol defaults), Gemini 3 Flash Preview →
-                    // Gemini 3.5 Flash, Sonnet 4.6 OAuth → Sonnet 5 (now → Sonnet 5.5), and the
+                    // Gemini 3.5 Flash (now → Gemini 3.8 Flash), Sonnet 4.6 OAuth → Sonnet 5 (now → Sonnet 5.5), and the
                     // ' OAuth' name suffix was dropped (Opus-4-8 OAuth → Opus-4-8,
                     // Sonnet 5 OAuth → Sonnet 5); the
                     // opus-4.8 (OpenRouter), haiku-4.5 and Proxy defaults were
@@ -2899,14 +2899,14 @@ async function loadApiProviders() {
                         // exist in the defaults)
                         { to: 'sonnet-5.5', from: { name: 'sonnet-4.5', apiKey: '', model: 'anthropic/claude-sonnet-4.5', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 200000, maxTokens: 64000, thinkingBudget: 40000 } },
                         { to: 'sonnet-5.5', from: { name: 'sonnet-4.6', apiKey: '', model: 'anthropic/claude-sonnet-4.6', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 200000, maxTokens: 64000, effort: 'high' } },
-                        { to: 'GLM 5.2', from: { name: 'Kimi K2.5', apiKey: '', model: 'moonshotai/kimi-k2.5', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 262000, maxTokens: 64000, thinkingBudget: 40000, provider: 'moonshotai' } },
+                        { to: 'GLM 5.3', from: { name: 'Kimi K2.5', apiKey: '', model: 'moonshotai/kimi-k2.5', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 262000, maxTokens: 64000, thinkingBudget: 40000, provider: 'moonshotai' } },
                         { to: 'gpt-6.1-sol', from: { name: 'gpt-5.2', apiKey: '', model: 'openai/gpt-5.2', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 400000, maxTokens: 128000, effort: 'low' } },
                         { to: 'gpt-6.1-sol', from: { name: 'gpt-5.5', apiKey: '', model: 'openai/gpt-5.5', endpoint: 'https://openrouter.ai/api/v1/chat/completions', effort: 'low' } },
                         // Sept 2026: GPT-6 Sol supersedes the gpt-5.6-sol OpenRouter default
                         { to: 'gpt-6.1-sol', from: { name: 'gpt-5.6-sol', model: 'openai/gpt-5.6-sol', endpoint: 'https://openrouter.ai/api/v1/chat/completions', apiKey: '', effort: 'low' } },
                         // Sept 30 2026: GPT-6.1 Sol supersedes the gpt-6-sol OpenRouter default
                         { to: 'gpt-6.1-sol', from: { name: 'gpt-6-sol', model: 'openai/gpt-6-sol', endpoint: 'https://openrouter.ai/api/v1/chat/completions', apiKey: '', effort: 'low' } },
-                        { to: 'Gemini 3.5 Flash', from: { name: 'Gemini 3 Flash Preview', apiKey: '', model: 'google/gemini-3-flash-preview', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 1000000, maxTokens: 64000, thinkingBudget: 50000 } },
+                        { to: 'Gemini 3.8 Flash', from: { name: 'Gemini 3 Flash Preview', apiKey: '', model: 'google/gemini-3-flash-preview', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 1000000, maxTokens: 64000, thinkingBudget: 50000 } },
                         { to: 'Sonnet 5.5', from: { name: 'Sonnet 4.6 OAuth', model: 'claude-sonnet-4-6', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', maxTokens: 100000, context_length: 200000, effort: 'high', isClaudeOAuth: true } },
                         // OAuth-suffix drop — same providers, friendlier names.
                         // Two Opus snapshots: effort was 'high' before the xhigh
@@ -2951,7 +2951,15 @@ async function loadApiProviders() {
                         { to: 'sonnet-5.5', from: { name: 'sonnet-5', apiKey: '', model: 'anthropic/claude-sonnet-5', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 1000000, maxTokens: 64000, effort: 'high' } },
                         { to: 'Sonnet 5.5', from: { name: 'Sonnet 5', model: 'claude-sonnet-5', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', effort: 'high', isClaudeOAuth: true } },
                         { to: 'Sonnet 5.5', from: { name: 'Sonnet 5', model: 'claude-sonnet-5', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', maxTokens: 100000, context_length: 1000000, effort: 'high', isClaudeOAuth: true } },
-                        { to: 'Sonnet 5.5', from: { name: 'Sonnet 5', model: 'claude-sonnet-5', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', maxTokens: 100000, effort: 'high', isClaudeOAuth: true } }
+                        { to: 'Sonnet 5.5', from: { name: 'Sonnet 5', model: 'claude-sonnet-5', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', maxTokens: 100000, effort: 'high', isClaudeOAuth: true } },
+                        // Oct 7 2026: GLM 5.3 / Gemini 3.8 Flash supersede the GLM
+                        // 5.2 / Gemini 3.5 Flash OpenRouter defaults. Inline-endpoint
+                        // seed shapes G1/F1 (206dddf) and G5/F5 (adb32f3→now); the
+                        // endpointId-era G2–G4/F2–F4 are expanded below.
+                        { to: 'GLM 5.3', from: { name: 'GLM 5.2', model: 'z-ai/glm-5.2', endpoint: 'https://openrouter.ai/api/v1/chat/completions', apiKey: '', provider: 'z-ai' } },
+                        { to: 'GLM 5.3', from: { name: 'GLM 5.2', apiKey: '', model: 'z-ai/glm-5.2', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 1048576, maxTokens: 64000, thinkingBudget: 40000, provider: 'z-ai' } },
+                        { to: 'Gemini 3.8 Flash', from: { name: 'Gemini 3.5 Flash', model: 'google/gemini-3.5-flash', endpoint: 'https://openrouter.ai/api/v1/chat/completions', apiKey: '' } },
+                        { to: 'Gemini 3.8 Flash', from: { name: 'Gemini 3.5 Flash', apiKey: '', model: 'google/gemini-3.5-flash', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 1048576, maxTokens: 64000, thinkingBudget: 50000 } }
                     ].concat((function() {
                         // endpointId-era sonnet-5 seeds (S2 80ea667→a60322e, S3
                         // 759b9a3, S4 8aaa494→a1a0627). inlineLegacyEndpointProviders
@@ -2963,16 +2971,25 @@ async function loadApiProviders() {
                         // (030-config.js). apiKey:'' is listed so a user key
                         // (renames ignore the apiKey VALUE) still matches (b)/(c).
                         var OR_URL = 'https://openrouter.ai/api/v1/chat/completions';
+                        // Same three vintages for GLM 5.2 (G2–G4) and Gemini 3.5
+                        // Flash (F2–F4), which shipped in the same commits.
                         return [
-                            { name: 'sonnet-5', model: 'anthropic/claude-sonnet-5', endpointId: 'openrouter', context_length: 1000000, maxTokens: 64000, effort: 'high' },
-                            { name: 'sonnet-5', model: 'anthropic/claude-sonnet-5', endpointId: 'openrouter', maxTokens: 64000, effort: 'high' },
-                            { name: 'sonnet-5', model: 'anthropic/claude-sonnet-5', endpointId: 'openrouter', effort: 'high' }
-                        ].reduce(function(rows, seed) {
+                            ['sonnet-5.5', { name: 'sonnet-5', model: 'anthropic/claude-sonnet-5', endpointId: 'openrouter', context_length: 1000000, maxTokens: 64000, effort: 'high' }],
+                            ['sonnet-5.5', { name: 'sonnet-5', model: 'anthropic/claude-sonnet-5', endpointId: 'openrouter', maxTokens: 64000, effort: 'high' }],
+                            ['sonnet-5.5', { name: 'sonnet-5', model: 'anthropic/claude-sonnet-5', endpointId: 'openrouter', effort: 'high' }],
+                            ['GLM 5.3', { name: 'GLM 5.2', model: 'z-ai/glm-5.2', endpointId: 'openrouter', context_length: 1048576, maxTokens: 64000, thinkingBudget: 40000, provider: 'z-ai' }],
+                            ['GLM 5.3', { name: 'GLM 5.2', model: 'z-ai/glm-5.2', endpointId: 'openrouter', maxTokens: 64000, thinkingBudget: 40000, provider: 'z-ai' }],
+                            ['GLM 5.3', { name: 'GLM 5.2', model: 'z-ai/glm-5.2', endpointId: 'openrouter', provider: 'z-ai' }],
+                            ['Gemini 3.8 Flash', { name: 'Gemini 3.5 Flash', model: 'google/gemini-3.5-flash', endpointId: 'openrouter', context_length: 1048576, maxTokens: 64000, thinkingBudget: 50000 }],
+                            ['Gemini 3.8 Flash', { name: 'Gemini 3.5 Flash', model: 'google/gemini-3.5-flash', endpointId: 'openrouter', maxTokens: 64000, thinkingBudget: 50000 }],
+                            ['Gemini 3.8 Flash', { name: 'Gemini 3.5 Flash', model: 'google/gemini-3.5-flash', endpointId: 'openrouter' }]
+                        ].reduce(function(rows, pair) {
+                            var to = pair[0], seed = pair[1];
                             var inlined = Object.assign({}, seed, { url: OR_URL, endpoint: OR_URL, apiKey: '' });
                             var dropped = Object.assign({}, inlined);
                             delete dropped.endpointId;
                             return rows.concat([seed, inlined, dropped].map(function(from) {
-                                return { to: 'sonnet-5.5', from: from };
+                                return { to: to, from: from };
                             }));
                         }, []);
                     })()).forEach(function(mig) {

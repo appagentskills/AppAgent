@@ -46,6 +46,13 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
     });
     var modelLower = provider.model.toLowerCase();
     var isAnthropic = (modelLower.includes('anthropic') || modelLower.includes('claude'));
+    // Pass chatId so sub-agent chats see their per-sub tool_roster
+    // (deterministic: parent's full list minus the nested-delegation
+    // trio unless allow_nested:true) and parent chats don't see
+    // sub-only tools (report_to_parent, sleep_self). Anthropic: exactly one
+    // 1h marker on the last tool (non-Anthropic: untouched legacy shape).
+    var requestTools = getEnabledTools(chatId);
+    if (isAnthropic) requestTools = _withAnthropicToolCacheMarker(requestTools);
     if (isAnthropic && messagesWithCache.length > 0) {
         // Step 1: Normalize ALL messages to array format for consistent structure
         for (var j = 0; j < messagesWithCache.length; j++) {
@@ -54,35 +61,31 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
                 messagesWithCache[j] = Object.assign({}, m, {
                     content: [{ type: 'text', text: m.content }]
                 });
+            } else if (Array.isArray(m.content) && m.content.some(function(c) { return c && c.cache_control; })) {
+                // Stale markers on stored blocks would bypass the budget below.
+                messagesWithCache[j] = Object.assign({}, m, { content: m.content.map(function(c) {
+                    if (!c || !c.cache_control) return c;
+                    var cc2 = Object.assign({}, c); delete cc2.cache_control; return cc2;
+                }) });
             }
         }
 
-        // Step 2: Cache last 2 user messages + last block
-        var cacheIndices = [];
+        // Step 2: message breakpoints within the HARD 4-marker budget
+        // (Anthropic 400s on a 5th). Reserved: system 1 + tools 1 (when
+        // tools are present; both applied below). In a tool loop the last
+        // message is role:'tool', so the old "last 2 user + last" scheme
+        // emitted 5. Now: last message first, then fill the remainder with
+        // the most recent user messages.
+        var _hasTools = Array.isArray(requestTools) && requestTools.length > 0;
+        var msgBudget = _anthropicMaxBreakpoints() - 1 - (_hasTools ? 1 : 0);
+        var cacheIndices = _selectAnthropicMessageCacheIndices(messagesWithCache, msgBudget);
 
-        // Find last 2 user messages
-        var userMsgCount = 0;
-        for (var i = messagesWithCache.length - 1; i >= 0 && userMsgCount < 2; i--) {
-            if (messagesWithCache[i].role === 'user') {
-                cacheIndices.push(i);
-                userMsgCount++;
-            }
-        }
-
-        // Always cache the last message
-        if (messagesWithCache.length > 0) {
-            var lastIdx = messagesWithCache.length - 1;
-            if (cacheIndices.indexOf(lastIdx) === -1) {
-                cacheIndices.push(lastIdx);
-            }
-        }
-
-        // Apply cache_control to selected indices
+        // Apply cache_control to selected indices (5m: after the 1h prefix)
         cacheIndices.forEach(function(idx) {
             var msg = messagesWithCache[idx];
             if (Array.isArray(msg.content) && msg.content.length > 0) {
                 var contentCopy = msg.content.map(function(c) { return Object.assign({}, c); });
-                contentCopy[contentCopy.length - 1].cache_control = { type: 'ephemeral' };
+                contentCopy[contentCopy.length - 1].cache_control = _anthropicCacheControl('message');
                 messagesWithCache[idx] = Object.assign({}, msg, { content: contentCopy });
             }
         });
@@ -97,7 +100,7 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
         // For Anthropic: use array format with cache_control on the system prompt
         systemMessage = {
             role: 'system',
-            content: [{ type: 'text', text: systemPromptText, cache_control: { type: 'ephemeral' } }]
+            content: [{ type: 'text', text: systemPromptText, cache_control: _anthropicCacheControl('stable') }]
         };
     } else {
         systemMessage = { role: 'system', content: systemPromptText };
@@ -106,11 +109,7 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
     var requestBody = {
         model: provider.model,
         messages: [systemMessage].concat(messagesWithCache),
-        // Pass chatId so sub-agent chats see their per-sub tool_roster
-        // (deterministic: parent's full list minus the nested-delegation
-        // trio unless allow_nested:true) and parent chats don't see
-        // sub-only tools (report_to_parent, sleep_self).
-        tools: getEnabledTools(chatId),
+        tools: requestTools,
         tool_choice: 'auto',
         parallel_tool_calls: true,
         stream: true,
@@ -184,7 +183,12 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
     // transformToAnthropic (background.js) can send {type:'between_tools'}.
     // On OpenRouter it is NOT sent ('disabled' is a 400 on Sonnet 5.5), so
     // reasoning stays absent (model default adaptive).
+    // Haiku 5.5+ (isHaiku55Plus) accepts thinking:{type:'disabled'} at effort
+    // ≤ high, and thinkingOff implies no provider effort (model default
+    // medium), so the off flag is kept on BOTH paths (OpenRouter maps
+    // enabled:false to 'disabled'; transformToAnthropic via thinkingOffShapeFor).
     var offSignalOk = !isThinkingBindingModel(modelLower)
+        || (typeof isHaiku55Plus === 'function' && isHaiku55Plus(modelLower))
         || (routesToClaudeOAuth && typeof isSonnet55Plus === 'function' && isSonnet55Plus(modelLower));
     if (thinkingOff && reasoningRequired) {
         // No off switch on these models: send the lowest supported effort.
@@ -849,6 +853,42 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
 // a screenshot is ~1MB of chars and its bytes never drift independently of
 // the block around it.
 var _prefixFpMemo = {};
+
+// ─── Anthropic prompt-cache breakpoints ─────────────────────────────────
+// Policy (budget + TTLs) lives in core/030-config.js; typeof-guarded so a
+// realm without it falls back to the documented defaults (4, 5m).
+function _anthropicMaxBreakpoints() {
+    return (typeof ANTHROPIC_MAX_CACHE_BREAKPOINTS === 'number') ? ANTHROPIC_MAX_CACHE_BREAKPOINTS : 4;
+}
+function _anthropicCacheControl(kind) {
+    return (typeof anthropicCacheControl === 'function') ? anthropicCacheControl(kind) : { type: 'ephemeral' };
+}
+// Copy of `tools` with exactly ONE marker (stable TTL) on the last tool —
+// replaces the plain 5m marker getEnabledTools stamps (ui/140 + worker/025).
+function _withAnthropicToolCacheMarker(tools) {
+    if (!Array.isArray(tools) || tools.length === 0) return tools;
+    return tools.map(function(t, i) {
+        if (!t || typeof t !== 'object') return t;
+        var copy = Object.assign({}, t);
+        delete copy.cache_control;
+        if (i === tools.length - 1) copy.cache_control = _anthropicCacheControl('stable');
+        return copy;
+    });
+}
+// Message indices to mark, at most `budget`: the last message first (the
+// moving tail), then the most recent role:'user' messages. Only messages
+// with non-empty array content count (a marker can only land there).
+function _selectAnthropicMessageCacheIndices(msgs, budget) {
+    var out = [];
+    if (!Array.isArray(msgs) || !(budget > 0)) return out;
+    function markable(m) { return m && Array.isArray(m.content) && m.content.length > 0; }
+    var lastIdx = msgs.length - 1;
+    if (lastIdx >= 0 && markable(msgs[lastIdx])) out.push(lastIdx);
+    for (var i = lastIdx - 1; i >= 0 && out.length < budget; i--) {
+        if (msgs[i] && msgs[i].role === 'user' && markable(msgs[i])) out.push(i);
+    }
+    return out.slice(0, budget);
+}
 function _fpReplacer(k, v) {
     if (typeof v !== 'string' || v.length < 256) return v;
     if (v.slice(0, 5) === 'data:' && v.indexOf(';base64,') !== -1) return '[b64 ' + v.length + ']';

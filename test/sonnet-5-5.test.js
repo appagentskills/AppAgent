@@ -35,10 +35,10 @@ async function _buildBody(provider, globalBudget) {
     var llm = await loadFile('src/js/app/010-llm-streaming.js');
     var cfg = await _cfgSrc();
     var body = _cut(llm, '    var requestBody = {', '\tif (provider.provider) {');
-    var fn = new Function('provider', 'modelLower', 'isAnthropic', 'systemMessage', 'messagesWithCache', 'chatId',
+    var fn = new Function('provider', 'modelLower', 'isAnthropic', 'systemMessage', 'messagesWithCache', 'chatId', 'requestTools',
         'getEnabledTools', 'getGlobalMaxTokens', 'getGlobalThinkingBudget',
         _cut(cfg, 'var ADAPTIVE_ONLY_CLAUDE_RE', 'var currentProvider = ') + body + '\nreturn requestBody;');
-    return fn(provider, provider.model.toLowerCase(), true, { role: 'system', content: 's' }, [], null,
+    return fn(provider, provider.model.toLowerCase(), true, { role: 'system', content: 's' }, [], null, [],
         function() { return []; }, function() { return 64000; }, function() { return globalBudget; });
 }
 var EP = 'https://api.anthropic.com/v1/messages', OR = 'https://openrouter.ai/api/v1/chat/completions';

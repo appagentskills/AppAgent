@@ -598,10 +598,9 @@ async function screenshotWidget(widgetId) {
             chrome.tabs.onUpdated.addListener(onUpdated);
             var fb = setTimeout(function() { chrome.tabs.onUpdated.removeListener(onUpdated); resolve(); }, 5000);
         });
-        // A6A2-01: target the temp tab explicitly (the SW honours
-        // message.targetTabId) instead of re-pointing the viewed chat's
-        // targetTabId, which a concurrent agent run in that chat would follow;
-        // the temp tab is closed on every path.
+        // A6A2-01: target the temp tab explicitly via message.targetTabId —
+        // the SW requires an explicit tab for every browser action (no chat pin,
+        // no active-tab fallback); the temp tab is closed on every path.
         var result;
         try {
             result = await new Promise(function(res) {
