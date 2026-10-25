@@ -2046,9 +2046,10 @@ function _providerToTier(prov) {
 // through to 'default'. Resolution order per slot: alias reverse-map →
 // per-slot tier stamped by recordSubLLMUsage → rec.tier / rec.provider →
 // 'default' (legacy records only).
-// COST HONESTY: only endpoints that actually REPORT a cost (usage.cost —
-// OpenRouter) mark cost_reported; otherwise cost is null (unknown), never a
-// misleading 0 — there is deliberately no client-side dollar pricing table.
+// COST HONESTY: only endpoints whose cost is KNOWN mark cost_reported —
+// OpenRouter (usage.cost) or Hugging Face (computed from the live /v1/models
+// price of the serving provider, 010-llm-streaming.js); otherwise cost is
+// null (unknown), never a misleading 0 — no static dollar pricing table.
 function _sanitizeUsageForAgent(usage, rec) {
     if (!usage) return null;
     var aliasMap = (typeof getTierAliasMap === 'function') ? getTierAliasMap() : {};
@@ -6042,6 +6043,9 @@ function agentStatus(args, ctx) {
             root_chat_id: rec.root_chat_id || rec.parent_chat_id,
             name: rec.name,
             state: rec.state,
+            // PAUSE-SUBS: 'running' but stood down by the parent chat's Pause
+            // (context kept; the parent's Resume re-queues it).
+            paused_by_parent: !!rec.paused_by_parent_chat,
             created_at: rec.created_at,
             last_activity_at: rec.last_activity_at,
             settled_at: rec.settled_at || null,
@@ -6136,6 +6140,7 @@ function agentStatus(args, ctx) {
             parent_chat_id: rec.parent_chat_id,
             name: rec.name,
             state: rec.state,
+            paused_by_parent: !!rec.paused_by_parent_chat,
             tier: tier,
             created_at: rec.created_at,
             last_activity_at: rec.last_activity_at,
@@ -6262,8 +6267,9 @@ function recordSubLLMUsage(chatId, m) {
         u.calls++;
         u.input_tokens += m.input_tokens || 0;
         u.output_tokens += m.output_tokens || 0;
-        // Cost honesty: only OpenRouter streams report usage.cost — every
-        // other endpoint leaves reqMetrics.cost undefined. Track WHETHER a
+        // Cost honesty: OpenRouter streams report usage.cost and Hugging Face
+        // cost is computed from live provider pricing — every other endpoint
+        // leaves reqMetrics.cost undefined. Track WHETHER a
         // cost was ever endpoint-reported so _sanitizeUsageForAgent can
         // return null (unknown) instead of a misleading 0.
         if (typeof m.cost === 'number') {

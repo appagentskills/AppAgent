@@ -54,6 +54,10 @@ async function init() {
     var statsCheckbox = document.getElementById('show-api-stats');
     if (statsCheckbox) statsCheckbox.checked = showApiStats;
 
+    // History/sidebar search scope (ui/180-search.js): '1' = include inner
+    // model text (tool calls/results).
+    searchIncludeInner = appStorage.getItem('searchIncludeInner') === '1';
+
     var savedCompactToolCalls = appStorage.getItem('compactToolCalls');
     if (savedCompactToolCalls !== null) compactToolCalls = savedCompactToolCalls === 'true';
     // The Compact tool calls checkbox is rendered by the settings panel
@@ -792,6 +796,21 @@ async function init() {
             document.body.style.margin = '0';
             var wf = document.createElement('iframe');
             wf.style.cssText = 'width:100%;height:100vh;border:none;display:block;';
+            // E (multi-page PDF): in print mode lay the widget out at the printable page
+            // width (A4/Letter minus 12mm margins ~= 186mm) from the start, so the content
+            // height measured below equals the height the PDF paginates. The 100vh above is
+            // only the pre-measure size; _dlPrintWidget replaces it with the full height.
+            var _dlPrintMode = urlParams.get('print') === '1';
+            if (_dlPrintMode) {
+                wf.setAttribute('data-print-frame', '1');
+                wf.style.width = '186mm';
+                var _dlPrintCss = document.createElement('style');
+                _dlPrintCss.setAttribute('data-appagent-print', '1');
+                _dlPrintCss.textContent = '@page{margin:12mm}' +
+                    'html,body{height:auto!important;min-height:0!important;max-height:none!important;overflow:visible!important;margin:0!important;background:#fff!important}' +
+                    'iframe[data-print-frame]{width:186mm!important;max-width:none!important;border:0!important;display:block!important;position:static!important;overflow:visible!important}';
+                document.head.appendChild(_dlPrintCss);
+            }
             document.body.appendChild(wf);
             // Deterministic render-complete signal for take_screenshot's widget
             // capture path. This tab is opened (active:false) solely to rasterize
@@ -858,8 +877,49 @@ async function init() {
                     } catch (e) {}
                     // S0C2-02: Print button (080 printWidgetFullscreen) opens ?widget=&print=1;
                     // print the top-level page once the sandboxed widget has rendered.
-                    if (urlParams.get('print') === '1') { try { window.print(); } catch (e) {} }
+                    // E: first size the iframe to the widget's full content height
+                    // (_dlPrintWidget), so the PDF spans as many pages as the content needs.
+                    if (urlParams.get('print') === '1') { _dlPrintWidget(); }
                 }); });
+            }
+            // E (multi-page PDF): ask the widget sandbox (widget-sandbox.html
+            // prepareWidgetForPrint) to inject its print stylesheet, unclip scroll
+            // containers, wait for images/fonts and report its scrollHeight; size the
+            // iframe to that height, re-measure once (100vh-relative content can grow
+            // with the frame), then window.print(). Bounded: if the sandbox never
+            // answers, print anyway after _DL_PRINT_TIMEOUT_MS with the best height known.
+            function _dlPrintWidget() {
+                var _DL_PRINT_TIMEOUT_MS = 7000, _DL_PRINT_MAX_PX = 200000;
+                var done = false, passes = 0, lastH = 0, reqId = '';
+                var timer = setTimeout(finish, _DL_PRINT_TIMEOUT_MS);
+                function frame(cb) { var f = false; var go = function() { if (f) return; f = true; cb(); }; try { requestAnimationFrame(go); } catch (e) {} setTimeout(go, 50); }
+                function finish() {
+                    if (done) return;
+                    done = true;
+                    clearTimeout(timer);
+                    window.removeEventListener('message', onSize);
+                    frame(function() { frame(function() { try { window.print(); } catch (e) {} }); });
+                }
+                function ask() {
+                    reqId = 'wp_' + (++passes) + '_' + Date.now();
+                    try { wf.contentWindow.postMessage({ type: 'widgetPrintPrepare', request_id: reqId }, '*'); } catch (e) { finish(); }
+                }
+                function onSize(ev) {
+                    if (done || ev.source !== wf.contentWindow) return;
+                    var d = ev.data;
+                    if (!d || d.type !== 'widgetPrintSize' || d.request_id !== reqId) return;
+                    var h = Math.ceil(Number(d.height));
+                    if (!isFinite(h) || h <= 0) { finish(); return; }
+                    h = Math.min(h, _DL_PRINT_MAX_PX);
+                    if (h <= lastH + 2) { finish(); return; }
+                    lastH = h;
+                    wf.style.height = h + 'px';
+                    try { document.body.style.height = 'auto'; } catch (e) {}
+                    if (passes >= 2) { finish(); return; }
+                    frame(function() { frame(ask); });
+                }
+                window.addEventListener('message', onSize);
+                ask();
             }
             // Live-DOM snapshot path (set by take_screenshot 060 via &snap=1): render a
             // STATIC snapshot of the widget's CURRENT live DOM instead of re-running

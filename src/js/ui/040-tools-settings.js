@@ -2468,10 +2468,11 @@ function showLlmEndpointModal(editingEndpoint) {
                 '<div class="form-field">' +
                     '<label class="form-label">' + t('Endpoint URL') + ' <span class="required">*</span></label>' +
                     '<input type="text" id="llm-endpoint-url" class="form-input" value="' + escapeHtml(ep.url) + '" placeholder="https://openrouter.ai/api/v1/chat/completions">' +
+                    '<div class="settings-page-row-hint">' + t('OpenAI-compatible chat-completions URL, e.g. OpenRouter or Hugging Face (https://router.huggingface.co/v1/chat/completions).') + '</div>' +
                 '</div>' +
                 '<div class="form-field">' +
                     '<label class="form-label">' + t('API Key') + '</label>' +
-                    '<input type="password" id="llm-endpoint-apikey" class="form-input" value="' + escapeHtml(ep.apiKey || '') + '" placeholder="sk-or-...">' +
+                    '<input type="password" id="llm-endpoint-apikey" class="form-input" value="' + escapeHtml(ep.apiKey || '') + '" placeholder="sk-or-... / hf_...">' +
                 '</div>' +
             '</div>' +
             '<div class="modal-actions">' +
@@ -2620,6 +2621,7 @@ function getEndpointIcon(url) {
     var host = '';
     try { host = new URL(url).hostname.toLowerCase(); } catch (e) {}
     if (host.indexOf('openrouter') !== -1) return UI_ICONS.brandOpenRouter;
+    if (typeof isHuggingFaceEndpoint === 'function' && isHuggingFaceEndpoint(url) && UI_ICONS.brandHuggingFace) return UI_ICONS.brandHuggingFace;
     if (host === 'localhost' || host === '127.0.0.1' || host === '0.0.0.0' || host === '[::1]' || /^192\.168\./.test(host) || /^10\./.test(host) || /\.local$/.test(host)) return UI_ICONS.brandLocalhost;
     return UI_ICONS.brandEndpoint;
 }
@@ -2690,6 +2692,8 @@ function selectModelEndpoint(endpointId) {
     }
     var hidden = document.getElementById('provider-endpoint-select');
     if (hidden) hidden.value = endpointId;
+    // Hugging Face endpoint → live model/provider catalog suggestions.
+    refreshCodexModelOptions();
 }
 
 // i18n: _MODAL_EFFORT_LEVELS and _modalEffortLabelHtml stay free of direct
@@ -2956,7 +2960,7 @@ function showAddApiProviderModal(editingProvider) {
                 '</div>' +
                 '<div class="form-field">' +
                     '<label class="form-label">' + t('Model ID') + ' <span class="required">*</span></label>' +
-                    '<input type="text" id="provider-model" class="form-input" list="provider-model-datalist" value="' + escapeHtml(provider.model) + '" placeholder="' + t('e.g. anthropic/claude-sonnet-4') + '" oninput="onModelIdInput(this.value)">' +
+                    '<input type="text" id="provider-model" class="form-input" list="provider-model-datalist" value="' + escapeHtml(provider.model) + '" placeholder="' + t('e.g. anthropic/claude-sonnet-4') + '" oninput="onModelIdInput(this.value)" onchange="refreshHuggingFaceProviderOptions()">' +
                     '<datalist id="provider-model-datalist"></datalist>' +
                     '<div class="settings-page-row-hint" id="provider-model-catalog-hint" style="display:none"></div>' +
                 '</div>' +
@@ -2971,7 +2975,9 @@ function showAddApiProviderModal(editingProvider) {
                     '</div>' +
                     '<div class="form-field" id="provider-provider-field">' +
                         '<label class="form-label">' + t('Provider (Optional)') + '</label>' +
-                        '<input type="text" id="provider-provider" class="form-input" value="' + escapeHtml(provider.provider || '') + '" placeholder="' + t('e.g. anthropic or novita/bf16') + '">' +
+                        '<input type="text" id="provider-provider" class="form-input" list="provider-provider-datalist" value="' + escapeHtml(provider.provider || '') + '" placeholder="' + t('e.g. anthropic or novita/bf16') + '">' +
+                        '<datalist id="provider-provider-datalist"></datalist>' +
+                        '<div class="settings-page-row-hint" id="provider-provider-hint" style="display:none"></div>' +
                     '</div>' +
                 '</div>' +
                 '<div class="form-field">' +
@@ -3017,6 +3023,10 @@ function refreshCodexModelOptions() {
     if (_selectedModelAuthKind() !== 'chatgpt') {
         dl.innerHTML = '';
         if (hint) hint.style.display = 'none';
+        _setProviderFieldHuggingFaceMode(false);
+        if (_selectedModelAuthKind() === 'endpoint' && _selectedEndpointIsHuggingFace()) {
+            refreshHuggingFaceModelOptions(generation);
+        }
         return;
     }
     if (typeof chrome === 'undefined' || !chrome.runtime || !chrome.runtime.sendMessage) return;
@@ -3040,6 +3050,80 @@ function refreshCodexModelOptions() {
             hintNow.style.display = '';
         });
     } catch (e) { /* catalog is best-effort — never block the modal */ }
+}
+
+// ── Hugging Face catalog suggestions (Add/Edit-Model modal) ──
+// When the selected endpoint is the HF router, the Model ID datalist lists
+// every model from the public /v1/models catalog (cheapest $in/$out per 1M,
+// context, tool support) and the Provider field lists the router policies
+// (fastest/cheapest/preferred) plus each inference provider for the typed
+// model with its own pricing/context/tools/status. Helpers live in
+// core/030-config.js; same generation guard as the Codex catalog.
+function _selectedEndpointIsHuggingFace() {
+    var hidden = document.getElementById('provider-endpoint-select');
+    var ep = hidden ? getLlmEndpointById(hidden.value) : null;
+    return !!(ep && typeof isHuggingFaceEndpoint === 'function' && isHuggingFaceEndpoint(ep.url));
+}
+
+function _setProviderFieldHuggingFaceMode(on) {
+    var input = document.getElementById('provider-provider');
+    if (input) input.placeholder = on ? t('e.g. fastest, cheapest, groq or together') : t('e.g. anthropic or novita/bf16');
+    if (!on) {
+        var pdl = document.getElementById('provider-provider-datalist');
+        if (pdl) pdl.innerHTML = '';
+        var ph = document.getElementById('provider-provider-hint');
+        if (ph) ph.style.display = 'none';
+    }
+}
+
+function refreshHuggingFaceModelOptions(generation) {
+    _setProviderFieldHuggingFaceMode(true);
+    var hint = document.getElementById('provider-model-catalog-hint');
+    if (hint) { hint.textContent = t('Loading Hugging Face model catalog…'); hint.style.display = ''; }
+    fetchHuggingFaceModelCatalog().then(function(models) {
+        if (generation !== _codexCatalogGeneration) return;
+        var dlNow = document.getElementById('provider-model-datalist');
+        if (!dlNow || _selectedModelAuthKind() !== 'endpoint' || !_selectedEndpointIsHuggingFace()) return;
+        dlNow.innerHTML = (models || []).map(function(m) {
+            return '<option value="' + escapeHtml(m.id) + '" label="' + escapeHtml(huggingFaceModelLabel(m)) + '">' + escapeHtml(huggingFaceModelLabel(m)) + '</option>';
+        }).join('');
+        var hintNow = document.getElementById('provider-model-catalog-hint');
+        if (hintNow) {
+            if (models && models.length) {
+                hintNow.textContent = tn(models.length, '{count} model on Hugging Face Inference Providers', '{count} models on Hugging Face Inference Providers');
+                hintNow.style.display = '';
+            } else {
+                hintNow.textContent = t('Hugging Face catalog unavailable — type a model ID (e.g. Qwen/Qwen3-8B)');
+            }
+        }
+        refreshHuggingFaceProviderOptions();
+    });
+}
+
+function refreshHuggingFaceProviderOptions() {
+    var pdl = document.getElementById('provider-provider-datalist');
+    if (!pdl || _selectedModelAuthKind() !== 'endpoint' || !_selectedEndpointIsHuggingFace()) return;
+    var modelInput = document.getElementById('provider-model');
+    var modelId = modelInput ? modelInput.value.trim() : '';
+    var gen = _codexCatalogGeneration;
+    fetchHuggingFaceModelCatalog().then(function(models) {
+        if (gen !== _codexCatalogGeneration) return;
+        var pdlNow = document.getElementById('provider-provider-datalist');
+        if (!pdlNow) return;
+        var entry = findHuggingFaceModel(models, modelId);
+        pdlNow.innerHTML = huggingFaceProviderOptions(entry).map(function(o) {
+            return '<option value="' + escapeHtml(o.value) + '" label="' + escapeHtml(o.label) + '">' + escapeHtml(o.label) + '</option>';
+        }).join('');
+        var ph = document.getElementById('provider-provider-hint');
+        if (ph) {
+            if (entry) {
+                ph.textContent = tn(entry.providers.length, '{count} inference provider for this model; empty = fastest', '{count} inference providers for this model; empty = fastest');
+                ph.style.display = '';
+            } else {
+                ph.style.display = 'none';
+            }
+        }
+    });
 }
 
 // Radio group in the add/edit-model modal: 'chatgpt' | 'claude' | 'endpoint'.

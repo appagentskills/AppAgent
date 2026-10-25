@@ -15,7 +15,7 @@ function extractFn(src, name) {
     throw new Error('unbalanced: ' + name);
 }
 
-var FNS = ['snProbeTabTokenUser', 'snFetchUserName', 'snFetchUserRoles', 'snCollectTabTokens',
+var FNS = ['snTimeoutMs', 'snWithTimeout', 'snFetchWithTimeout', 'snProbeTabTokenUser', 'snFetchUserName', 'snFetchUserRoles', 'snCollectTabTokens',
     'snPickTabToken', 'snResolveInstanceSession', 'snRememberInstanceToken', 'snUpdateInstanceTokens',
     'snGetInstancesDetailed', 'snGetTokenForInstance', 'handleRefreshToken'];
 

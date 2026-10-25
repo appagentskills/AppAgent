@@ -603,7 +603,17 @@ function generateDiff(args) {
             if (type !== 'del') lineNum++;
             body += '<div class="display-diff-line display-diff-' + type + '"><span class="display-diff-num">' + (type === 'del' ? '' : lineNum) + '</span><span class="display-diff-content">' + (type === 'add' ? '+ ' : type === 'del' ? '- ' : '  ') + escDisplay(text) + '</span></div>';
         });
+    } else if ((oldText || newText) && typeof sdocDiffHunks === 'function' && typeof sdocComputeDiff === 'function') {
+        // GitHub-style: LCS line diff, only the changed hunks with 3 lines of context and
+        // expandable "N unchanged lines" folds (shared with the Smart Documents version diff).
+        var split = function(s) { s = String(s); return s ? s.split('\n') : []; };
+        var model = sdocDiffHunks(sdocComputeDiff(split(oldText), split(newText)), 3);
+        addCount = model.added; delCount = model.removed;
+        body = sdocDiffBodyHtml(model, 'display-diff', function(r) {
+            return '<div class="display-diff-line display-diff-' + r.type + '"><span class="display-diff-num">' + (r.type === 'del' ? '' : r.newNo) + '</span><span class="display-diff-content">' + (r.type === 'add' ? '+ ' : r.type === 'del' ? '- ' : '  ') + escDisplay(r.text) + '</span></div>';
+        });
     } else if (oldText || newText) {
+        // Fallback when the Smart Documents diff helpers are not loaded (positional compare).
         var oldLines = oldText.split('\n');
         var newLines = newText.split('\n');
         oldLines.forEach(function(line, i) {

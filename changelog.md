@@ -1,5 +1,23 @@
 # Changelog
 
+## v1.1.37
+
+### New
+- Hugging Face Inference Providers works as an LLM endpoint, with a per-model provider picker and per-request cost.
+- Split-screen view: edit a widget side by side with the chat, with live in-place updates.
+- Widgets can be exported as a self-contained offline HTML file.
+- Documents opens JSON, XML, JS/TS, HTML and Markdown in smart viewers, and Agent Files highlights new files.
+- Running sub-agents can be paused and resumed.
+- Browser tools work on any website tab, and web fetches can go through an open tab when a site blocks bots.
+- The agent can read past chats with a read-only, approval-gated history tool.
+
+### Fixes
+- Redesigned chat cards, with PR chips and always-visible actions.
+- Errored or stuck chats idle for over 7 days leave Active chats.
+- Opening a sub-agent chat from the Workers panel works reliably.
+
+---
+
 ## v1.1.36
 
 ### New

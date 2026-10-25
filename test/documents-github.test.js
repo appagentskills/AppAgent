@@ -19,14 +19,19 @@ describe('documents page: GitHub repositories', function() {
         o = o || {};
         var WS = args.workspace;
         var U = await runFile('test/ui-helpers.js', { workspace: WS }, WS);
-        var rec = { api: [], clones: [], replace: [], deletes: [], reclones: [], confirms: [], reads: [], settings: [], snacks: [], overlays: [] };
-        var metas = (o.metas || []).slice();
+        var rec = { api: [], clones: [], replace: [], deletes: [], reclones: [], confirms: [], reads: [], settings: [], snacks: [], overlays: [], adds: [], picks: [] };
+        var metas = (o.metas || []).slice(), folders = [];
         var m = await U.loadUi(MODS, { globals: Object.assign({
             chats: {}, currentChatId: 'c1', currentView: 'documents', LOCAL_FOLDER_VIRTUAL_ID: 'virtual',
             escDisplay: esc, escapeHtml: esc,
             showSnackbar: function(msg, kind) { rec.snacks.push([kind, msg]); },
-            listLocalFolders: async function() { return [{ id: 'virtual', kind: 'virtual', label: 'Agent Files', name: 'agent-files', access: 'readwrite', permission: 'granted' }]; },
-            pickLocalFolder: function() { return Promise.resolve(null); },
+            listLocalFolders: async function() { return [{ id: 'virtual', kind: 'virtual', label: 'Agent Files', name: 'agent-files', access: 'readwrite', permission: 'granted' }].concat(folders); },
+            addLocalFolder: function(h, opts) {
+                rec.adds.push([h && h.name, opts && opts.access]);
+                if (o.add) return o.add(h, opts);
+                var f = { id: 'f' + (folders.length + 1), kind: 'local', label: h.name, name: h.name, access: opts.access, permission: 'granted' };
+                folders.push(f); return Promise.resolve(f);
+            },
             getAllWorkspaceMetas: async function() { return metas.map(function(x) { return Object.assign({}, x); }); },
             githubApi: async function(method, path) {
                 rec.api.push([method, path]);
@@ -48,6 +53,8 @@ describe('documents page: GitHub repositories', function() {
             wsReadRaw: async function(wk, path) { rec.reads.push([wk, path]); var r = o.read || { success: true, file: { content: 'hello <world>' } }; return typeof r === 'function' ? r() : r; },
             _wsfOverlay: function(title, body) { var d = document.createElement('div'); d.className = 'test-overlay'; d.innerHTML = body; document.body.appendChild(d); rec.overlays.push(d); return d; }
         }, o.globals || {}), allowUnstubbed: o.allowUnstubbed });
+        // The module's `window` is the loader's fakeWindow (m.__scope.window): stub the picker there.
+        m.__scope.window.showDirectoryPicker = function(opts) { rec.picks.push(opts); return o.picker ? o.picker(opts) : Promise.resolve({ kind: 'directory', name: 'proj' }); };
         // Rail layout: the sources rail (with the "Add source" popover) + the pane head (repo actions).
         var mount = await U.mountDom({ html: '<div id="documents-list" class="sdoc-rail-layout"><nav class="sdoc-rail" id="documents-sources"></nav>' +
             '<div class="sdoc-pane" id="sdoc-pane"><div class="sdoc-pane-head" id="sdoc-pane-head"></div><span id="documents-count"></span><div id="documents-items"></div></div></div>' });
@@ -61,9 +68,12 @@ describe('documents page: GitHub repositories', function() {
     function qa(sel) { return Array.prototype.slice.call(document.querySelectorAll('#documents-list ' + sel)).concat(Array.prototype.slice.call(document.querySelectorAll('#sdoc-add-modal ' + sel))); }
     async function settle(U) { await U.flush(); await U.flush(); await U.flush(); }
     async function toGithub(e) {
-        e.U.fireInline(q('.sdoc-conn-mode .radio-option[data-value="github"]'), 'click', e.m);
+        e.U.fireInline(q('.sdoc-add-type-radio[data-value="github"]'), 'click', e.m);
         await settle(e.U);
     }
+    function toFolder(e) { e.U.fireInline(q('.sdoc-add-type-radio[data-value="folder"]'), 'click', e.m); }
+    function primary() { return q('#sdoc-add-pop .sdoc-add-primary'); }
+    function footFks() { return qa('#sdoc-add-pop .sdoc-add-foot-btns [data-fk]').map(function(b) { return b.getAttribute('data-fk'); }); }
     function type(e, el, v) { el.value = v; e.U.fireInline(el, 'input', e.m); }
     function done(e) { document.querySelectorAll('.test-overlay, #sdoc-add-modal').forEach(function(d) { d.remove(); }); return e.U.cleanupAll(); }
     // The sandbox's focus() does not move activeElement (ui-helpers.js): pin it by hand.
@@ -79,7 +89,7 @@ describe('documents page: GitHub repositories', function() {
         return r;
     }
 
-    test('Add source opens a modal on <body> with dialog semantics and source cards', async function() {
+    test('Add source opens a modal on <body> with dialog semantics, source-type radios and a configure step', async function() {
         var e = await load({ closed: true });
         try {
             assert.ok(!document.getElementById('sdoc-add-modal'), 'closed: no overlay');
@@ -95,14 +105,23 @@ describe('documents page: GitHub repositories', function() {
             assert.strictEqual(dlg.getAttribute('aria-labelledby'), 'sdoc-add-title');
             assert.ok(document.getElementById('sdoc-add-title'));
             assert.strictEqual(q('.sdoc-rail-add').getAttribute('aria-expanded'), 'true');
-            var cards = qa('.sdoc-add-card').map(function(c) { return c.getAttribute('data-card'); });
-            assert.deepStrictEqual(cards, ['read', 'readwrite', 'github', 'files']);
-            qa('.sdoc-add-card').forEach(function(c) {
-                assert.ok(c.querySelector('.sdoc-type-tile') && c.querySelector('.sdoc-add-card-title') && c.querySelector('.sdoc-add-card-desc') && c.querySelector('.sdoc-add-card-btn'), 'card parts: ' + c.getAttribute('data-card'));
+            var grp = q('.sdoc-add-types');
+            assert.strictEqual(grp.getAttribute('role'), 'radiogroup');
+            assert.strictEqual(grp.getAttribute('aria-labelledby'), 'sdoc-add-type-h');
+            assert.ok(document.getElementById('sdoc-add-type-h') && document.getElementById('sdoc-add-config-h'), 'step headings');
+            var types = qa('.sdoc-add-type-radio').map(function(r) { return [r.getAttribute('data-value'), r.getAttribute('role'), r.getAttribute('aria-checked'), r.getAttribute('tabindex'), r.getAttribute('data-fk')].join(':'); });
+            assert.deepStrictEqual(types, ['folder:radio:true:0:type:folder', 'github:radio:false:-1:type:github']);
+            qa('.sdoc-add-type').forEach(function(c) {
+                assert.ok(c.querySelector('.sdoc-type-tile') && c.querySelector('.sdoc-add-type-title') && c.querySelector('.sdoc-add-type-desc'), 'type card parts');
             });
-            assert.ok(q('.sdoc-add-card[data-card="files"] .sdoc-add-card-status'), 'Agent Files marked connected');
-            assert.ok(!q('.sdoc-add-card[data-card="read"] .sdoc-add-card-status'), 'no read-only folder connected yet');
+            assert.ok(q('.sdoc-add-type.is-selected .sdoc-add-type-radio[data-value="folder"]'), 'folder card selected');
+            assert.ok(!q('.sdoc-add-type-n'), 'no "N connected" link with nothing connected');
+            assert.ok(!q('.sdoc-add-card') && !q('#sdoc-add-opts') && !q('.sdoc-conn-mode'), 'old card / mode markup gone');
+            assert.strictEqual(q('#sdoc-add-folder-name').textContent, 'No folder selected');
+            assert.ok(q('#sdoc-add-acc-hint'), 'access hint');
+            assert.ok(!q('.modal-body [data-fk="connect"]') && q('#sdoc-add-pop > .sdoc-add-foot [data-fk="connect"]'), 'primary in the footer, outside .modal-body');
             assert.ok(q('#sdoc-add-pop .sdoc-add-foot [data-fk="add:cancel"]'), 'cancel kept');
+            assert.ok(q('.sdoc-add-foot [data-fk="add:files"]'), 'Agent Files "Open" link in the footer');
         } finally { await done(e); }
     }, { tags: ['unit'] });
 
@@ -123,19 +142,165 @@ describe('documents page: GitHub repositories', function() {
         } finally { await done(e); }
     }, { tags: ['unit'] });
 
-    test('Add source modal: failed folder connect shows an inline error, busy while picking', async function() {
+    test('Add source modal: failed folder connect shows an inline error, busy while connecting', async function() {
         var rej;
-        var e = await load({ globals: { pickLocalFolder: function() { return new Promise(function(res, r) { rej = r; }); } } });
+        var e = await load({ add: function() { return new Promise(function(res, r) { rej = r; }); } });
         try {
-            e.U.fireInline(q('.sdoc-add-card[data-card="readwrite"] .sdoc-add-card-btn'), 'click', e.m);
-            assert.strictEqual(e.m.sdocSrcState.addAccess, 'readwrite');
-            assert.strictEqual(q('.sdoc-add-card[data-card="readwrite"] .sdoc-add-card-btn').getAttribute('aria-busy'), 'true', 'busy while the picker is open');
+            e.U.fireInline(q('[data-fk="add:browse"]'), 'click', e.m);
+            await settle(e.U);
+            e.U.fireInline(primary(), 'click', e.m);
+            assert.strictEqual(primary().getAttribute('aria-busy'), 'true', 'busy while connecting');
+            await e.U.flush();
+            assert.deepStrictEqual(e.rec.adds, [['proj', 'read']]);
+            assert.ok(primary().disabled && /Connecting/.test(primary().textContent));
             rej(new Error('nope'));
             await settle(e.U);
             var err = q('#sdoc-add-pop .sdoc-add-err');
             assert.ok(err && err.getAttribute('role') === 'alert' && /nope/.test(err.textContent), 'inline error');
-            assert.ok(!q('.sdoc-add-card-btn[aria-busy]'), 'busy cleared');
+            assert.ok(!primary().hasAttribute('aria-busy') && !primary().disabled, 'busy cleared, retry possible');
+            assert.ok(e.rec.snacks.some(function(s) { return s[0] === 'error' && /nope/.test(s[1]); }), 'error snackbar');
         } finally { await done(e); }
+    }, { tags: ['unit'] });
+
+    test('sdocGhNormRepo: owner/repo, URLs, .git, trailing slash, /tree/<branch>, invalid', async function() {
+        var e = await load({ closed: true });
+        try {
+            var n = function(s) { var r = e.m.sdocGhNormRepo(s); return [r.repo, r.branch]; };
+            assert.deepStrictEqual(n('octo/alpha'), ['octo/alpha', '']);
+            assert.deepStrictEqual(n('  octo/alpha  '), ['octo/alpha', ''], 'trimmed');
+            assert.deepStrictEqual(n('https://github.com/octo/alpha'), ['octo/alpha', '']);
+            assert.deepStrictEqual(n('http://github.com/octo/alpha'), ['octo/alpha', '']);
+            assert.deepStrictEqual(n('github.com/octo/alpha'), ['octo/alpha', ''], 'bare host');
+            assert.deepStrictEqual(n('www.github.com/octo/alpha'), ['octo/alpha', '']);
+            assert.deepStrictEqual(n('https://github.com/octo/alpha.git'), ['octo/alpha', '']);
+            assert.deepStrictEqual(n('octo/alpha.git'), ['octo/alpha', '']);
+            assert.deepStrictEqual(n('octo/alpha/'), ['octo/alpha', '']);
+            assert.deepStrictEqual(n('https://github.com/octo/alpha/'), ['octo/alpha', '']);
+            assert.deepStrictEqual(n('https://github.com/octo/alpha/tree/dev'), ['octo/alpha', 'dev']);
+            assert.deepStrictEqual(n('https://github.com/octo/alpha/blob/main/x.md'), ['octo/alpha', ''], 'only tree/<branch> sets a branch');
+            assert.deepStrictEqual(n('https://github.com/octo/alpha?tab=readme#top'), ['octo/alpha', ''], 'query / hash dropped');
+            ['', null, undefined, 'octo', 'octo/', '/alpha', 'octo/alpha/extra', 'octo /alpha', 'https://github.com/octo', 'https://github.com/'].forEach(function(s) {
+                assert.strictEqual(e.m.sdocGhNormRepo(s).repo, '', 'invalid: ' + JSON.stringify(s));
+            });
+            assert.strictEqual(e.m.sdocGhNormRepo('octo/alpha.git/').raw, 'octo/alpha', 'raw = normalised text');
+        } finally { await done(e); }
+    }, { tags: ['unit'] });
+
+    test('primary button: disabled until valid; label Connect folder / Clone repository; typed /tree/ URL pre-fills the branch', async function() {
+        var e = await load({ repos: new Promise(function() {}) });
+        try {
+            assert.ok(primary().disabled && primary().textContent === 'Connect folder', 'folder: disabled until a folder is picked');
+            assert.deepStrictEqual(footFks(), ['add:cancel', 'connect']);
+            e.U.fireInline(q('[data-fk="add:browse"]'), 'click', e.m);
+            await settle(e.U);
+            assert.deepStrictEqual(e.rec.picks, [{ id: 'appagent-connected-folder', mode: 'read' }]);
+            assert.ok(/proj/.test(q('#sdoc-add-folder-name').textContent), 'picked folder named');
+            assert.ok(!primary().disabled, 'enabled once a folder is picked');
+            assert.deepStrictEqual(e.rec.adds, [], 'Browse only picks; nothing connected yet');
+            await toGithub(e);
+            assert.strictEqual(primary().textContent, 'Clone repository');
+            assert.deepStrictEqual(footFks(), ['add:cancel', 'connect-gh']);
+            assert.ok(primary().disabled, 'GitHub: disabled with an empty repo');
+            var inp = q('#sdoc-gh-repo-in');
+            assert.ok(inp && q('label[for="sdoc-gh-repo-in"]') && q('#sdoc-gh-branch-in') && q('label[for="sdoc-gh-branch-in"]'), 'labelled repo + branch inputs');
+            assert.strictEqual(inp.getAttribute('aria-describedby'), 'sdoc-add-gh-note');
+            assert.ok(q('#sdoc-add-gh-note'));
+            type(e, inp, 'octo');
+            assert.ok(primary().disabled, 'owner only: still disabled');
+            type(e, inp, 'octo/alpha');
+            assert.ok(!primary().disabled, 'owner/repo: enabled (live, no re-render)');
+            assert.strictEqual(q('#sdoc-gh-repo-in'), inp, 'input not rebuilt');
+            type(e, inp, 'https://github.com/octo/alpha/tree/dev');
+            assert.ok(!primary().disabled);
+            assert.strictEqual(q('#sdoc-gh-branch-in').value, 'dev', 'branch auto-filled from the /tree/ URL');
+            type(e, inp, 'https://github.com/octo/alpha');
+            assert.strictEqual(q('#sdoc-gh-branch-in').value, '', 'an auto-filled branch follows the URL');
+            type(e, inp, 'not a repo');
+            assert.ok(primary().disabled, 'invalid: disabled again');
+            toFolder(e);
+            assert.strictEqual(primary().textContent, 'Connect folder');
+        } finally { await done(e); }
+    }, { tags: ['unit'] });
+
+    test('Browse \u2192 Connect: read-only adds without a permission prompt; read & write asks first (granted / denied); cancel is silent', async function() {
+        var reqs = [], state = 'granted';
+        var handle = { kind: 'directory', name: 'proj', requestPermission: function(o) { reqs.push(o); return Promise.resolve(state); } };
+        var e = await load({ picker: function() { return Promise.resolve(handle); } });
+        try {
+            e.U.fireInline(q('[data-fk="add:browse"]'), 'click', e.m);
+            await settle(e.U);
+            e.U.fireInline(primary(), 'click', e.m);
+            await settle(e.U);
+            assert.deepStrictEqual(e.rec.adds, [['proj', 'read']]);
+            assert.deepStrictEqual(reqs, [], 'read-only: no permission prompt');
+            assert.strictEqual(e.m.sdocSrcState.addOpen, false, 'closed on success');
+            assert.strictEqual(e.m.sdocSrcState.sel, 'lf:f1', 'new folder selected');
+            assert.strictEqual(e.m.sdocSrcState.addHandle, null, 'handle cleared');
+            assert.ok(e.rec.snacks.some(function(s) { return s[0] === 'success' && /proj/.test(s[1]); }));
+            // Read & write, granted.
+            e.m.sdocAddToggle();
+            e.U.fireInline(q('#sdoc-add-pop .sdoc-access-radio .radio-option[data-value="readwrite"]'), 'click', e.m);
+            assert.ok(/edit/.test(q('#sdoc-add-acc-hint').textContent), 'hint follows the access choice');
+            e.U.fireInline(q('[data-fk="add:browse"]'), 'click', e.m);
+            await settle(e.U);
+            assert.strictEqual(e.rec.picks[1].mode, 'readwrite', 'picker asked in readwrite mode');
+            e.U.fireInline(primary(), 'click', e.m);
+            assert.deepStrictEqual(reqs, [{ mode: 'readwrite' }], 'permission requested synchronously in the click');
+            await settle(e.U);
+            assert.deepStrictEqual(e.rec.adds[1], ['proj', 'readwrite']);
+            assert.strictEqual(e.m.sdocSrcState.addOpen, false);
+            // Read & write, denied: nothing added, inline error, dialog stays open.
+            state = 'denied';
+            e.m.sdocAddToggle();
+            assert.strictEqual(e.m.sdocSrcState.addAccess, 'readwrite', 'access remembered');
+            e.U.fireInline(q('[data-fk="add:browse"]'), 'click', e.m);
+            await settle(e.U);
+            e.U.fireInline(primary(), 'click', e.m);
+            await settle(e.U);
+            assert.strictEqual(reqs.length, 2);
+            assert.strictEqual(e.rec.adds.length, 2, 'denied: addLocalFolder not called');
+            assert.ok(e.m.sdocSrcState.addOpen && /not granted \(denied\)/.test(q('#sdoc-add-pop .sdoc-add-err').textContent), 'inline error');
+            // Picker cancelled (AbortError): no error, handle kept.
+            var keep = e.m.sdocSrcState.addHandle;
+            e.m.__scope.window.showDirectoryPicker = function() { var x = new Error('aborted'); x.name = 'AbortError'; return Promise.reject(x); };
+            e.m.sdocSrcState.addErr = ''; e.m.sdocRenderSourcesStrip();
+            e.U.fireInline(q('[data-fk="add:browse"]'), 'click', e.m);
+            await settle(e.U);
+            assert.ok(!q('#sdoc-add-pop .sdoc-add-err'), 'cancel: no error');
+            assert.strictEqual(e.m.sdocSrcState.addHandle, keep);
+        } finally { await done(e); }
+    }, { tags: ['unit'] });
+
+    test('source-type radios: arrows move + pick (roving tabindex), Enter/Space pick, focus follows', async function() {
+        var foc = stubFocus();
+        var e = await load({ repos: new Promise(function() {}) });
+        try {
+            var grp = q('.sdoc-add-types');
+            function key(k, target) {
+                var ev = { key: k, target: target, currentTarget: q('.sdoc-add-types'), defaultPrevented: false, preventDefault: function() { ev.defaultPrevented = true; }, stopPropagation: function() {} };
+                e.m.sdocAddTypeKeydown(ev); return ev;
+            }
+            var fol = q('.sdoc-add-type-radio[data-value="folder"]');
+            q('.sdoc-add-type-radio[data-value="github"]').focus = function() { foc.set(this); };
+            var ev = key('ArrowRight', fol);
+            assert.ok(ev.defaultPrevented);
+            assert.strictEqual(e.m.sdocSrcState.addMode, 'github', 'ArrowRight picks GitHub');
+            var gh = q('.sdoc-add-type-radio[data-value="github"]');
+            assert.strictEqual(gh.getAttribute('aria-checked'), 'true');
+            assert.strictEqual(gh.getAttribute('tabindex'), '0');
+            assert.strictEqual(q('.sdoc-add-type-radio[data-value="folder"]').getAttribute('tabindex'), '-1');
+            assert.ok(q('#sdoc-gh-repo-in'), 'configure step switched');
+            key('ArrowDown', gh);
+            assert.strictEqual(e.m.sdocSrcState.addMode, 'folder', 'ArrowDown wraps to folder');
+            key('ArrowLeft', q('.sdoc-add-type-radio[data-value="folder"]'));
+            assert.strictEqual(e.m.sdocSrcState.addMode, 'github', 'ArrowLeft wraps to GitHub');
+            key('ArrowUp', q('.sdoc-add-type-radio[data-value="github"]'));
+            assert.strictEqual(e.m.sdocSrcState.addMode, 'folder', 'ArrowUp: previous');
+            key(' ', q('.sdoc-add-type-radio[data-value="github"]'));
+            assert.strictEqual(e.m.sdocSrcState.addMode, 'github', 'Space picks');
+            var x = key('a', q('.sdoc-add-type-radio[data-value="github"]'));
+            assert.ok(!x.defaultPrevented, 'other keys pass through');
+        } finally { foc.restore(); await done(e); }
     }, { tags: ['unit'] });
 
     test('sdocFocusTrapIndex wraps Tab / Shift+Tab at the dialog edges', async function() {
@@ -155,7 +320,7 @@ describe('documents page: GitHub repositories', function() {
     test('Connect card switches Local folder / GitHub repo', async function() {
         var e = await load();
         try {
-            var modes = qa('.sdoc-conn-mode .radio-option').map(function(o) { return o.getAttribute('data-value') + ':' + o.getAttribute('aria-checked'); });
+            var modes = qa('.sdoc-add-type-radio').map(function(o) { return o.getAttribute('data-value') + ':' + o.getAttribute('aria-checked'); });
             assert.deepStrictEqual(modes, ['folder:true', 'github:false']);
             assert.ok(q('#sdoc-add-pop .sdoc-access-radio[data-folder-id=""]'), 'folder mode shows the access picker');
             assert.ok(!q('.sdoc-gh-repo'));
@@ -163,8 +328,9 @@ describe('documents page: GitHub repositories', function() {
             assert.strictEqual(e.m.sdocSrcState.addMode, 'github');
             assert.ok(q('#sdoc-add-pop .sdoc-gh-repo') && q('.sdoc-gh-branch'), 'repo + branch inputs');
             assert.ok(!q('.sdoc-access-radio[data-folder-id=""]'), 'no folder access picker in GitHub mode');
-            assert.strictEqual(q('.sdoc-conn-mode .radio-option[data-value="github"]').getAttribute('aria-checked'), 'true');
-            e.U.fireInline(q('.sdoc-conn-mode .radio-option[data-value="folder"]'), 'click', e.m);
+            assert.strictEqual(q('.sdoc-add-type-radio[data-value="github"]').getAttribute('aria-checked'), 'true');
+            assert.ok(q('.sdoc-add-type.is-selected .sdoc-add-type-radio[data-value="github"]'), 'selected card follows');
+            toFolder(e);
             assert.ok(q('.sdoc-access-radio[data-folder-id=""]') && !q('.sdoc-gh-repo'));
         } finally { await done(e); }
     }, { tags: ['unit'] });
@@ -186,7 +352,7 @@ describe('documents page: GitHub repositories', function() {
             assert.ok(/someone\/else/.test(q('#sdoc-gh-pop .sdoc-gh-hint').textContent), 'typed repo named in the empty state (in the popup)');
             assert.strictEqual(q('.sdoc-gh-note').textContent, '', 'the in-card note stays empty');
             // Cached for the page session: back to folder and to GitHub again, no refetch.
-            e.U.fireInline(q('.sdoc-conn-mode .radio-option[data-value="folder"]'), 'click', e.m);
+            toFolder(e);
             await toGithub(e);
             assert.strictEqual(e.rec.api.length, 1);
         } finally { await done(e); }
@@ -230,22 +396,26 @@ describe('documents page: GitHub repositories', function() {
             assert.ok(pop.hidden, 'Escape closes the popup (loading hint, no options)');
             assert.strictEqual(inp.value, 'oc', 'first Escape only closes');
             assert.ok(q('#sdoc-add-pop'), 'the combobox Escape does not close the popover');
-            assert.deepStrictEqual(qa('#sdoc-add-pop .sdoc-add-foot [data-fk]').map(function(b) { return b.getAttribute('data-fk'); }), ['add:cancel', 'connect-gh'], 'footer: Cancel + Clone repo');
+            assert.deepStrictEqual(footFks(), ['add:cancel', 'connect-gh'], 'footer: Cancel + Clone repo');
         } finally { await done(e); }
     }, { tags: ['unit'] });
 
-    test('popover reserves no room for empty parts: folder mode is title, mode, access, hint, footer; the empty GitHub note is [hidden]', async function() {
+    test('popover reserves no room for empty parts: header, body (type, configure), footer; folder configure is folder, access, hint; the empty GitHub note is [hidden]', async function() {
         var e = await load({ repos: new Promise(function() {}) });
         try {
             var dlg = q('#sdoc-add-pop');
             assert.ok(dlg.querySelector('.sdoc-add-head #sdoc-add-title'), 'title in the modal header');
-            var kids = Array.prototype.map.call(dlg.querySelector('.sdoc-add-details').children, function(c) {
+            var top = Array.prototype.map.call(dlg.children, function(c) { var cl = c.classList; return cl.contains('modal-header') ? 'head' : cl.contains('modal-body') ? 'body' : cl.contains('sdoc-add-foot') ? 'foot' : c.className; });
+            assert.deepStrictEqual(top, ['head', 'body', 'foot']);
+            var steps = Array.prototype.map.call(dlg.querySelector('.modal-body').children, function(c) { return c.classList.contains('sdoc-add-config') ? 'config' : c.classList.contains('sdoc-add-step') ? 'type' : c.className; });
+            assert.deepStrictEqual(steps, ['type', 'config'], 'no error box when there is no error');
+            var kids = Array.prototype.map.call(dlg.querySelector('.sdoc-add-config').children, function(c) {
                 var cl = c.classList;
-                return c.id === 'sdoc-add-opts' ? 'title' : cl.contains('sdoc-conn-mode') ? 'mode' : cl.contains('sdoc-add-label') ? 'label' : cl.contains('sdoc-access-radio') ? 'access' : cl.contains('sdoc-add-hint') ? 'hint' : cl.contains('sdoc-add-foot') ? 'foot' : c.className;
+                return cl.contains('sdoc-add-label') ? 'h' : cl.contains('form-label') ? 'label' : cl.contains('sdoc-add-folder-row') ? 'row' : cl.contains('sdoc-access-radio') ? 'access' : cl.contains('sdoc-add-hint') ? 'hint' : c.className;
             });
-            assert.deepStrictEqual(kids, ['title', 'mode', 'label', 'access', 'hint', 'foot'], 'nothing in between');
-            assert.deepStrictEqual(qa('#sdoc-add-pop .sdoc-add-foot [data-fk]').map(function(b) { return b.getAttribute('data-fk'); }), ['add:cancel', 'connect'], 'footer: Cancel + Choose folder');
-            assert.ok(/next step/.test(q('.sdoc-add-hint').textContent));
+            assert.deepStrictEqual(kids, ['h', 'label', 'row', 'label', 'access', 'hint'], 'nothing in between');
+            assert.deepStrictEqual(footFks(), ['add:cancel', 'connect'], 'footer: Cancel + Connect folder');
+            assert.ok(/read files/.test(q('#sdoc-add-acc-hint').textContent));
             await toGithub(e);
             var note = q('#sdoc-gh-note');
             assert.ok(note && note.hidden, 'empty note rendered hidden');
@@ -440,11 +610,11 @@ describe('documents page: GitHub repositories', function() {
             // The successful clone closed the popover: reopen it for the mode radio keys.
             assert.ok(!q('#sdoc-add-pop'), 'clone success closes the popover');
             e.m.sdocAddToggle(); await settle(e.U);
-            // Mode radio keys: ArrowLeft/Right move + pick.
-            var gh = q('.sdoc-conn-mode .radio-option[data-value="github"]');
+            // Source-type radio keys: ArrowLeft/Right move + pick.
+            var gh = q('.sdoc-add-type-radio[data-value="github"]');
             var mev = new KeyboardEvent('keydown', { key: 'ArrowLeft', bubbles: true, cancelable: true });
-            Object.defineProperty(mev, 'target', { value: gh }); Object.defineProperty(mev, 'currentTarget', { value: q('.sdoc-conn-mode') });
-            e.m.sdocSrcModeKeydown(mev);
+            Object.defineProperty(mev, 'target', { value: gh }); Object.defineProperty(mev, 'currentTarget', { value: q('.sdoc-add-types') });
+            e.m.sdocAddTypeKeydown(mev);
             assert.ok(mev.defaultPrevented);
             assert.strictEqual(e.m.sdocSrcState.addMode, 'folder');
         } finally { await done(e); }
@@ -473,8 +643,14 @@ describe('documents page: GitHub repositories', function() {
             await c1; await settle(e.U);
             assert.strictEqual(e.rec.clones.length, 1);
             assert.ok(!q('#sdoc-add-pop'), 'a successful clone closes the Add source popover');
-            e.m.sdocAddToggle(); // reopen: Clone repo is enabled again
-            assert.ok(q('[data-fk="connect-gh"]') && !q('[data-fk="connect-gh"]').disabled && !q('[data-fk="connect-gh"]').hasAttribute('aria-busy'));
+            e.m.sdocAddToggle(); // reopen: Clone repo is no longer busy; enabled only for a valid repo
+            var cg = q('[data-fk="connect-gh"]');
+            assert.ok(cg && !cg.hasAttribute('aria-busy'));
+            assert.strictEqual(cg.disabled, !e.m.sdocGhNormRepo(e.m.sdocGhState.query).repo);
+            assert.ok(q('.sdoc-add-type-n[data-fk="add:show:ws"]') && /^\d+ connected$/.test(q('.sdoc-add-type-n').textContent.trim()), '"N connected" link next to the GitHub card: ' + (q('.sdoc-add-type-n') || {}).textContent);
+            assert.ok(!q('.sdoc-add-type-radio .sdoc-add-type-n'), 'the link is not nested inside role=radio');
+            e.U.fireInline(q('[data-fk="add:show:ws"]'), 'click', e.m);
+            assert.ok(!e.m.sdocSrcState.addOpen && /^ws:octo\/alpha::/.test(e.m.sdocSrcState.sel), 'N connected closes and selects that source');
         } finally { await done(e); }
     }, { tags: ['unit'] });
 

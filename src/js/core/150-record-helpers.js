@@ -21,23 +21,127 @@
 var _recValidTable = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
 var _recValidSysId = /^[0-9a-fA-F]{32}$/;
 
-function _recHeaders() {
+// Optional `target` ({instanceUrl, token}) points the helpers at a NON-active
+// instance so cross-instance mutations can be version-tracked too (they were
+// previously skipped entirely and never reached the sidebar Artifacts list).
+function _recHeaders(target) {
     return {
-        'X-UserToken': (typeof Platform !== 'undefined' && Platform.getSessionToken && Platform.getSessionToken()) || '',
+        'X-UserToken': (target && target.token) || (typeof Platform !== 'undefined' && Platform.getSessionToken && Platform.getSessionToken()) || '',
         'Accept': 'application/json'
     };
 }
 
-function _recPrefix() {
+function _recFetchOpts(target) {
+    var o = { headers: _recHeaders(target) };
+    if (target && target.instanceUrl) o.credentials = 'include';
+    return o;
+}
+
+function _recPrefix(target) {
+    if (target && target.instanceUrl) return String(target.instanceUrl).replace(/\/+$/, '');
     return (typeof Platform !== 'undefined' && Platform.instanceUrl) || '';
 }
 
-async function getRecordScope(table, sysId) {
+// ---- Instance identity of version-history entries (page + SW) ----
+// Entries may carry `instanceUrl` (set for writes on a non-active instance).
+// ONE key function decides record identity everywhere (sidebar grouping,
+// revert/redo/diff lookups): normalized origin, and a missing value or the
+// active instance both map to '' so an untagged entry and an entry stamped
+// with the active URL (e.g. while the active URL was still unknown) merge.
+function normalizeInstanceUrl(u) {
+    if (!u) return '';
+    var s = String(u).trim();
+    if (!s) return '';
+    if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(s)) s = 'https://' + s;
+    try { return new URL(s).origin.toLowerCase(); }
+    catch (e) { return s.toLowerCase().replace(/\/+$/, ''); }
+}
+
+function _recActiveInstanceUrl() {
+    var a = '';
+    try {
+        if (typeof Platform !== 'undefined' && Platform) {
+            a = Platform.instanceUrl || (typeof Platform.resolveInstanceUrl === 'function' ? Platform.resolveInstanceUrl(null) : '') || '';
+        }
+    } catch (e) { a = ''; }
+    return normalizeInstanceUrl(a);
+}
+
+// '' = the active instance (or unknown/missing); otherwise the normalized origin.
+function recordInstanceKey(instanceUrl) {
+    var n = normalizeInstanceUrl(instanceUrl);
+    if (!n) return '';
+    return n === _recActiveInstanceUrl() ? '' : n;
+}
+
+// Value to STORE on a new entry: always the normalized origin (the entry's own
+// instance, else the CURRENT active one), so an entry written while A was
+// active still targets A after the user switches to B. recordInstanceKey()
+// keeps mapping a stored active origin to '' for grouping/merging with legacy
+// untagged entries. undefined only when no origin is known at all.
+function recordStoredInstanceUrl(instanceUrl) {
+    return normalizeInstanceUrl(instanceUrl) || _recActiveInstanceUrl() || undefined;
+}
+
+function recordEntryKey(entry) {
+    if (!entry) return '';
+    return recordInstanceKey(entry.instanceUrl) + '|' + entry.table + '_' + entry.sysId;
+}
+
+function isSameRecordEntry(v, table, sysId, instanceUrl) {
+    return !!v && v.table === table && v.sysId === sysId &&
+        recordInstanceKey(v.instanceUrl) === recordInstanceKey(instanceUrl);
+}
+
+// Resolve where a sidebar action for an entry must go. The STORED origin is
+// compared to the CURRENT active instance at action time (recordInstanceKey):
+// legacy untagged entries and the active origin → active; any other origin
+// (incl. an entry stored while it was active) → that instance. Active instance →
+// {active:true} (relative URLs, session token). Other instance → its origin +
+// a token from Platform.getTokenForInstance (same as the tools). Returns null
+// when no token can be obtained — callers MUST refuse rather than fall back
+// to the active instance (the same sys_id may exist there).
+async function resolveRecordTarget(instanceUrl) {
+    var key = recordInstanceKey(instanceUrl);
+    if (!key) {
+        return { active: true, instanceUrl: '', token: (typeof Platform !== 'undefined' && Platform.getSessionToken && Platform.getSessionToken()) || '' };
+    }
+    var token = '';
+    try {
+        if (typeof Platform !== 'undefined' && typeof Platform.getTokenForInstance === 'function') {
+            token = (await Platform.getTokenForInstance(key)) || '';
+        }
+    } catch (e) { token = ''; }
+    if (!token) return null;
+    return { active: false, instanceUrl: key, token: token };
+}
+
+// fetch() a ServiceNow path ('/api/now/...') on a resolved target. Active →
+// relative URL (the page fetch interceptor adds token + credentials);
+// otherwise absolute URL with the target's token and credentials.
+function recordFetch(target, path, opts) {
+    opts = Object.assign({}, opts || {});
+    if (!target || target.active || !target.instanceUrl) {
+        var h0 = Object.assign({}, opts.headers || {});
+        if (!h0['X-UserToken']) h0['X-UserToken'] = (target && target.token) || (typeof window !== 'undefined' && window.sessionToken) || '';
+        opts.headers = h0;
+        return fetch(path, opts);
+    }
+    var h = Object.assign({}, opts.headers || {});
+    h['X-UserToken'] = target.token;
+    opts.headers = h;
+    opts.credentials = 'include';
+    return fetch(target.instanceUrl + path, opts);
+}
+
+async function getRecordScope(table, sysId, target) {
     if (!sysId || !table) return null;
     if (!_recValidTable.test(table) || !_recValidSysId.test(sysId)) return null;
     try {
-        var url = _recPrefix() + '/api/now/table/' + table + '/' + sysId + '?sysparm_fields=sys_scope';
-        var res = await fetch(url, { headers: _recHeaders() });
+        var url = _recPrefix(target) + '/api/now/table/' + table + '/' + sysId + '?sysparm_fields=sys_scope';
+        var res = await fetch(url, target && target.instanceUrl
+            ? { headers: _recHeaders(target), credentials: 'include' }
+            : { headers: _recHeaders() });
         if (!res.ok) return null;
         var data = await res.json();
         if (data && data.result && data.result.sys_scope) {
@@ -49,12 +153,12 @@ async function getRecordScope(table, sysId) {
     return null;
 }
 
-async function getRecordVersion(table, sysId) {
+async function getRecordVersion(table, sysId, target) {
     if (!sysId || !_recValidTable.test(table) || !_recValidSysId.test(sysId)) return null;
     try {
-        var url = _recPrefix() + '/api/now/table/sys_update_version?sysparm_query=name=' + table + '_' + sysId +
+        var url = _recPrefix(target) + '/api/now/table/sys_update_version?sysparm_query=name=' + table + '_' + sysId +
             '^ORDERBYDESCsys_created_on&sysparm_fields=sys_id,sys_created_on,state&sysparm_limit=1';
-        var res = await fetch(url, { headers: _recHeaders() });
+        var res = await fetch(url, _recFetchOpts(target));
         var data = await res.json();
         if (data && data.result && data.result[0]) return data.result[0];
     } catch (e) {
@@ -109,14 +213,14 @@ async function snDetectMaint(instanceUrl, token, fetchFn) {
     return ok;
 }
 
-async function getRecordDisplayValue(table, sysId) {
+async function getRecordDisplayValue(table, sysId, target) {
     if (!sysId || !_recValidTable.test(table) || !_recValidSysId.test(sysId)) {
         return sysId ? sysId.substring(0, 8) : '';
     }
     try {
-        var url = _recPrefix() + '/api/now/table/' + table + '/' + sysId +
+        var url = _recPrefix(target) + '/api/now/table/' + table + '/' + sysId +
             '?sysparm_fields=sys_id,name,number,short_description&sysparm_limit=1';
-        var res = await fetch(url, { headers: _recHeaders() });
+        var res = await fetch(url, _recFetchOpts(target));
         var data = await res.json();
         if (data && data.result) {
             return data.result.name || data.result.number || data.result.short_description || sysId.substring(0, 8);

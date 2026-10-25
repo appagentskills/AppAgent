@@ -42,8 +42,17 @@ describe('documents page sources', function() {
                 return { path: path };
             },
             showPromptModal: async function(title, msg, def) { rec.prompts.push([title, msg, def]); return o.prompt; },
-            pickLocalFolder: function(access) { rec.picks.push(access); return Promise.resolve(null); }
+            addLocalFolder: function(h, opts) {
+                (rec.adds = rec.adds || []).push([h.name, opts.access]);
+                var f = { id: 'lf_new', kind: 'local', label: h.name, name: h.name, access: opts.access, permission: 'granted' };
+                folders.push(f); return Promise.resolve(f);
+            }
         }, allowUnstubbed: o.allowUnstubbed });
+        // The module's `window` is the loader's fakeWindow (m.__scope.window): the picker is stubbed there.
+        m.__scope.window.showDirectoryPicker = function(opts) {
+            rec.picks.push(opts.mode);
+            return Promise.resolve({ kind: 'directory', name: 'proj', requestPermission: function(p) { (rec.perms = rec.perms || []).push(p.mode); return 'granted'; } });
+        };
         // Rail layout: the sources rail + the pane (title bar with the selected source's actions, then the items).
         var mount = await U.mountDom({ html: '<div id="documents-list" class="sdoc-rail-layout"><nav class="sdoc-rail" id="documents-sources"></nav>' +
             '<div class="sdoc-pane" id="sdoc-pane"><div class="sdoc-pane-head" id="sdoc-pane-head"></div><span id="documents-count"></span><div id="documents-items"></div></div></div>' });
@@ -205,11 +214,20 @@ describe('documents page sources', function() {
             assert.strictEqual(e.rec.updates.length, 2, 'nothing stored');
             m.sdocRenderSourcesStrip();
             assert.strictEqual(checkedIn(addRadio()), 'readwrite', 'remembered across re-renders');
-            await e.U.fireInline(document.querySelector('#sdoc-add-pop [data-fk="connect"]'), 'click', m).result;
-            assert.deepStrictEqual(e.rec.picks, ['readwrite'], 'Choose folder uses the remembered access');
+            assert.ok(document.querySelector('#sdoc-add-pop [data-fk="connect"]').disabled, 'Connect folder disabled until a folder is picked');
+            await e.U.fireInline(document.querySelector('#sdoc-add-pop [data-fk="add:browse"]'), 'click', m).result;
+            assert.deepStrictEqual(e.rec.picks, ['readwrite'], 'Browse opens the picker with the remembered access');
             e.U.fireInline(addRadio().querySelector('[data-value="read"]'), 'click', m);
             assert.strictEqual(m.sdocSrcState.addAccess, 'read');
             assert.strictEqual(e.rec.updates.length, 2);
+            e.U.fireInline(addRadio().querySelector('[data-value="readwrite"]'), 'click', m);
+            await e.U.fireInline(document.querySelector('#sdoc-add-pop [data-fk="connect"]'), 'click', m).result;
+            await settle(e.U);
+            assert.deepStrictEqual(e.rec.perms, ['readwrite'], 'read & write: permission requested before adding');
+            assert.deepStrictEqual(e.rec.adds, [['proj', 'readwrite']], 'addLocalFolder gets the chosen access');
+            assert.strictEqual(m.sdocSrcState.sel, 'lf:lf_new', 'the new folder is selected');
+            assert.ok(!document.getElementById('sdoc-add-pop'), 'dialog closed');
+            assert.strictEqual(e.rec.updates.length, 2, 'nothing stored through updateLocalFolder');
         } finally { seen.restore(); e.U.cleanupAll(); }
 
         var f = await load({ updateFail: function(p) { return p.access === 'read' ? new Error('locked') : null; } });
@@ -239,7 +257,7 @@ describe('documents page sources', function() {
             assert.strictEqual(document.querySelector('.sdoc-rail-add').getAttribute('aria-expanded'), 'true');
             assert.ok(pop.contains(seen[seen.length - 1]), 'focus moves into the popover');
             // Not Escape: stays open.
-            assert.strictEqual(e.U.fireInline(pop, 'keydown', m, { key: 'Enter', target: pop.querySelector('[data-fk="connect"]') }).prevented, false);
+            assert.strictEqual(e.U.fireInline(pop, 'keydown', m, { key: 'Enter', target: pop.querySelector('[data-fk="add:browse"]') }).prevented, false);
             assert.ok(document.getElementById('sdoc-add-pop'));
             // An Escape already consumed inside (e.g. the repo combobox closing its list) is skipped.
             var ev = new KeyboardEvent('keydown', { key: 'Escape', cancelable: true });

@@ -1,0 +1,44 @@
+/* Smart file viewers on the Documents page (tools/112-file-viewers.js).
+   Colors come from theme tokens only (--sh-*, .json-*, xml vars) so light/dark both work. */
+.fv-wrap { display: flex; flex-direction: column; gap: var(--space-2); min-width: 0; }
+.fv-bar { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
+.fv-bar-spacer { flex: 1 1 auto; }
+.fv-tab[aria-selected="true"] { background: var(--bg-tertiary); color: var(--text-primary); font-weight: var(--font-semibold); }
+.fv-btn { border: 1px solid var(--secondary-border); background: transparent; color: var(--text-muted); border-radius: var(--radius-sm); padding: var(--space-1) var(--space-3); font-size: var(--text-caption); cursor: pointer; }
+.fv-btn:hover { color: var(--text-primary); background: var(--bg-tertiary); }
+.fv-btn:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
+.fv-wrap:not([data-view="tree"]) .fv-tree-btn { display: none; }
+.fv-notice { font-size: var(--text-caption); color: var(--text-muted); border-left: 3px solid var(--secondary-border); padding: var(--space-1) var(--space-2); background: var(--secondary-lighter); border-radius: var(--radius-sm); }
+.fv-pane[hidden] { display: none; }
+.fv-pane .wsf-code { margin: 0; }
+
+/* Code: gutter + source share font and line-height so rows line up. */
+.fv-code { display: flex; align-items: flex-start; overflow: auto; max-height: 70vh; background: var(--secondary-lighter); border: 1px solid var(--secondary-border); border-radius: var(--radius-md); }
+.fv-gutter, .fv-code-src { margin: 0; padding: var(--space-2); font-family: var(--font-mono, monospace); font-size: 12px; line-height: 1.5; white-space: pre; background: transparent; border: 0; }
+.fv-gutter { flex: 0 0 auto; text-align: right; color: var(--text-muted); user-select: none; border-right: 1px solid var(--secondary-border); position: sticky; left: 0; background: var(--secondary-lighter); }
+.fv-code-src { flex: 1 1 auto; color: var(--text-primary); }
+
+/* Trees */
+.fv-tree { font-family: var(--font-mono, monospace); font-size: 12px; line-height: 1.5; overflow: auto; max-height: 70vh; padding: var(--space-2); background: var(--secondary-lighter); border: 1px solid var(--secondary-border); border-radius: var(--radius-md); }
+.fv-node > summary { cursor: pointer; list-style: revert; }
+.fv-node > summary:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
+.fv-children { padding-left: 1.25em; border-left: 1px dotted var(--secondary-border); margin-left: 0.3em; }
+.fv-leaf { white-space: pre-wrap; word-break: break-word; }
+.fv-close { padding-left: 0.3em; }
+.fv-node[open] > summary .fv-count, .fv-node[open] > summary .fv-close-inline { display: none; }
+.fv-node:not([open]) > .fv-close { display: none; }
+.fv-count { color: var(--text-muted); font-size: 0.9em; margin: 0 0.3em; }
+.fv-count::before { content: "\2026 "; }
+.fv-punc { color: var(--text-muted); }
+.fv-idx { color: var(--sh-number); }
+
+/* XML tokens (same mapping as .diff-text in 16-diff.css) */
+.fv-wrap .xml-bracket { color: var(--text-muted); }
+.fv-wrap .xml-tag { color: var(--primary); }
+.fv-wrap .xml-attr { color: var(--accent); }
+.fv-wrap .xml-attr-value { color: var(--success); }
+.fv-wrap .xml-text { color: var(--text-primary); }
+.fv-wrap .xml-comment, .fv-wrap .xml-decl { color: var(--text-muted); font-style: italic; }
+
+/* Rendered markdown */
+.fv-md { overflow: auto; max-height: 70vh; padding: var(--space-2) var(--space-3); border: 1px solid var(--secondary-border); border-radius: var(--radius-md); }

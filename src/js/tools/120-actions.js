@@ -2396,6 +2396,13 @@ var ACTIVE_CHAT_LINGER_MS = 5 * 60 * 1000; // 5 minutes
 // longer live work, so it stops holding a slot under Active and is reached from
 // Completed Today / History instead.
 var UNSEEN_CHAT_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
+// Age cap on FAILED / BLOCKED chats (classifier key 'error' or 'stuck'). An
+// errored or stuck chat whose last activity is older than this is abandoned
+// work, not something the run monitor should keep surfacing: it drops out of
+// "Active chats" (header pill, jobs dropdown, home panel, expand modal) but the
+// chat itself is untouched and stays reachable from History / Pinned.
+// See _isStaleFailedChat().
+var STALE_FAILED_CHAT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 // Max cards rendered per HISTORICAL bucket in the shared Active-chats surfaces
 // (_jobsExpandBuckets -> expand modal + home panel). Active is deliberately
 // UNCAPPED -- it is the run monitor, so every live/blocked run must be visible.
@@ -2420,7 +2427,8 @@ var JOBS_BUCKET_MAX = 20;
 //               literally executing. Rejected -- "in flight" for a monitor means
 //               "not finished", and a blocked run is emphatically not finished.)
 //   'error'  -- IN: an unresolved failed run is open work needing triage; see
-//               getActiveChatsList() step 8, which admits errored chats forever.
+//               getActiveChatsList() step 8. Both 'error' and 'stuck' age out
+//               after STALE_FAILED_CHAT_MAX_AGE_MS (7 d) idle (_isStaleFailedChat).
 //   NOT in: 'done', 'pr_opened', 'pr_merged' -- finished runs. They live in
 //   Completed Today / Pinned. Because those three keys are excluded here, the
 //   "Done" / "PR opened" / "PR merged" pills can never count a chat that is
@@ -2522,8 +2530,9 @@ function _isChatUnseen(chatId) {
 // next run start, and by dismissChatNotifications/dismissChatFromJobs). Such a
 // chat is still open work the user needs to triage, so it must keep showing
 // under "Active Chats" regardless of age or seen-state — and UNLIKE the unread
-// rule, which now ages out after UNSEEN_CHAT_MAX_AGE_MS, an errored chat is
-// never aged out — until the error is retried, cleared, or dismissed.
+// rule, which ages out after UNSEEN_CHAT_MAX_AGE_MS, an errored chat stays
+// until the error is retried, cleared, or dismissed -- or until it has been
+// idle for STALE_FAILED_CHAT_MAX_AGE_MS (7 days, see _isStaleFailedChat).
 // Same scoping as _isChatUnseen: background Action chats and sub-agents have
 // their own surfaces and never qualify here.
 function _isChatErrored(chatId) {
@@ -2544,6 +2553,38 @@ function _isChatErrored(chatId) {
     var st = prog && prog.state;
     if (st && st !== 'error' && isTerminalProgressState(st)) return false;
     return true;
+}
+
+// Last-activity stamp used by the stale-failed age cap: the newest of the
+// persisted activity stamps (lastResponseAt / lastActivityAt / updatedAt),
+// falling back to the creation time (createdAt, or the id-embedded stamp) for
+// legacy chats that never recorded activity. 0 = unknown age.
+function _chatLastActivityTs(c) {
+    if (!c) return 0;
+    var last = Math.max(c.lastResponseAt || 0, c.lastActivityAt || 0, c.updatedAt || 0);
+    return last || _chatCreatedTs(c);
+}
+
+// True when this chat is ERRORED or STUCK (THE classifier _homeChatFilterKey
+// says 'error' or 'stuck' -- i.e. _lastApiError / an 'error' card, or an
+// approval / prompt / stuck / needs_input / needs_permission card / user Pause)
+// AND its last activity is older than STALE_FAILED_CHAT_MAX_AGE_MS (7 days).
+// Such a chat is kept OUT of every Active-chats surface: getActiveChatsList()
+// (header pill, jobs dropdown, home panel + expand modal population) and
+// _isChatInActiveSection(). A chat that is genuinely running (own loop or a
+// running sub-agent) is never stale. Unknown age (no stamps) is not stale.
+// `key` is an optional precomputed _homeChatFilterKey() result.
+function _isStaleFailedChat(chatId, now, key) {
+    var c = (typeof chats !== 'undefined') ? chats[chatId] : null;
+    if (!c) return false;
+    var last = _chatLastActivityTs(c);
+    if (!last) return false;
+    // Cheap age test first, so the O(messages) classifier only runs for old chats.
+    if (((now || Date.now()) - last) <= STALE_FAILED_CHAT_MAX_AGE_MS) return false;
+    if (isChatActivelyRunning(chatId) || chatHasRunningSubAgents(chatId)) return false;
+    var k = key;
+    if (k === undefined) { try { k = _homeChatFilterKey(chatId); } catch (e) { return false; } }
+    return k === 'error' || k === 'stuck';
 }
 
 // True when the chat has ANY activity (finished response OR mid-run event —
@@ -2730,6 +2771,9 @@ function getActiveChatsList() {
         // Honor an explicit 'remove from list' (dismissChatFromJobs) even while the
         // chat is running; pinned chats are never hidden.
         if (c._jobsHidden && !c.pinned) return;
+        // Errored / stuck chats idle for > STALE_FAILED_CHAT_MAX_AGE_MS (7 days)
+        // are abandoned work: keep them out of every Active surface.
+        if (_isStaleFailedChat(cid)) return;
         seen[cid] = true;
         out.push(c);
     }
@@ -2794,8 +2838,9 @@ function getActiveChatsList() {
     }
     // 8) Errored chats (_lastApiError still set) — failed work the user hasn't
     //    retried or dismissed yet needs triage, so it belongs under Active
-    //    Chats no matter how old or already-seen it is (same "until resolved"
-    //    rule as unseen chats). Dismissing the card clears the flag.
+    //    Chats however already-seen it is -- until retried or dismissed, or
+    //    until it has been idle > STALE_FAILED_CHAT_MAX_AGE_MS (consider()
+    //    drops it via _isStaleFailedChat). Dismissing the card clears the flag.
     if (typeof chats !== 'undefined' && chats) {
         Object.keys(chats).forEach(function(cid) {
             if (_isChatErrored(cid)) consider(cid);
@@ -4020,7 +4065,9 @@ function _jobsExpandBuckets() {
 // Callers own the empty-state (total === 0) decision. Sections-only: empty
 // sections are skipped, cards flow in a three-per-row grid (see
 // .jobs-expand-section-cards).
-function _jobsExpandBodyHtml(buckets) {
+// cardSink (optional array): receives {id, html} per rendered card so the home
+// panel can patch only the cards whose markup changed (_homeChatsPatch).
+function _jobsExpandBodyHtml(buckets, cardSink) {
     var activeChats = buckets.active, todayChats = buckets.today, pinnedChats = buckets.pinned;
     function section(label, arr, hidden) {
         if (!arr.length) return '';
@@ -4034,7 +4081,12 @@ function _jobsExpandBodyHtml(buckets) {
             '<div class="jobs-expand-subhead">' + escapeHtml(label) +
                 ' <span class="jobs-expand-col-count">' + arr.length + '</span>' + moreHtml + '</div>' +
             '<div class="jobs-expand-section-cards">' +
-                arr.map(function(c) { try { return _jobsExpandCardHtml(c); } catch (e) { console.warn('jobs: expand card render failed', e); return ''; } }).join('') +
+                arr.map(function(c) {
+                    var h;
+                    try { h = _jobsExpandCardHtml(c); } catch (e) { console.warn('jobs: expand card render failed', e); return ''; }
+                    if (cardSink && h) cardSink.push({ id: c.id, html: h });
+                    return h;
+                }).join('') +
             '</div>' +
         '</div>';
     }
@@ -4138,7 +4190,9 @@ function _homeChatFilterKey(chatId) {
 // 'done' -> not Active, matching _homeChatsFilterBarHtml()'s existing fallback.
 function _isChatInActiveSection(chatId) {
     var k; try { k = _homeChatFilterKey(chatId); } catch (e) { k = 'done'; }
-    return !!HOME_ACTIVE_SECTION_KEYS[k];
+    if (!HOME_ACTIVE_SECTION_KEYS[k]) return false;
+    // Errored / stuck and idle > 7 days -> not Active (see _isStaleFailedChat).
+    return !_isStaleFailedChat(chatId, Date.now(), k);
 }
 // Apply the current filter to _jobsExpandBuckets() output. Returns fresh
 // bucket arrays (never mutates the input) with a recomputed total.
@@ -4403,6 +4457,7 @@ function renderHomeActiveChats() {
     // entirely. A filter that matches nothing keeps the chrome + pills visible
     // with an inline empty message instead (so the user can switch back).
     var html = '';
+    var cardSink = [];
     if (rawTotal) {
         html = '<div class="home-active-chats-inner">' +
             '<div class="home-active-chats-head">' +
@@ -4411,7 +4466,7 @@ function renderHomeActiveChats() {
                 filterBar +
             '</div>' +
             '<div class="home-active-chats-body layout-sections">' +
-                (total ? _jobsExpandBodyHtml(shown)
+                (total ? _jobsExpandBodyHtml(shown, cardSink)
                        : '<div class="jobs-expand-empty">' + escapeHtml(t('No chats in this state')) + '</div>') +
             '</div>' +
         '</div>';
@@ -4446,7 +4501,7 @@ function renderHomeActiveChats() {
     // Keyboard focus survives the replace (fix 7): snapshot before, restore after.
     var _focusKey = _homeChatsFocusKey(container);
     container._homeLastHtml = html;
-    container.innerHTML = html;
+    _homeChatsPatch(container, html, cardSink);
     // Restore scroll positions after the repaint (body first — it's the outer
     // scroller; columns/cards scroll independently inside it).
     var newBodyEl = container.querySelector('.home-active-chats-body');
@@ -4458,6 +4513,93 @@ function renderHomeActiveChats() {
     // Focus last: after the scroll restores, so focusing a control cannot fight
     // the scrollTop we just wrote back.
     _homeChatsRestoreFocus(container, _focusKey);
+}
+// Flash fix: a change to ANY card (a running chat's progress text, spinner,
+// context ring, PR state) used to replace the WHOLE panel's innerHTML, so
+// every card was rebuilt each 1s poll tick that saw a change -- restarting
+// their CSS animations/transitions and dropping hover state, i.e. all cards
+// "flashed" every couple of seconds while anything streamed. Now: when the
+// panel skeleton (everything except the cards: head, pills, section headers,
+// card order) is unchanged, only the cards whose own markup changed are
+// swapped (outerHTML); untouched cards keep their live DOM nodes. Any
+// skeleton change (membership, order, counts, filter) falls back to the full
+// replace.
+function _homeChatsSkeleton(html, cards) {
+    var s = html;
+    for (var i = 0; i < cards.length; i++) {
+        var at = s.indexOf(cards[i].html);
+        if (at === -1) return null;
+        s = s.slice(0, at) + '\u0000' + cards[i].id + '\u0000' + s.slice(at + cards[i].html.length);
+    }
+    return s;
+}
+function _homeChatsPatch(container, html, cards) {
+    cards = cards || [];
+    var skel = _homeChatsSkeleton(html, cards);
+    var prevMap = container._homeCardHtml || null;
+    var map = {};
+    cards.forEach(function(c) { map[c.id] = c.html; });
+    var patched = false;
+    if (skel !== null && prevMap && container._homeSkeleton === skel) {
+        patched = true;
+        var live = {};
+        container.querySelectorAll('.jobs-expand-card').forEach(function(el) {
+            live[el.getAttribute('data-chat-id')] = el;
+        });
+        // The live DOM must still hold EVERY card (someone may have cleared or
+        // replaced the container's content since the last paint, e.g. the
+        // modal closing): otherwise patch nothing and fall back to a full paint.
+        for (var j = 0; j < cards.length; j++) { if (!live[cards[j].id]) { patched = false; break; } }
+        for (var i = 0; i < cards.length && patched; i++) {
+            var c = cards[i];
+            if (prevMap[c.id] === c.html) continue;
+            var el = live[c.id];
+            if (!el) { patched = false; break; }
+            _homeChatsPatchCard(el, prevMap[c.id], c.html);
+        }
+    }
+    if (!patched) container.innerHTML = html;
+    container._homeSkeleton = skel;
+    container._homeCardHtml = map;
+    return patched;
+}
+// Swap one changed card. Finer than outerHTML: when the old and new card have
+// the same child layout (head / actions rail / body / drawer), only the
+// children whose markup changed are replaced and the root's attributes are
+// synced in place -- so a running chat whose progress text changed keeps its
+// head spinner, context ring and PR cards (no animation restart / hover drop).
+// Anything unexpected falls back to a whole-card outerHTML swap.
+function _homeChatsPatchCard(el, prevHtml, html) {
+    try {
+        if (typeof prevHtml !== 'string' || !el.children || typeof document === 'undefined' || !document.createElement) throw 0;
+        var mk = function(h) { var tp = document.createElement('template'); tp.innerHTML = h; return tp.content && tp.content.firstElementChild; };
+        var a = mk(prevHtml), b = mk(html);
+        if (!a || !b || a.tagName !== b.tagName || a.children.length !== b.children.length || el.children.length !== b.children.length) throw 0;
+        var i, at;
+        for (i = el.attributes.length - 1; i >= 0; i--) {
+            at = el.attributes[i].name;
+            if (!b.hasAttribute(at)) el.removeAttribute(at);
+        }
+        for (i = 0; i < b.attributes.length; i++) {
+            at = b.attributes[i];
+            if (el.getAttribute(at.name) !== at.value) el.setAttribute(at.name, at.value);
+        }
+        var oldKids = Array.prototype.slice.call(a.children), newKids = Array.prototype.slice.call(b.children);
+        var liveKids = Array.prototype.slice.call(el.children);
+        // Swap a changed child via its outerHTML setter, NEVER by moving the
+        // parsed <template> node in: the MV3 CSP polyfill
+        // (platform/extension/csp-polyfill.js) rewrites onclick="..." to
+        // data-_ev-click and binds it only for nodes inserted through
+        // innerHTML/outerHTML/insertAdjacentHTML; its innerHTML scan of the
+        // <template> sees no children (they live in .content), so template
+        // nodes carry unbound handlers and the rail's open/pin/dismiss
+        // buttons went dead after any patch.
+        for (i = 0; i < newKids.length; i++) {
+            if (oldKids[i].outerHTML !== newKids[i].outerHTML) liveKids[i].outerHTML = newKids[i].outerHTML;
+        }
+    } catch (e) {
+        el.outerHTML = html;
+    }
 }
 function renderJobsExpandModal() {
     var overlay = document.getElementById('jobs-expand-overlay');
@@ -4474,8 +4616,9 @@ function renderJobsExpandModal() {
     var buckets = _jobsExpandBuckets();
     var total = buckets.total;
     var closeIcon = UI_ICONS.close || '\u00d7';
+    var cardSink = [];
     var body = total
-        ? _jobsExpandBodyHtml(buckets)
+        ? _jobsExpandBodyHtml(buckets, cardSink)
         : '<div class="jobs-expand-empty">' + escapeHtml(t('No active chats right now')) + '</div>';
     var html =
         '<div class="jobs-expand-modal" role="dialog" aria-label="' + escapeHtml(t('Active chats')) + '">' +
@@ -4492,7 +4635,9 @@ function renderJobsExpandModal() {
         return;
     }
     overlay._jobsLastHtml = html;
-    overlay.innerHTML = html;
+    // Same per-card patch as the home panel (flash fix): unchanged cards keep
+    // their live nodes; any skeleton change falls back to a full replace.
+    _homeChatsPatch(overlay, html, cardSink);
     var newBody = overlay.querySelector('.jobs-expand-body');
     if (newBody) newBody.scrollTop = prevScroll;
     _jobsRestoreCardScroll(overlay, prevCardScroll);
@@ -4504,6 +4649,15 @@ function _jobsExpandCardHtml(c) {
     // Design A: same three channels as the dropdown rows (see _jobsRowSignals).
     var indicator = _jobsStateIndicatorHtml(st, c.id);
     var sig = _jobsRowSignals(c.id, st);
+    var trail = sig.trail;
+    // Cards only (dropdown rows keep check + trailing dot): an unread finished
+    // chat shows the blue unread dot IN PLACE of the done check, not next to
+    // it. Read cards keep the check; spinner / bell / state dots untouched.
+    var unreadDot = '<span class="jobs-unread-dot" aria-hidden="true"></span>';
+    if (/ jobs-unread\b/.test(sig.cls) && (st === 'done' || st === 'unseen') && indicator.indexOf('jobs-row-check') !== -1) {
+        indicator = unreadDot;
+        trail = trail.replace(unreadDot, '');
+    }
     var idJs = escapeJsString(c.id);
     // Progress only in the scrollable body — sub-agent rows live in a drawer
     // docked INSIDE the card but BELOW the body scroll, so they stay visible
@@ -4511,26 +4665,107 @@ function _jobsExpandCardHtml(c) {
     // data-worker-toggle listener.
     var prog = (typeof getChatProgressStateFor === 'function') ? getChatProgressStateFor(c.id) : null;
     var workers = (typeof _jobsAccWorkersHtml === 'function') ? _jobsAccWorkersHtml(c.id) : '';
+    // PR cards (chat + its sub-agents; the chat sidebar's .pr-sidebar-item
+    // cards) sit at the top of the drawer, directly above the worker cards; a
+    // chat with PRs but no workers still gets the drawer so its PRs stay visible.
+    var prCards = _jobsCardPrCardsHtml(c.id);
+    var drawer = prCards + workers;
     // Pin toggle (shared with the dropdown rows — same chat.pinned flag) +
-    // dismiss (hover-revealed; hidden on pinned cards, matching _jobsRowButtons:
+    // dismiss (always visible; omitted on pinned cards, matching _jobsRowButtons:
     // pinned chats are never hidden, unpin first).
     var pinned = !!c.pinned;
     var pinBtn = (typeof _jobsPinBtnHtml === 'function') ? _jobsPinBtnHtml(c) : '';
     var dismissBtn = pinned ? '' :
         '<button class="jobs-row-btn danger jobs-card-dismiss" title="' + escapeHtml(t('Remove from list')) + '" onclick="event.stopPropagation();dismissChatFromJobs(\'' + idJs + '\')">' + UI_ICONS.close + '</button>';
     return '<div class="jobs-expand-card state-' + escapeHtml(st) + sig.cls + '" data-chat-id="' + escapeHtml(c.id) + '">' +
+        // Head stays ONE direct child of the card (_homeChatsPatchCard swaps
+        // children 1:1). Inside it: leading indicator + title line (title +
+        // trailing dot) on row 1, the status pill on its own row 2 under the
+        // title (2-column grid, see .jobs-expand-card-head in 23-actions.css)
+        // so neither the title nor the pill gets squeezed.
         '<div class="jobs-expand-card-head">' +
             indicator +
-            '<div class="jobs-expand-card-title">' + escapeHtml(_jobsChatTitleText(c)) + '</div>' +
-            sig.trail +
+            '<div class="jobs-expand-card-titleline">' +
+                '<div class="jobs-expand-card-title">' + escapeHtml(_jobsChatTitleText(c)) + '</div>' +
+                trail +
+            '</div>' +
             _jobsProgressBadgeHtml(c.id) +
-            pinBtn +
-            (typeof _contextCircleHtml === 'function' ? _contextCircleHtml(c.id, 'jobs-row-ctx', true) : '') +
+        '</div>' +
+        // Action icons stacked vertically in a rail on the card's right side
+        // (grid area "actions", spanning the head + body rows), top to bottom:
+        // open chat, context ring, pin, dismiss (close).
+        '<div class="jobs-expand-card-actions">' +
             '<button class="jobs-row-btn" title="' + escapeHtml(t('Open chat')) + '" onclick="event.stopPropagation();openChatFromExpand(\'' + idJs + '\')">' + UI_ICONS.chat + '</button>' +
+            (typeof _contextCircleHtml === 'function' ? _contextCircleHtml(c.id, 'jobs-row-ctx', true) : '') +
+            pinBtn +
             dismissBtn +
         '</div>' +
         '<div class="jobs-expand-card-body">' + _jobsAccordionBodyHtml(prog) + '</div>' +
-        (workers ? '<div class="jobs-expand-card-workers" data-workers-for="' + escapeHtml(c.id) + '">' + workers + '</div>' : '') +
+        (drawer ? '<div class="jobs-expand-card-workers" data-workers-for="' + escapeHtml(c.id) + '">' + drawer + '</div>' : '') +
+    '</div>';
+}
+// PRs pushed by a chat AND its sub-agents, deduped by URL, each with a state
+// ('open' | 'merged' | 'closed'). Same sources as the version sidebar's Pull
+// Requests section (renderVersionSidebar, 120-ui-utils.js): the message scan
+// (getPushedPRsForChat) over the chat + getSubAgentChatsForChat, then the
+// durable workspace meta.prs union (_sidebarMetaPRs) for entries stamped with
+// this chat / one of its subs / root_chat_id. State: live _sidebarPRState,
+// else the meta stamp (state / merged_at), else 'open'.
+function _jobsCardPrs(chatId) {
+    var out = [];
+    if (!chatId || typeof chats === 'undefined' || !chats) return out;
+    var seen = {};
+    var subIds = {};
+    // worker: sub-agent name for the PR card's worker chip (like the sidebar).
+    function add(pr, worker) {
+        if (!pr || !pr.url || seen[pr.url]) return;
+        seen[pr.url] = true;
+        out.push({ url: pr.url, number: pr.number, title: pr.title || '', branch: pr.branch || '', base: pr.base || '', worker: worker || null });
+    }
+    var scan = (typeof getPushedPRsForChat === 'function') ? getPushedPRsForChat : null;
+    try { if (scan && chats[chatId]) scan(chats[chatId]).forEach(add); } catch (e) { /* skip */ }
+    var subs = [];
+    try { subs = (typeof getSubAgentChatsForChat === 'function') ? (getSubAgentChatsForChat(chatId) || []) : []; } catch (e) { subs = []; }
+    subs.forEach(function(sc) {
+        if (!sc || !sc.chatId) return;
+        subIds[sc.chatId] = sc.name || sc.chatId; // truthy; doubles as the worker chip label
+        try { if (scan && sc.chat) scan(sc.chat).forEach(function(pr) { add(pr, sc.name); }); } catch (e) { /* skip */ }
+    });
+    // Home page may render before any chat sidebar warmed the meta cache.
+    try { if (typeof _sidebarMetaPRs !== 'undefined' && _sidebarMetaPRs === null && typeof _refreshSidebarMetaPRs === 'function') _refreshSidebarMetaPRs(); } catch (e) { /* best effort */ }
+    var meta = (typeof _sidebarMetaPRs !== 'undefined' && Array.isArray(_sidebarMetaPRs)) ? _sidebarMetaPRs : [];
+    var metaByUrl = {};
+    meta.forEach(function(p) {
+        if (!p || !p.url) return;
+        metaByUrl[p.url] = p;
+        if (p.chatId === chatId || subIds[p.chatId] || p.root_chat_id === chatId) add(p, (p.chatId !== chatId && subIds[p.chatId]) || null);
+    });
+    var live = (typeof _sidebarPRState !== 'undefined' && _sidebarPRState) ? _sidebarPRState : {};
+    out.forEach(function(pr) {
+        var st = live[pr.url];
+        var m = metaByUrl[pr.url];
+        if (st !== 'merged' && st !== 'closed' && st !== 'open' && st !== 'merging') {
+            st = (m && (m.state === 'merged' || m.merged_at)) ? 'merged' : (m && m.state === 'closed' ? 'closed' : 'open');
+        }
+        pr.state = st;
+        if (!pr.title && m && m.title) pr.title = m.title;
+    });
+    return out;
+}
+// PR cards for an active-chat card, or '' when the chat tree has no PRs. Each
+// card is the chat sidebar's PR card (renderPrSidebarItemHtml,
+// ui/120-ui-utils.js): title, #N + worker chip, Merged/Closed state or the
+// merge button, opening the PR in a new tab without toggling the card. Also
+// nudges the shared background GitHub state refresh (throttled per URL in
+// _refreshSidebarPRStates) so open PRs flip to merged/closed.
+function _jobsCardPrCardsHtml(chatId) {
+    var prs = _jobsCardPrs(chatId);
+    if (!prs.length || typeof renderPrSidebarItemHtml !== 'function') return '';
+    try { if (typeof _refreshSidebarPRStates === 'function') _refreshSidebarPRStates(prs); } catch (e) { /* best effort */ }
+    return '<div class="pr-sidebar-list jobs-card-prs">' +
+        prs.map(function(pr) {
+            return renderPrSidebarItemHtml(pr, pr.state, { stopPropagation: true });
+        }).join('') +
     '</div>';
 }
 // Open a chat from an expand-modal card: close the modal, then navigate (which

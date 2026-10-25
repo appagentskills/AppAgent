@@ -369,6 +369,8 @@ var WidgetStore = (function() {
         await init();
         // Tombstone BEFORE the delete commits: a concurrent read() can't remigrate.
         setTombstone(id, true);
+        // Drop the export record & replay cache (tools/082-widget-export.js).
+        if (typeof widgetExportClearRecords === 'function') { try { widgetExportClearRecords(id); } catch (e) {} }
         var database = await openDatabase();
         try {
             await new Promise(function(resolve, reject) {
@@ -698,10 +700,15 @@ function widgetVersionFrames(root) {
     return frames;
 }
 function refreshWidgetVersionViews(widgetId) {
+    // Split pane (core/082-split-view.js): keep its recorded version/title current.
+    if (typeof noteSplitViewWidgetCommitted === 'function') noteSplitViewWidgetCommitted(widgetId);
     widgetVersionFrames().forEach(function(iframe) {
         if (iframe.dataset.savedWidgetId !== widgetId) return;
         if (iframe.dataset.selectedWidgetVersion) { attachWidgetVersionPicker(iframe, widgetId); return; }
         var latest = WidgetStore.view(widgetId);
+        // Split pane: update the SAME iframe in place (slots or state-preserving
+        // reload), gated on user interaction (core/082-split-view.js).
+        if (latest && iframe.dataset.savedWidgetVersion !== String(latest.contentVersion) && typeof splitViewApplyUpdate === 'function' && typeof splitViewFrameInPane === 'function' && splitViewFrameInPane(iframe)) { splitViewApplyUpdate(iframe, widgetId); return; }
         if (latest && iframe.dataset.savedWidgetVersion !== String(latest.contentVersion)) selectWidgetRenderVersion(iframe, '');
         else attachWidgetVersionPicker(iframe, widgetId);
     });
@@ -714,7 +721,7 @@ function refreshWidgetVersionViews(widgetId) {
 // so the picker hides with it). Headerless mounts (home cards, deep-link tab /
 // side panel, bare containers) find no slot and get NO picker. Walks out of
 // open shadow roots (dashboard cards mount the iframe in .widget-shadow-host).
-var WIDGET_VERSION_SCOPE = '.widget-inline, .widget-modal, .widget-fullscreen-modal, .dashboard-widget';
+var WIDGET_VERSION_SCOPE = '.widget-inline, .widget-modal, .widget-fullscreen-modal, .dashboard-widget, .split-widget-pane';
 var WIDGET_VERSION_SLOT = '.widget-controls, .widget-modal-controls, .dashboard-widget-controls';
 function widgetVersionSlot(iframe) {
     var node = iframe;

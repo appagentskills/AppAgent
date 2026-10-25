@@ -119,6 +119,8 @@ window.addEventListener('message', function(event) {
         var reply = message.data;
         if (!reply || _liveWidgetFrames.get(entry.iframe) !== entry) return;
         if (reply.type === 'widgetDocumentGone') { unregisterWidgetInstance(entry.iframe, entry); return; }
+        // Replies to widgetPortRequest (split-pane state capture / slot apply).
+        if (entry.requests && typeof reply.request_id === 'string' && entry.requests[reply.request_id]) { entry.requests[reply.request_id](reply); return; }
         if (reply.type === 'widgetContentLoaded' && reply.probe_id === entry.probeId) {
             if (entry.probeTimer) clearTimeout(entry.probeTimer);
             entry.probeId = null;
@@ -133,6 +135,27 @@ window.addEventListener('message', function(event) {
 // The document-wide observer exists only while live instances exist (see
 // syncWidgetInstanceObserver). Light/shadow mutations share one queued detach
 // sweep; exact identity is still checked synchronously at use.
+
+// Request/reply over the exact render's document-owned MessagePort (used by
+// the split pane, core/082-split-view.js, for widgetCaptureState/applySlots).
+// Returns null when no bound port exists (caller falls back to the
+// source-checked window channel); otherwise a Promise of the reply or null on
+// timeout.
+function widgetPortRequest(iframe, message, replyType, timeoutMs) {
+    var entry = iframe ? _liveWidgetFrames.get(iframe) : null;
+    if (!entry || !entry.port || !entry.ready) return null;
+    var port = entry.port;
+    var requestId = 'wr_' + crypto.randomUUID();
+    entry.requests = entry.requests || {};
+    return new Promise(function(resolve) {
+        var timer = null;
+        function done(v) { if (timer) clearTimeout(timer); delete entry.requests[requestId]; resolve(v); }
+        entry.requests[requestId] = function(reply) { if (reply && reply.type === replyType) done(reply); };
+        timer = setTimeout(function() { done(null); }, timeoutMs || 400);
+        try { port.postMessage(Object.assign({}, message, { request_id: requestId })); }
+        catch (error) { done(null); }
+    });
+}
 
 function widgetEvalFailure(code, error, instanceId) {
     return { success: false, code: code, error: error, instance_id: instanceId || null };

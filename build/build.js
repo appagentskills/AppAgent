@@ -149,6 +149,9 @@ const WORKER_SHARED_FILES = [
     // before 080-tools/097.
     'js/core/078-tool-profiles.js',
     'js/core/080-tools.js',
+    // 082-split-view: split-view state + per-turn prompt context the SW
+    // injects via getSystemPromptWithContext (schema lives in 080).
+    'js/core/082-split-view.js',
     'js/core/085-eval-runner.js',
     // 090-codemap.js is DOM-free and is called by 100-cached-results.js's
     // codemap-extract path (large code tool results get summarized via
@@ -187,6 +190,9 @@ const WORKER_SHARED_FILES = [
     // runner: reads workspace files, runs them via the js_eval arm) —
     // dispatched by 020-tool-execution's run_js_file / run_tests arms; headless.
     'js/tools/160-run-tests.js',
+    // 165-chat-history: read-only chat_history tool (chats + chat_payloads
+    // stores, readonly transactions) — headless, dispatched by 020's arm.
+    'js/tools/165-chat-history.js',
     // 170-local-folders: connected folders (OPFS virtual folder + picked
     // directory handles) behind the local_folder tool, plus the binary-input
     // resolver used by servicenow_api attachment upload and web_fetch bodies.

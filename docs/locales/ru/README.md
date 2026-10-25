@@ -102,7 +102,7 @@ AppAgent — это расширение Chrome со встроенным аге
 ## Установка
 
 1. **Установка** — установите расширение AppAgent из Chrome Web Store (или загрузите распакованное расширение для разработки)
-2. **Получение API-ключа** — зарегистрируйтесь на [OpenRouter](https://openrouter.ai), используйте Anthropic/OpenAI напрямую или подключите подписку Claude Code (Enterprise или Personal)
+2. **Получение API-ключа** — зарегистрируйтесь на [OpenRouter](https://openrouter.ai) или [Hugging Face](https://huggingface.co/docs/inference-providers), используйте Anthropic/OpenAI напрямую или подключите подписку Claude Code (Enterprise или Personal)
 3. **Настройка** — откройте расширение и добавьте API-ключ (или войдите через Claude) в разделе «Настройки» → «API-провайдеры»
 4. **Начало работы** — откройте свой экземпляр ServiceNow во вкладке (он будет обнаружен автоматически) и начните общение
 

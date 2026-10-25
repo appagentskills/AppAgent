@@ -232,6 +232,21 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
         requestBody.plugins = [{ id: 'file-parser', pdf: { engine: 'native' } }];
     }
 
+    // Hugging Face Inference Providers (router.huggingface.co): plain OpenAI
+    // chat-completions — strip OpenRouter-only fields, route via the model
+    // suffix (provider.provider → model:provider; tool-capable provider when
+    // tools are sent under 'fastest'/none), and refresh the /v1/models catalog
+    // in the background so cost can be computed from live provider pricing
+    // (the router reports no usage.cost). The request path never awaits the
+    // catalog: it uses the cached copy or skips. core/030-config.js.
+    var isHuggingFace = !provider.isClaudeOAuth && !provider.isChatGPTOAuth
+        && typeof isHuggingFaceEndpoint === 'function' && isHuggingFaceEndpoint(provider.endpoint);
+    if (isHuggingFace) {
+        try { fetchHuggingFaceModelCatalog(); } catch (eCat) { /* background refresh only */ }
+        requestBody = adaptRequestBodyForHuggingFace(requestBody, provider, getCachedHuggingFaceModelCatalog());
+    }
+    var hfRoutedProvider = '';
+
     // Store request body in metrics for debugging
     reqMetrics.requestBody = requestBody;
     // PREFIX-STABILITY diagnostics: cheap per-part fingerprint (pre
@@ -261,7 +276,9 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
     // Prompt-cache heartbeat: stamp the finalized request body per chat so the
     // SW alarm (background.js) can re-send an identical-prefix 1-token request
     // when the chat sits waiting on sub-agents past the cache-TTL window.
-    _stampCacheHeartbeat(chatId, requestBody, currentProvider);
+    // Skipped for Hugging Face: no prompt cache to keep warm there, so a
+    // heartbeat would just re-bill the full prompt every 4 minutes.
+    if (!isHuggingFace) _stampCacheHeartbeat(chatId, requestBody, currentProvider);
 
     var reader;
 
@@ -399,7 +416,12 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
             body: JSON.stringify(requestBody)
         };
         if (abortController && abortController.signal) fetchOpts.signal = abortController.signal;
+        if (isHuggingFace) delete fetchOpts.headers['HTTP-Referer'];
         var res = await fetch(provider.endpoint, fetchOpts);
+        if (isHuggingFace) {
+            try { hfRoutedProvider = (res.headers && res.headers.get && res.headers.get('x-inference-provider')) || ''; } catch (eH) {}
+            if (hfRoutedProvider) reqMetrics.routedProvider = hfRoutedProvider;
+        }
 
         if (!res.ok) {
             setLLMConnectionStatus('disconnected');
@@ -424,6 +446,9 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
                         throw new Error(rawError);
                     }
                 }
+                // HF router / OpenAI-compatible providers may send {error:"text"}.
+                if (typeof errorData.error === 'string' && errorData.error) throw new Error(errorData.error);
+                if (typeof errorData.message === 'string' && errorData.message && !errorData.error) throw new Error(errorData.message);
                 throw new Error(errorData.error?.message || 'API request failed');
             } catch (e) {
                 // F5-1: attach the HTTP status to whatever error propagates so
@@ -802,6 +827,27 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
 
     // Capture usage from OpenRouter if available in final data
     // OpenRouter typically includes usage in X-headers or final message
+
+    // Hugging Face: no usage.cost from the router — compute it from the live
+    // /v1/models pricing of the provider that served the request
+    // (x-inference-provider header, else the explicit model suffix /
+    // provider field naming a provider). Policy routing (fastest/cheapest/
+    // preferred) without the header leaves cost undefined rather than
+    // guessing. Uses the cached catalog only (refreshed in the background at
+    // request start) — never waits on the network here.
+    if (isHuggingFace && reqMetrics.cost === undefined
+        && (Number.isFinite(reqMetrics.input_tokens) || Number.isFinite(reqMetrics.output_tokens))) {
+        try {
+            var hfCatalog = getCachedHuggingFaceModelCatalog();
+            var hfPricing = hfCatalog ? resolveHuggingFacePricing(hfCatalog, requestBody.model, provider.provider, hfRoutedProvider) : null;
+            var hfCost = computeHuggingFaceCost({ prompt_tokens: reqMetrics.input_tokens, completion_tokens: reqMetrics.output_tokens }, hfPricing);
+            if (hfCost !== undefined) {
+                reqMetrics.cost = hfCost;
+                reqMetrics.costSource = 'huggingface-catalog';
+                reqMetrics.routedProvider = hfPricing.provider;
+            }
+        } catch (eCost) { /* cost stays unreported */ }
+    }
     
     // Close the last text block BEFORE any synthetic refusal text is appended,
     // so its end offset covers only what the model streamed.
@@ -1018,9 +1064,19 @@ function sendCacheHeartbeat(chatId) {
         delete body.reasoning;
         // usage accounting is pointless for a discarded 1-token response.
         delete body.usage;
+        // HF/OpenAI-compatible: stream_options is invalid with stream:false;
+        // reasoning_effort mirrors the stripped `reasoning`.
+        delete body.stream_options;
+        delete body.reasoning_effort;
 
         var provider = getProviderById(entry.provider);
         if (!provider) return false;
+        // Hugging Face has no prompt cache to keep warm: never re-send (and
+        // re-bill) the full prompt. Covers entries stamped before the
+        // _stampCacheHeartbeat skip, or a provider whose endpoint changed.
+        var hbIsHF = !provider.isClaudeOAuth && !provider.isChatGPTOAuth
+            && typeof isHuggingFaceEndpoint === 'function' && isHuggingFaceEndpoint(provider.endpoint);
+        if (hbIsHF) { delete reg[chatId]; return false; }
 
         if (provider.isChatGPTOAuth) {
             // The Codex backend DOES keep an implicit prompt cache (~5-10 min
@@ -1058,15 +1114,20 @@ function sendCacheHeartbeat(chatId) {
 
         // Non-OAuth providers: plain fetch with the same headers as the real
         // path (callOpenRouterStreaming's fetch branch). Fire-and-forget.
+        var hbHeaders = {
+            'Authorization': 'Bearer ' + provider.apiKey,
+            'Content-Type': 'application/json'
+        };
+        // HTTP-Referer is an OpenRouter attribution header; never sent to
+        // Hugging Face (mirrors the real request path).
+        if (!hbIsHF) {
+            hbHeaders['HTTP-Referer'] = (typeof Platform !== 'undefined' && Platform.getReferer)
+                ? Platform.getReferer()
+                : (Platform.instanceUrl || (typeof window !== 'undefined' ? window.location.href : ''));
+        }
         fetch(provider.endpoint, {
             method: 'POST',
-            headers: {
-                'Authorization': 'Bearer ' + provider.apiKey,
-                'Content-Type': 'application/json',
-                'HTTP-Referer': (typeof Platform !== 'undefined' && Platform.getReferer)
-                    ? Platform.getReferer()
-                    : (Platform.instanceUrl || (typeof window !== 'undefined' ? window.location.href : ''))
-            },
+            headers: hbHeaders,
             body: JSON.stringify(body)
         }).then(function(res) {
             if (!res.ok) console.warn('[cache-heartbeat] non-OK response for chat', chatId, res.status);

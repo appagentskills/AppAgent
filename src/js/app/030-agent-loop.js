@@ -1580,6 +1580,14 @@ async function runAgent(overrideChatId) {
             }
         }
 
+        // Split view awareness (core/082-split-view.js): a TAIL role:'context'
+        // row, pushed only when the split signature (shown/closed, widget_id,
+        // version, pendingUpdate) changed since the last _splitViewCtx row.
+        // Keeps the system prompt stable so the prompt cache survives.
+        if (typeof maybePushSplitViewTailContext === 'function') {
+            try { maybePushSplitViewTailContext(chat, streamingChatId); } catch (e) {}
+        }
+
         // #3 (Phase 4, flag P4_SUB_SATURATION_HARDSTOP): sub-agent saturation
         // hard stop — see maybeSubSaturationHardStop. 'reported' means
         // SubAgents.report parked this chat on the sub's behalf: persist and

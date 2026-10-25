@@ -102,7 +102,7 @@ AppAgent إضافة لمتصفح Chrome مع حلقة وكيل مدمجة. تص�
 ## الإعداد
 
 1. **التثبيت** — ثبّت إضافة AppAgent من Chrome Web Store (أو حمّلها غير مضغوطة لأغراض التطوير)
-2. **احصل على مفتاح API** — أنشئ حسابًا على [OpenRouter](https://openrouter.ai)، أو استخدم Anthropic/OpenAI مباشرةً، أو اربط اشتراكك في Claude Code (المؤسسي أو الشخصي)
+2. **احصل على مفتاح API** — أنشئ حسابًا على [OpenRouter](https://openrouter.ai) أو [Hugging Face](https://huggingface.co/docs/inference-providers)، أو استخدم Anthropic/OpenAI مباشرةً، أو اربط اشتراكك في Claude Code (المؤسسي أو الشخصي)
 3. **التكوين** — افتح الإضافة وأضف مفتاح API الخاص بك (أو سجّل الدخول باستخدام Claude) في الإعدادات ← موفرو API
 4. **ابدأ البناء** — افتح مثيل ServiceNow الخاص بك في علامة تبويب (يُكتشف تلقائيًا) وابدأ المحادثة
 

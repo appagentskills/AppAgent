@@ -223,7 +223,8 @@ describe('TB-8/TB-9 version-history XML export (ui/090-version-history.js)', fun
         function resp(ok, body) { return { ok: ok, status: ok ? 200 : 404, json: async function() { return body; }, text: async function() { return String(body); } }; }
         var doc = { body: { appendChild: function() {}, removeChild: function() {} },
             createElement: function(tag) { return { tagName: String(tag).toUpperCase(), click: function() { t.clicks++; } }; } };
-        t.m = await loadModules([SRC], { lenient: true, globals: {
+        // core/150 provides the instance-aware record identity helpers (recordEntryKey, ...).
+        t.m = await loadModules(['src/js/core/150-record-helpers.js', SRC], { lenient: true, globals: {
             window: { sessionToken: 'tok' }, document: doc,
             fetch: async function(url) {
                 t.fetched.push(url);

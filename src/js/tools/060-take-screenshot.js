@@ -129,6 +129,126 @@ async function downscaleImageHighQuality(source, scale) {
     return { base64: out, width: newW, height: newH };
 }
 
+// --- split_widget: in-place capture of the live split pane -------------------
+// Shoots the visible viewport of the extension page hosting the chat
+// (chrome.tabs.captureVisibleTab on its own tab) and crops it to the widget
+// iframe rect (or the whole #split-widget-pane with include_header:true).
+// No new tab, no offscreen render, no widget reload. A side panel has no tab
+// of its own (captureVisibleTab would shoot the website beside it) -> error.
+var SPLIT_PANE_NOT_VISIBLE = 'split pane not visible';
+var SPLIT_PANE_MISMATCH = 'split pane mismatch';
+// callerChatId: the chat that issued the tool call (options.chatId). The pane
+// is keyed by the ROOT chat of the chat family shown on screen
+// (core/082-split-view.js renderSplitViewPane -> pane.dataset.chatId).
+async function _ssCaptureSplitPaneInPlace(args, maxWidth, callerChatId) {
+    var hasDoc = typeof document !== 'undefined' && document && typeof document.getElementById === 'function';
+    var pane = hasDoc ? document.getElementById('split-widget-pane') : null;
+    var frame = typeof _splitViewPaneFrame === 'function' ? _splitViewPaneFrame() : null;
+    if (!pane || pane.hidden || !frame) {
+        return { success: false, error: SPLIT_PANE_NOT_VISIBLE + ': no widget is shown in the split pane, or the chat view is hidden. Open one with split_view action=open, or use target "widget".' };
+    }
+    // Never silently capture another chat family's pane, or a different widget
+    // than the one asked for.
+    var paneChatId = pane.dataset && pane.dataset.chatId;
+    if (callerChatId && paneChatId) {
+        var callerRoot = typeof splitViewRootChatId === 'function' ? splitViewRootChatId(callerChatId)
+            : (typeof resolveRootChatId === 'function' ? (resolveRootChatId(callerChatId) || String(callerChatId)) : String(callerChatId));
+        if (String(callerRoot) !== String(paneChatId)) {
+            return { success: false, code: 'SPLIT_PANE_OTHER_CHAT', error: SPLIT_PANE_MISMATCH + ': the split pane on screen belongs to another chat (' + paneChatId + '), not this chat family (' + callerRoot + '). Switch the view to this chat, or use target "widget" with widget_id.' };
+        }
+    }
+    var shownWidgetId = (pane.dataset && pane.dataset.widgetId) || (frame.dataset && frame.dataset.savedWidgetId) || null;
+    if (args.widget_id && String(args.widget_id) !== String(shownWidgetId)) {
+        return { success: false, code: 'SPLIT_PANE_OTHER_WIDGET', error: SPLIT_PANE_MISMATCH + ': the split pane shows widget ' + (shownWidgetId || '(unknown)') + ', not ' + args.widget_id + '. Open it with split_view action=replace, or use target "widget".', widget_id: shownWidgetId };
+    }
+    if (document.visibilityState === 'hidden') {
+        return { success: false, error: SPLIT_PANE_NOT_VISIBLE + ': the AppAgent page is not in front (hidden/background tab). Bring it to the front and retry.' };
+    }
+    var sidePanelMsg = SPLIT_PANE_NOT_VISIBLE + ': the chat runs in the Chrome side panel, which has no tab of its own, so its pixels cannot be captured (captureVisibleTab would shoot the website beside it). Open AppAgent in a full tab to capture the pane, or use target "widget".';
+    if (document.body && document.body.classList && document.body.classList.contains('sidepanel-mode')) {
+        return { success: false, error: sidePanelMsg };
+    }
+    if (typeof chrome === 'undefined' || !chrome.tabs || !chrome.tabs.captureVisibleTab || !chrome.tabs.getCurrent) {
+        return { success: false, error: 'split_widget capture unavailable: chrome.tabs.captureVisibleTab is not available in this context.' };
+    }
+    var tab = null;
+    try { tab = await chrome.tabs.getCurrent(); } catch (e) { tab = null; }
+    if (!tab) return { success: false, error: sidePanelMsg };
+    if (tab.active === false) {
+        return { success: false, error: SPLIT_PANE_NOT_VISIBLE + ': the AppAgent tab is not the active tab of its window. Focus it and retry.' };
+    }
+    var includeHeader = !!args.include_header;
+    var r = (includeHeader ? pane : frame).getBoundingClientRect();
+    var left = r.left, top = r.top, right = r.right, bottom = r.bottom;
+    if (!includeHeader) {
+        // The iframe sits in .split-widget-content (overflow:auto) below the
+        // header, progress card and pill. Clip to that scroll container, not the
+        // whole pane: a scrolled/overflowing iframe would otherwise pull the
+        // header pixels into the widget-only crop.
+        var clipEl = (typeof pane.querySelector === 'function' && pane.querySelector('.split-widget-content')) || pane;
+        var pr = clipEl.getBoundingClientRect();
+        left = Math.max(left, pr.left); top = Math.max(top, pr.top);
+        right = Math.min(right, pr.right); bottom = Math.min(bottom, pr.bottom);
+    }
+    var vw = window.innerWidth, vh = window.innerHeight;
+    left = Math.max(0, left); top = Math.max(0, top);
+    right = Math.min(vw, right); bottom = Math.min(vh, bottom);
+    if (!(right - left >= 1 && bottom - top >= 1)) {
+        return { success: false, error: SPLIT_PANE_NOT_VISIBLE + ': the pane has no visible area on screen.' };
+    }
+    var dataUrl;
+    try {
+        dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
+    } catch (e) {
+        return { success: false, error: 'split_widget capture failed: ' + (e && e.message || e) };
+    }
+    if (!dataUrl) return { success: false, error: 'split_widget capture failed: empty capture' + (chrome.runtime && chrome.runtime.lastError ? ' (' + chrome.runtime.lastError.message + ')' : '') };
+    var full = await createImageBitmap(_b64DataUrlToBlob(dataUrl));
+    // Image px per CSS px: derived from the capture (covers DPR and zoom);
+    // devicePixelRatio is the fallback.
+    var k = (full.width && vw) ? full.width / vw : (window.devicePixelRatio || 1);
+    var sx = Math.round(left * k), sy = Math.round(top * k);
+    var sw = Math.max(1, Math.min(full.width - sx, Math.round((right - left) * k)));
+    var sh = Math.max(1, Math.min(full.height - sy, Math.round((bottom - top) * k)));
+    var canvas = (typeof OffscreenCanvas !== 'undefined') ? new OffscreenCanvas(sw, sh) : document.createElement('canvas');
+    canvas.width = sw; canvas.height = sh;
+    canvas.getContext('2d').drawImage(full, sx, sy, sw, sh, 0, 0, sw, sh);
+    try { full.close(); } catch (e) {}
+    var outW = sw, outH = sh, base64;
+    var scale = fitScreenshotScale(sw, sh, maxWidth);
+    if (scale < 1) {
+        var ds = await downscaleImageHighQuality(canvas, scale);
+        base64 = ds.base64; outW = ds.width; outH = ds.height;
+    } else if (canvas.convertToBlob) {
+        base64 = await _blobToBase64DataUrl(await canvas.convertToBlob({ type: 'image/png' }));
+    } else {
+        base64 = canvas.toDataURL('image/png');
+    }
+    if (args.grid) {
+        // Labels in CSS px relative to the crop origin (= widget iframe
+        // coordinates when include_header is false).
+        base64 = await overlayGrid(base64, Math.round(right - left), Math.round(bottom - top));
+    }
+    base64 = await compressBase64Image(base64);
+    var widgetId = (pane.dataset && pane.dataset.widgetId) || (frame.dataset && frame.dataset.savedWidgetId) || null;
+    var id = newFileId();
+    var desc = 'split pane ' + (includeHeader ? '(with header) ' : '') + 'widget ' + (widgetId || '');
+    return {
+        success: true,
+        screenshot_id: id,
+        widget_id: widgetId,
+        message: 'Screenshot captured in place: ' + desc,
+        dimensions: outW + 'x' + outH,
+        crop: { x: Math.round(left), y: Math.round(top), width: Math.round(right - left), height: Math.round(bottom - top), pixel_ratio: k, include_header: includeHeader },
+        size_bytes: Math.round(base64.length * 0.75),
+        note: 'The screenshot image is now attached to this conversation. Use screenshot_id "' + id + '" with screenshot_by_id tool to retrieve the image data.',
+        _screenshotMessage: {
+            role: 'screenshot', base64: base64, name: args.name || null, description: desc,
+            timestamp: Date.now(), width: outW, height: outH, screenshot_id: id, file_id: id
+        }
+    };
+}
+
 // target 'browser' and 'element' REQUIRE an explicit args.tab_id (no active-tab or
 // chat-stored fallback). The extension's own tab is a valid target.
 async function executeTakeScreenshot(args, options) {
@@ -147,7 +267,14 @@ async function executeTakeScreenshot(args, options) {
     var maxWidth = args.max_width || 1568;
 
     if (!target) {
-        return { success: false, error: 'target is required. Use "browser", "widget", or "element"' };
+        return { success: false, error: 'target is required. Use "browser", "widget", "split_widget", or "element"' };
+    }
+    // split_widget: capture the pixels of the split pane ALREADY ON SCREEN
+    // (captureVisibleTab of this page + crop to the pane rect). It must never
+    // reuse the widget branch below (temp tab / offscreen re-render), which lost
+    // the pane's width, scroll, typed input, pill and progress card.
+    if (target === 'split_widget') {
+        return await _ssCaptureSplitPaneInPlace(args, maxWidth, (options && options.chatId) || _ssChatId);
     }
 
     var _ssTabId = null;

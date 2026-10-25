@@ -34,25 +34,28 @@ var currentDiffFile = null;
 var _diffViewSeq = 0; // A3B3-01: bumped by every updateDiffView call and by closeDiffViewer
 
 // Open fullscreen diff viewer
-async function openDiffViewer(table, sysId, displayName) {
-    var versions = getVersionsForFile(table, sysId);
+// `instanceUrl` = the entry's instance (omitted/'' = active instance). Every
+// lookup, fetch and action below is scoped to it (core/150-record-helpers.js).
+async function openDiffViewer(table, sysId, displayName, instanceUrl) {
+    instanceUrl = recordInstanceKey(instanceUrl) || undefined;
+    var versions = getVersionsForFile(table, sysId, instanceUrl);
 
     // Source-aware: the record may have been created by one of this chat's
     // sub-agents (rolled up into the sidebar) — check the active chat AND its
     // sub-agent chats (getVersionHistorySources, 090-version-history.js).
     var isNew = getVersionHistorySources().some(function(src) {
         return src.entries.some(function(v) {
-            return v.chatId === src.chatId && v.table === table && v.sysId === sysId &&
+            return v.chatId === src.chatId && isSameRecordEntry(v, table, sysId, instanceUrl) &&
                    v.action === 'POST' && !v.invalidated;
         });
     });
-    var firstBeforeVersion = getFirstVersionForRecord(table, sysId);
-    var latestAfterVersion = getLatestAfterVersion(table, sysId);
+    var firstBeforeVersion = getFirstVersionForRecord(table, sysId, instanceUrl);
+    var latestAfterVersion = getLatestAfterVersion(table, sysId, instanceUrl);
 
     // Determine if we have versions to compare (excluding the current/latest version)
     var hasComparableVersions = versions.length > 1 || (versions.length === 1 && versions[0].versionId !== latestAfterVersion);
 
-    currentDiffFile = { table: table, sysId: sysId, displayName: displayName, versions: versions, isNew: isNew, firstBeforeVersion: firstBeforeVersion, latestAfterVersion: latestAfterVersion, hasComparableVersions: hasComparableVersions };
+    currentDiffFile = { table: table, sysId: sysId, displayName: displayName, instanceUrl: instanceUrl, versions: versions, isNew: isNew, firstBeforeVersion: firstBeforeVersion, latestAfterVersion: latestAfterVersion, hasComparableVersions: hasComparableVersions };
 
     // Create overlay
     var overlay = document.createElement('div');
@@ -99,7 +102,8 @@ async function openDiffViewer(table, sysId, displayName) {
     }
 
     // Open on instance URL
-    var instanceUrl = (Platform.instanceUrl || '') + '/' + table + '.do?sys_id=' + sysId;
+    // The entry's own instance origin, not the active one.
+    var openRecordUrl = (instanceUrl || Platform.instanceUrl || '') + '/' + table + '.do?sys_id=' + sysId;
 
     header.innerHTML = '<div class="diff-header-left">' +
         '<span class="diff-file-name">' + escapeHtml(displayName) + '</span>' +
@@ -107,8 +111,8 @@ async function openDiffViewer(table, sysId, displayName) {
         '</div>' +
         '<div class="diff-header-center" id="diff-header-stats"></div>' +
         '<div class="diff-header-right">' +
-        '<a class="diff-action-btn" href="' + instanceUrl + '" target="_blank" title="' + escapeHtml(t('Open on instance')) + '">' + UI_ICONS.externalLink + '<span>' + escapeHtml(t('Open')) + '</span></a>' +
-        (table === 'sys_ui_page' ? '<button class="diff-action-btn" onclick="screenshotUIPage(\'' + escapeJsString(displayName) + '\')" title="' + escapeHtml(t('Screenshot')) + '">' + UI_ICONS.camera + '<span>' + escapeHtml(t('Screenshot')) + '</span></button>' : '') +
+        '<a class="diff-action-btn" href="' + escapeHtml(openRecordUrl) + '" target="_blank" title="' + escapeHtml(t('Open on instance')) + '">' + UI_ICONS.externalLink + '<span>' + escapeHtml(t('Open')) + '</span></a>' +
+        (table === 'sys_ui_page' ? '<button class="diff-action-btn" onclick="screenshotUIPage(\'' + escapeJsString(displayName) + '\', \'' + escapeJsString(instanceUrl || '') + '\')" title="' + escapeHtml(t('Screenshot')) + '">' + UI_ICONS.camera + '<span>' + escapeHtml(t('Screenshot')) + '</span></button>' : '') +
         '<button class="diff-action-btn" onclick="downloadFromDiffViewer()" title="' + escapeHtml(t('Download XML')) + '">' + UI_ICONS.download + '<span>' + escapeHtml(t('Download')) + '</span></button>' +
         revertBtnHtml +
         '<button class="diff-close-btn" onclick="closeDiffViewer()" title="' + escapeHtml(t('Close')) + '">' + UI_ICONS.close + '</button>' +
@@ -134,7 +138,7 @@ async function openDiffViewer(table, sysId, displayName) {
     if (hasComparableVersions) {
         var chatVersionIds = versions.map(function(v) { return v.versionId; });
         var openedFile = currentDiffFile; // RC7B1B-F1
-        var historicalVersions = await getHistoricalVersions(table, sysId, chatVersionIds);
+        var historicalVersions = await getHistoricalVersions(table, sysId, chatVersionIds, instanceUrl);
         if (currentDiffFile !== openedFile || !content.isConnected) return; // closed or reopened mid-fetch
 
         // Combine and sort all versions
@@ -198,7 +202,7 @@ async function updateDiffView() {
     content.innerHTML = '<div class="diff-loading"><div class="spinner"></div>' + escapeHtml(t('Loading...')) + '</div>';
     if (headerStats) headerStats.innerHTML = '';
 
-    var latestAfterVersion = getLatestAfterVersion(currentDiffFile.table, currentDiffFile.sysId);
+    var latestAfterVersion = getLatestAfterVersion(currentDiffFile.table, currentDiffFile.sysId, currentDiffFile.instanceUrl);
     var isPreviewOnly = !currentDiffFile.hasComparableVersions;
 
     // Get compare version from dropdown if available
@@ -213,7 +217,7 @@ async function updateDiffView() {
         try {
             // Shared helper (ui/090-version-history.js): chat version → live
             // version → <table>.do?XML export fallback for data tables.
-            var xml = await getLatestRecordXml(currentDiffFile.table, currentDiffFile.sysId);
+            var xml = await getLatestRecordXml(file.table, file.sysId, file.instanceUrl);
             if (stale()) return;
             if (!xml) {
                 content.innerHTML = '<div class="diff-error">' + escapeHtml(t('Could not load record data.')) + '</div>';
@@ -249,8 +253,14 @@ async function updateDiffView() {
     }
 
     try {
-        var oldXml = await getVersionXml(compareVersionId);
-        var newXml = latestAfterVersion ? await getVersionXml(latestAfterVersion) : oldXml;
+        var tgt = await resolveRecordTarget(file.instanceUrl);
+        if (stale()) return;
+        if (!tgt) {
+            content.innerHTML = '<div class="diff-error">' + escapeHtml(recordTargetRefusalMessage(file.instanceUrl)) + '</div>';
+            return;
+        }
+        var oldXml = await getVersionXml(compareVersionId, tgt);
+        var newXml = latestAfterVersion ? await getVersionXml(latestAfterVersion, tgt) : oldXml;
         if (stale()) return;
 
         if (!oldXml) {
@@ -394,7 +404,12 @@ async function downloadFromDiffViewer() {
         // getLatestRecordXml falls back to the <table>.do?XML export for data
         // tables (no sys_update_version rows) — the old getLatestAfterVersion
         // early-return made Download dead-end with "No version to download".
-        var xml = await getLatestRecordXml(file.table, file.sysId);
+        if (recordInstanceKey(file.instanceUrl) && !(await resolveRecordTarget(file.instanceUrl))) {
+            hideSpinner();
+            refuseRecordTarget(file.instanceUrl);
+            return;
+        }
+        var xml = await getLatestRecordXml(file.table, file.sysId, file.instanceUrl);
         if (!xml) {
             hideSpinner();
             showSnackbar(t('No version to download'), 'warning');
@@ -422,39 +437,44 @@ async function downloadFromDiffViewer() {
 // Revert from diff viewer
 async function revertFromDiffViewer() {
     if (!currentDiffFile) return;
+    var file = currentDiffFile;
+    var inst = file.instanceUrl;
 
-    if (currentDiffFile.isNew) {
+    if (file.isNew) {
         // Delete new record
         if (!await showConfirmModal(t('Delete Record'), t('Delete "{name}"? This will permanently delete this newly created record.', { name: escapeHtml(currentDiffFile.displayName) }), 'danger')) return;
 
         showSpinner(t('Deleting...'));
         try {
-            var recordScope = await getRecordScope(currentDiffFile.table, currentDiffFile.sysId);
-            var deleteUrl = '/api/now/table/' + currentDiffFile.table + '/' + currentDiffFile.sysId;
+            var tgt = await resolveRecordTarget(inst);
+            if (!tgt) { hideSpinner(); refuseRecordTarget(inst); return; }
+            var recordScope = await getRecordScope(file.table, file.sysId, tgt.active ? null : tgt);
+            var deleteUrl = '/api/now/table/' + file.table + '/' + file.sysId;
             if (recordScope) {
                 deleteUrl += '?sysparm_record_scope=' + encodeURIComponent(recordScope);
             }
 
-            var res = await fetch(deleteUrl, {
+            var res = await recordFetch(tgt, deleteUrl, {
                 method: 'DELETE',
-                headers: { 'X-UserToken': window.sessionToken, 'Accept': 'application/json' }
+                headers: { 'Accept': 'application/json' }
             });
 
             if (res.ok || res.status === 204) {
                 // Mark all changes as invalidated — across the active chat
                 // AND its sub-agent chats (the record may be sub-owned).
-                setRecordEntriesInvalidated(currentDiffFile.table, currentDiffFile.sysId, true);
+                setRecordEntriesInvalidated(file.table, file.sysId, true, inst);
                 addVersionHistoryEntry({
                     id: 'vh_' + Date.now(),
                     chatId: currentChatId,
                     timestamp: Date.now(),
-                    table: currentDiffFile.table,
-                    sysId: currentDiffFile.sysId,
-                    displayName: currentDiffFile.displayName,
+                    table: file.table,
+                    sysId: file.sysId,
+                    instanceUrl: inst,
+                    displayName: file.displayName,
                     action: 'USER_DELETE',
                     messageIndex: -1
                 });
-                showSnackbar(t('Deleted "{name}"', { name: currentDiffFile.displayName }), 'success');
+                showSnackbar(t('Deleted "{name}"', { name: file.displayName }), 'success');
                 closeDiffViewer();
             } else {
                 showSnackbar(t('Delete failed'), 'error');
@@ -463,31 +483,34 @@ async function revertFromDiffViewer() {
             showSnackbar(t('Delete failed: {error}', { error: e.message }), 'error');
         }
         hideSpinner();
-    } else if (currentDiffFile.firstBeforeVersion) {
+    } else if (file.firstBeforeVersion) {
         // Revert to before chat
         if (!await showConfirmModal(t('Revert Changes'), t('Revert "{name}" to its state before this chat? You can redo this later.', { name: escapeHtml(currentDiffFile.displayName) }))) return;
 
         showSpinner(t('Reverting...'));
         try {
-            var xml = await getVersionXml(currentDiffFile.firstBeforeVersion);
+            var rtgt = await resolveRecordTarget(inst);
+            if (!rtgt) { hideSpinner(); refuseRecordTarget(inst); return; }
+            var xml = await getVersionXml(file.firstBeforeVersion, rtgt);
             if (xml) {
-                var result = await uploadXml(xml, currentDiffFile.table, currentDiffFile.sysId);
+                var result = await uploadXml(xml, file.table, file.sysId, rtgt);
                 if (result.success) {
                     // Mark all changes as invalidated — across the active chat
                     // AND its sub-agent chats (the record may be sub-owned).
-                    setRecordEntriesInvalidated(currentDiffFile.table, currentDiffFile.sysId, true);
+                    setRecordEntriesInvalidated(file.table, file.sysId, true, inst);
                     addVersionHistoryEntry({
                         id: 'vh_' + Date.now(),
                         chatId: currentChatId,
                         timestamp: Date.now(),
-                        table: currentDiffFile.table,
-                        sysId: currentDiffFile.sysId,
-                        displayName: currentDiffFile.displayName,
+                        table: file.table,
+                        sysId: file.sysId,
+                        instanceUrl: inst,
+                        displayName: file.displayName,
                         action: 'REVERT',
                         messageIndex: -1,
-                        afterVersion: currentDiffFile.firstBeforeVersion
+                        afterVersion: file.firstBeforeVersion
                     });
-                    showSnackbar(t('Reverted "{name}"', { name: currentDiffFile.displayName }), 'success');
+                    showSnackbar(t('Reverted "{name}"', { name: file.displayName }), 'success');
                     closeDiffViewer();
                 } else {
                     showSnackbar(t('Revert failed: {error}', { error: result.error }), 'error');

@@ -102,7 +102,7 @@ AppAgent är ett Chrome-tillägg med en inbyggd agentloop. Du beskriver vad du v
 ## Installation
 
 1. **Installera** – Installera AppAgent-tillägget från Chrome Web Store (eller läs in det okomprimerat för utveckling)
-2. **Skaffa en API-nyckel** – Registrera dig på [OpenRouter](https://openrouter.ai), använd Anthropic/OpenAI direkt eller anslut ditt Claude Code-abonnemang (Enterprise eller Personal)
+2. **Skaffa en API-nyckel** – Registrera dig på [OpenRouter](https://openrouter.ai) eller [Hugging Face](https://huggingface.co/docs/inference-providers), använd Anthropic/OpenAI direkt eller anslut ditt Claude Code-abonnemang (Enterprise eller Personal)
 3. **Konfigurera** – Öppna tillägget och lägg till din API-nyckel (eller logga in med Claude) under Inställningar → API-leverantörer
 4. **Börja bygga** – Öppna din ServiceNow-instans i en flik (den identifieras automatiskt) och börja chatta
 

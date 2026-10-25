@@ -148,8 +148,8 @@ var TOOLS = [
                     operation_id: { type: 'string', description: 'Stable retry key for edit_html; reuse only with identical edits and expected_version.' },
                     widget_id: { type: 'string', description: 'Target an html_widget by ID. Required for open_widget and edit_html; optional for get_visible_text, get_dom, click, fill (targets the widget instead of the browser).' },
                     user: { type: 'string', description: 'For impersonate: username, display name, or sys_id; "stop" ends impersonation.' },
-                    instance: { type: 'string', description: 'REQUIRED. Target ServiceNow instance by short name (relative navigate URLs resolve against it). The TAB is chosen only by tab_id. See list_instances.' },
-                    tab_id: { type: ['integer', 'string'], description: 'REQUIRED for every browser action (all actions except widget actions with widget_id, and close); there is NO fallback to the active tab or any remembered tab. A Chrome tab id number from list_instances (instances[].activeTabs[].id, or selfTabId / extensionTabs[].id for the agent\'s own tab), or the tab_id returned by a previous browser action / take_screenshot. navigate only: "new" opens a new background tab (its id is returned as tab_id; reuse it). The agent\'s own tab can be read/screenshotted but NOT navigated. A closed/unknown id is an error.' },
+                    instance: { type: 'string', description: 'Optional. ServiceNow instance (short name from list_instances, hostname or URL) used ONLY as the base for RELATIVE navigate urls (e.g. "/incident_list.do"). Omit it for absolute urls and non-ServiceNow websites; an unknown value is ignored with a warning. The TAB is chosen only by tab_id.' },
+                    tab_id: { type: ['integer', 'string'], description: 'REQUIRED for every browser action (all actions except widget actions with widget_id, and close); there is NO fallback to the active tab or any remembered tab. A Chrome tab id number from list_instances — ANY website tab works, not just ServiceNow: instances[].activeTabs[].id (ServiceNow tabs), otherTabs[].id (every other open website tab), or selfTabId / extensionTabs[].id for the agent\'s own tab, or the tab_id returned by a previous browser action / take_screenshot. navigate only: "new" opens a new background tab (its id is returned as tab_id; reuse it). The agent\'s own tab can be read/screenshotted but NOT navigated. Browser-internal pages (chrome://, other extensions, Chrome Web Store; otherTabs[].restricted) cannot be read/clicked/captured — only navigated away from or closed. A closed/unknown id is an error.' },
                     edits: {
                         type: 'array',
                         description: 'For edit_html: find/replace operations on the widget HTML.',
@@ -167,7 +167,7 @@ var TOOLS = [
                     confirm: { type: 'boolean', description: 'Set true to have the user approve before execution (destructive, bulk, or significant changes). Omit for reads and routine operations. Instance-modifying actions: click, fill, impersonate, dispatch_event, select_option.' },
                     status_message: { type: 'string', description: 'Short human-friendly description of this call, shown in the UI header.' }
                 },
-                required: ['action', 'instance']
+                required: ['action']
             }
         }
     },
@@ -390,18 +390,19 @@ var TOOLS = [
         type: 'function',
         function: {
             name: 'html_widget',
-            description: 'Render an interactive HTML widget inline in chat, in an isolated iframe (own document; scripts, CSS and DOM fully isolated — handlers, forms, animations, API calls all work). Use ONLY when the user asked for a visualization/dashboard/interactive UI or the data is too large/structured for plain text; for short answers reply in text, and prefer display when a template fits.\n\nOne permanent widget per task:\n- Each save creates a DISTINCT widget or appends a version to an EXISTING widget_id. When iterating/fixing/regenerating, ALWAYS reuse widget_id; NEVER create a second widget for the same task.\n- Edit flow: action=read (latest_version + HTML), then save with expected_version and a stable operation_id (reuse it only to retry identical content).\n- Omitted widget_id uses the explicit widget-edit target of the current user request only; later ordinary user turns do not inherit it. create_new=true deliberately creates an unrelated artifact.\n- action=list finds all saved widgets, even after unpin or chat deletion. Selecting history is per-view and never overwrites latest.\n\nInside the widget:\n- No session token (no window.sessionToken, no X-UserToken shim): ServiceNow requests MUST go through agent tools via await executeTool(name, args), e.g. executeTool("servicenow_api", {method:"GET", table:"incident", limit:5}).\n- Embed an earlier screenshot: executeTool("screenshot_by_id", {id: screenshotId}).then(function(r){ img.src = r.base64; }).\n- "Ask the agent" button: await executeTool("start_chat", {message: "...", mode: "send"|"draft", include_widget: true}) — include_widget references THIS widget, "draft" only prefills the composer, background:true keeps the widget on screen.\n- App design tokens (colors, spacing, radii, fonts) are auto-injected and follow the light/dark theme live: var(--bg-main), var(--text-primary), var(--primary), var(--space-8), var(--radius-md); full table in the widget-best-practices skill.\n\nReturns a widgetId, usable for debugging with iframe_tool (get_visible_text, get_dom, click, fill) or take_screenshot when those are available.',
+            description: 'Render an interactive HTML widget inline in chat, in an isolated iframe (own document; scripts, CSS and DOM fully isolated — handlers, forms, animations, API calls all work). Use ONLY when the user asked for a visualization/dashboard/interactive UI or the data is too large/structured for plain text; for short answers reply in text, and prefer display when a template fits.\n\nOne permanent widget per task:\n- Each save creates a DISTINCT widget or appends a version to an EXISTING widget_id. When iterating/fixing/regenerating, ALWAYS reuse widget_id; NEVER create a second widget for the same task.\n- Edit flow: action=read (latest_version + HTML), then save with expected_version and a stable operation_id (reuse it only to retry identical content).\n- Omitted widget_id uses the explicit widget-edit target of the current user request only; later ordinary user turns do not inherit it. create_new=true deliberately creates an unrelated artifact.\n- action=list finds all saved widgets, even after unpin or chat deletion. Selecting history is per-view and never overwrites latest.\n\nInside the widget:\n- No session token (no window.sessionToken, no X-UserToken shim): ServiceNow requests MUST go through agent tools via await executeTool(name, args), e.g. executeTool("servicenow_api", {method:"GET", table:"incident", limit:5}).\n- Embed an earlier screenshot: executeTool("screenshot_by_id", {id: screenshotId}).then(function(r){ img.src = r.base64; }).\n- Show a stored file / image by file_id: executeTool("get_file", {id: fileId}).then(function(r){ img.src = r.data; }) (full data URL), or {id: fileId, thumbnail: {max: 256}} then img.src = r.thumbnail.data_url for galleries.\n- "Ask the agent" button: await executeTool("start_chat", {message: "...", mode: "send"|"draft", include_widget: true}) — include_widget references THIS widget, "draft" only prefills the composer, background:true keeps the widget on screen.\n- App design tokens (colors, spacing, radii, fonts) are auto-injected and follow the light/dark theme live: var(--bg-main), var(--text-primary), var(--primary), var(--space-8), var(--radius-md); full table in the widget-best-practices skill.\n\nWorkshop (split view): a NEW widget auto-opens in the split pane unless another widget is already shown there. Screenshots cannot be shown in the pane, so show visual progress by building/updating a widget (embed screenshots via screenshot_by_id when needed). Ship a quick skeleton first, then refine: add data-slot placeholders for upcoming steps and fill them with action=patch + slots. Keep the pane progress card current with split_view progress. Keep widgets light and standalone-exportable; use executeTool only when live data is needed. Sub-agents may patch the same widget: on VERSION_CONFLICT the result carries latest_version, html and slots — rebase and retry with the new expected_version.\n\nReturns a widgetId, usable for debugging with iframe_tool (get_visible_text, get_dom, click, fill) or take_screenshot when those are available.',
             parameters: {
                 type: 'object',
                 properties: {
-                    action: { type: 'string', enum: ['save', 'read', 'list'], description: 'Default save. read returns HTML and version history; list discovers saved widgets.' },
+                    action: { type: 'string', enum: ['save', 'read', 'list', 'export', 'patch'], description: 'Default save. read returns HTML and version history; list discovers saved widgets. patch (widget_id + expected_version + slots or html) commits a new version from the stored HTML: slots:{name: html} replaces the innerHTML of every [data-slot="name"] element; the split pane applies it IN PLACE, keeping the user\'s scroll/inputs (mark updatable regions with data-slot and user-owned state with data-keep-state). Nested slots: the OUTER slot wins whatever the key order — a named slot inside another named slot is replaced by the outer content, skipped, and listed in the result\'s overridden_slots. export (widget_id, optional version) builds a self-contained offline .html (images/CSS/scripts embedded as data URLs, get_file/screenshot_by_id calls pre-resolved) and returns {file_id, file_name, size_bytes, images_embedded, source, warnings}; use the file_id with get_file {download:true} or local_folder write.' },
                     widget_id: { type: 'string', description: 'EXISTING permanent ID to revise/read. Reuse it for every iteration.' },
                     expected_version: { type: 'integer', description: 'Required for updates: the version read before editing. A stale version returns VERSION_CONFLICT without writing.' },
                     operation_id: { type: 'string', description: 'Stable unique operation key; reuse only for an identical retry. Required for reliable sandbox/js_eval retries.' },
                     create_new: { type: 'boolean', description: 'Explicitly create a distinct artifact instead of using the widget edit target. Never use for iteration.' },
-                    version: { type: 'integer', description: 'Read a historical version; omitted = latest.' },
+                    version: { type: 'integer', description: 'Read (or export) a historical version; omitted = latest.' },
                     title: { type: 'string', description: 'Widget title (shown in header and sidebar).' },
                     html: { type: 'string', description: 'Complete HTML document: <style> for CSS, <script> for JS. Scripts call agent tools via executeTool(name, args), e.g. await executeTool("servicenow_api", {method:"GET", table:"incident", ...}).' },
+                    slots: { type: 'object', additionalProperties: { type: 'string' }, description: 'For action=patch: {slotName: innerHTML} for elements marked data-slot="slotName". Unknown names fail with SLOT_NOT_FOUND (lists available_slots) without writing. A slot nested inside another slot in the same patch is ignored (outer wins) and reported in overridden_slots.' },
                     height: { type: 'string', description: 'Initial height, e.g. "400px", "auto". Default: "400px".' },
                     width: { type: 'string', description: 'Width, e.g. "400px", "500px". Default: "400px".' },
                     pin: { type: 'string', enum: ['main', 'home'], description: 'Optionally pin at creation: "home" (home page, above Active chats) or "main" (dashboard page). Omit to keep it inline in chat only.' },
@@ -431,20 +432,42 @@ var TOOLS = [
     {
         type: 'function',
         function: {
+            name: 'split_view',
+            description: 'Split the chat screen and show ONE existing html_widget in a pane beside the chat, for INTERACTIVE EDITING of that widget with the user. The user can close the pane (×). While a widget is shown, every widget edit applies to it (reuse its widget_id; html_widget read, then save with expected_version) unless the user clearly asks for a completely different widget — then, if that work is interactive, use action "replace" to pin the new widget. Actions: open (show widget_id), replace (swap in another widget_id), close, status (what is shown, held update, progress), progress (show a compact progress card {state,label,tasks,output} in the pane header while you work on the widget). New html_widget widgets open here automatically when the pane is free. status reports shown/closed (closed_by_user) and is shared by the whole chat family, so sub-agents see and update the same pane. Screenshots cannot be shown in the pane: build/patch the widget to show progress; take_screenshot target:"split_widget" captures just the live widget.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    action: { type: 'string', enum: ['open', 'replace', 'close', 'status', 'progress'], description: 'open = show widget_id in the split pane; replace = swap the shown widget for widget_id; close = close the pane; status = report what is shown; progress = set/replace the pane progress card (clear:true removes it).' },
+                    widget_id: { type: 'string', description: 'Widget id returned by html_widget (required for open/replace).' },
+                    state: { type: 'string', enum: ['running', 'waiting', 'stuck', 'done', 'error'], description: 'For progress: card state (default running).' },
+                    label: { type: 'string', description: 'For progress: short card label (<= 120 chars).' },
+                    tasks: { type: 'array', items: { type: 'object', properties: { label: { type: 'string' }, status: { type: 'string', enum: ['pending', 'running', 'done', 'error'] } }, required: ['label'] }, description: 'For progress: FULL task list (replaces the previous one).' },
+                    output: { type: 'string', description: 'For progress: optional short result text (e.g. on done).' },
+                    clear: { type: 'boolean', description: 'For progress: remove the card.' },
+                    status_message: { type: 'string', description: 'Short human-friendly description of this call, shown in the UI header.' }
+                },
+                required: ['action']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
             name: 'take_screenshot',
-            description: 'Capture a real PNG screenshot and send it to the vision model, to SEE what is actually rendered — UI elements, layouts, colors, charts, errors. Best for debugging visual issues, verifying UI changes, and analyzing widgets or page layouts. target browser/element REQUIRE an explicit tab_id (no active-tab fallback). Returns a screenshot_id for later retrieval with screenshot_by_id (e.g. to embed in a widget or process in js_eval).',
+            description: 'Capture a real PNG screenshot and send it to the vision model, to SEE what is actually rendered — UI elements, layouts, colors, charts, errors. Best for debugging visual issues, verifying UI changes, and analyzing widgets or page layouts. target browser/element REQUIRE an explicit tab_id (no active-tab fallback). Returns a screenshot_id for later retrieval with screenshot_by_id (e.g. to embed in a widget or process in js_eval). Screenshots are NOT shown in the split pane: to show visual progress there, update a widget and embed the image via screenshot_by_id. target "split_widget" captures the split pane IN PLACE (the on-screen pixels cropped to the pane; no new tab, no re-render); it needs AppAgent in a full, front tab — from the Chrome side panel it returns "split pane not visible" (a side panel cannot be captured).',
             parameters: {
                 type: 'object',
                 properties: {
                     target: {
                         type: 'string',
-                        enum: ['browser', 'widget', 'element'],
-                        description: '"browser" (iframe panel content), "widget" (an html_widget by ID), or "element" (a DOM element by selector).'
+                        enum: ['browser', 'widget', 'element', 'split_widget'],
+                        description: '"browser" (iframe panel content), "widget" (an html_widget by ID), "split_widget" (the split pane exactly as shown on screen, with the user\'s current state; no widget_id needed; full-tab AppAgent only, not the side panel), or "element" (a DOM element by selector).'
                     },
                     widget_id: { type: 'string', description: 'For target="widget": the widget ID.' },
-                    tab_id: { type: 'integer', description: 'REQUIRED for target="browser" and target="element": the Chrome tab to capture (list_instances instances[].activeTabs[].id, selfTabId for the agent\'s own tab, or the tab_id returned by a previous iframe_tool call). No fallback to the active tab. The result carries tab_id. Not used for target="widget".' },
+                    tab_id: { type: 'integer', description: 'REQUIRED for target="browser" and target="element": the Chrome tab to capture — any website tab, not only ServiceNow (list_instances instances[].activeTabs[].id for ServiceNow tabs, otherTabs[].id for any other website tab, selfTabId for the agent\'s own tab, or the tab_id returned by a previous iframe_tool call). Browser-internal pages (chrome://, Chrome Web Store, other extensions) cannot be captured. No fallback to the active tab. The result carries tab_id. Not used for target="widget".' },
                     selector: { type: 'string', description: 'For target="element": CSS selector of the element.' },
                     max_width: { type: 'number', description: 'Max width in px, for token efficiency. Default 1568 (Anthropic vision long-edge limit). Captured at native device resolution and downscaled with high-quality resampling so text stays sharp; height may reach 2x this value; width is never scaled below 1024px.' },
+                    include_header: { type: 'boolean', description: 'For target="split_widget": also include the pane header, progress card and "New update" pill. Default false (widget area only).' },
                     grid: { type: 'boolean', description: 'If true, overlays a labeled coordinate grid — to find x,y for click/fill when CSS selectors are hard to determine. Default: false.' },
                     name: { type: 'string', description: 'Short name, max 3-4 words (e.g. "Users list", "Form error", "Dashboard"); used for display and download.' },
                     status_message: { type: 'string', description: 'Short human-friendly description of this call, shown in the UI header.' }
@@ -472,13 +495,14 @@ var TOOLS = [
         type: 'function',
         function: {
             name: 'get_file',
-            description: 'Retrieve any file by its file_id — screenshots, user attachments (images, PDFs, text), fetched files, smart documents. Returns content, metadata and a download URL. To view/analyze an image or PDF yourself, use attach=true, not download.',
+            description: 'Retrieve any file by its file_id — screenshots, user attachments (images, PDFs, text), fetched files, smart documents. Returns content, metadata and a download URL. To view/analyze an image or PDF yourself, use attach=true, not download. Binary files come back as `data` = a full data URL (data:<mime>;base64,…) — from js_eval or an html_widget, executeTool("get_file",{id}) is THE way to turn a file_id (e.g. from a local_folder read with data_url_omitted) into an <img> src. thumbnail:{max:512} returns a small JPEG thumbnail {data_url,width,height} INSTEAD of data (data_omitted:true).',
             parameters: {
                 type: 'object',
                 properties: {
                     id: { type: 'string', description: 'The file_id (from take_screenshot, read_attached_file, web_fetch with save_file, document, etc.).' },
                     download: { type: 'boolean', description: 'Return only metadata and a download button for the user; you do not see the file.' },
                     attach: { type: 'boolean', description: 'Attach the file to the conversation so you can see/analyze it (images and PDFs).' },
+                    thumbnail: { description: 'Images: true, a number, or {max: px} → return thumbnail {data_url (JPEG), width, height} (long edge <= max, default 512) instead of the full data.' },
                     status_message: { type: 'string', description: 'Short human-friendly description of this call, shown in the UI header.' }
                 },
                 required: ['id']
@@ -605,7 +629,7 @@ var TOOLS = [
         type: 'function',
         function: {
             name: 'web_fetch',
-            description: 'Fetch any URL; returns the raw response body (JSON APIs: JSON.parse(result.body)). HTML responses also include page_title, meta_description and extracted_text (script/style-stripped visible text) — read those instead of slicing raw HTML. For HTML pages, do NOT call this tool directly; fetch AND parse in one js_eval step so raw HTML never enters context:\nvar res = await executeTool("web_fetch", {url: "..."});\nvar doc = new DOMParser().parseFromString(res.body, "text/html");\nreturn { text: doc.body.innerText, title: doc.querySelector("title")?.textContent, links: [...doc.querySelectorAll("a[href]")].map(a => ({text: a.textContent.trim(), href: a.href})) };',
+            description: 'Fetch any URL; returns the raw response body (JSON APIs: JSON.parse(result.body)). HTML responses also include page_title, meta_description and extracted_text (script/style-stripped visible text) — read those instead of slicing raw HTML. For HTML pages, do NOT call this tool directly; fetch AND parse in one js_eval step so raw HTML never enters context:\nvar res = await executeTool("web_fetch", {url: "..."});\nvar doc = new DOMParser().parseFromString(res.body, "text/html");\nreturn { text: doc.body.innerText, title: doc.querySelector("title")?.textContent, links: [...doc.querySelectorAll("a[href]")].map(a => ({text: a.textContent.trim(), href: a.href})) };\nA 403/503/999 may mean bot protection, not an unreachable site (503 can also be maintenance/outage; 429 = rate limit: wait and back off first); a result.hint is added for these and for small 200 pages that look like a verification challenge (challenge_suspected:true). Then retry with tab_id (an open tab of that site, or open one with iframe_tool navigate {tab_id:"new"} and close it afterwards), or read the page with iframe_tool get_dom/get_visible_text. A 401 usually means not logged in (cookies are already sent): ask the user to log in, or use a tab. Never solve CAPTCHAs — ask the user to.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -620,7 +644,9 @@ var TOOLS = [
                     form: { type: 'object', description: 'multipart/form-data body: {field: "text" | {file_id} | {folder, path} | {base64}, each file part optionally with filename and content_type}. Content-Type/boundary is set automatically.' },
                     save_file: { type: 'boolean', description: 'If true, saves the response as a file and returns a file_id instead of the body — for binary content (images, PDFs, archives) or files to reference later, copy into a workspace, or offer as a download.' },
                     timeout_ms: { type: 'number', description: 'Hard timeout in ms (default 30000). After 5s returns {pending:true, handle} and keeps running; await_handle to wait or cancel.' },
-                    confirm: { type: 'boolean', description: 'Set true to have the user approve before execution (destructive, bulk, or significant changes). Omit for reads and routine operations. Note: web_fetch normally prompts on every call EXCEPT requests to the connected GitHub REST API base, which this flag governs — reads run silently; set confirm:true for writes such as merging a PR or posting a comment.' },
+                    tab_id: { type: ['integer', 'string'], description: 'Run the request INSIDE this open tab, as the user in that page (their cookies, the page origin/Referer, client hints) — for sites that 403/challenge a plain fetch. Use it only for the site the user asked about, never for POSTs the user didn\'t ask for. Tab ids: list_instances otherTabs, or open the site with iframe_tool navigate {tab_id:"new"} and close it afterwards. The url should be on the tab\'s origin (or an API host the site itself calls — CORS applies). Text bodies only (binary responses are refused: use web_fetch without tab_id + save_file). Result has context:"tab" and the same page_title/extracted_text/hint fields. Not exempt from approval for GitHub URLs.' },
+                    tab_world: { type: 'string', enum: ['ISOLATED', 'MAIN'], description: 'With tab_id: ISOLATED (default, content-script world — page JS cannot see the call) or MAIN (the page\'s own fetch, incl. any wrapper the site installs).' },
+                    confirm: { type: 'boolean', description: 'Set true to have the user approve before execution (destructive, bulk, or significant changes). Omit for reads and routine operations. Note: web_fetch normally prompts on every call EXCEPT requests to the connected GitHub REST API base (without tab_id), which this flag governs — reads run silently; set confirm:true for writes such as merging a PR or posting a comment.' },
                     status_message: { type: 'string', description: 'Short human-friendly description of this call, shown in the UI header.' }
                 },
                 required: ['url']
@@ -631,7 +657,7 @@ var TOOLS = [
         type: 'function',
         function: {
             name: 'local_folder',
-            description: 'Read/write files in the user\'s CONNECTED FOLDERS: the built-in virtual folder "virtual" ("Agent Files", always read/write — your scratch space, and where the user uploads files for you) plus local folders the user connected as read-only ("read") or read/write ("readwrite"). Paths are relative to the folder root (".." is rejected); folder defaults to "virtual".\nActions: list (folders + access + permission), ls {path?, recursive?}, read {path, encoding?:"base64"}, grep {pattern, path?}, write {path, content | base64 | file_id | source:{folder,path}, append?}, mkdir {path}, delete {path, recursive?}, request {reason, access?, folder?} (asks the user to connect a new folder, or re-grant permission for folder).\nread of a BINARY file (images, PDFs…) returns a file_id instead of content (encoding:"base64" also returns data_url). Use that file_id directly: servicenow_api attachment upload (attachment_file_id, or attachment_source:{folder,path}), web_fetch (body_file_id, or form:{file:{file_id}}), get_file {attach:true} to view it. write is refused on read-only folders.',
+            description: 'Read/write files in the user\'s CONNECTED FOLDERS: the built-in virtual folder "virtual" ("Agent Files", always read/write — your scratch space, and where the user uploads files for you) plus local folders the user connected as read-only ("read") or read/write ("readwrite"). Paths are relative to the folder root (".." is rejected); folder defaults to "virtual".\nActions: list (folders + access + permission), ls {path?, recursive?}, read {path, encoding?:"base64"}, grep {pattern, path?}, write {path, content | base64 | file_id | source:{folder,path}, append?}, mkdir {path}, delete {path, recursive?}, request {reason, access?, folder?} (asks the user to connect a new folder, or re-grant permission for folder).\nread of a BINARY file (images, PDFs…) returns a file_id instead of content (encoding:"base64" also returns data_url). Use that file_id directly: servicenow_api attachment upload (attachment_file_id, or attachment_source:{folder,path}), web_fetch (body_file_id, or form:{file:{file_id}}), get_file {attach:true} to view it. write is refused on read-only folders.\ndata_url size limit: direct tool calls inline data_url only up to ~1 MB encoded; programmatic callers (executeTool from js_eval or an html_widget) get the FULL data_url up to ~48 MB encoded. Over the limit the result has data_url_omitted:true + data_url_limit_chars + note, and the file_id still carries the full bytes (get_file {id} returns them as a data URL to js_eval/widgets). max_bytes overrides the limit; thumbnail:{max:512} adds a small JPEG thumbnail {data_url,width,height} for images.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -639,7 +665,9 @@ var TOOLS = [
                     folder: { type: 'string', description: 'Folder id or label from list. Default "virtual" (Agent Files).' },
                     path: { type: 'string', description: 'Path relative to the folder root, e.g. "images/logo.png". Empty = root.' },
                     recursive: { type: 'boolean', description: 'ls: walk sub-folders (skips .git/node_modules). delete: remove a non-empty directory.' },
-                    encoding: { type: 'string', enum: ['text', 'base64'], description: 'read: "base64" also returns data_url (and a file_id) for any file.' },
+                    encoding: { type: 'string', enum: ['text', 'base64'], description: 'read: "base64" also returns data_url (and a file_id) for any file. Size-limited (see description): over the limit data_url_omitted:true and only file_id.' },
+                    max_bytes: { type: 'number', description: 'read base64: max raw file size to inline as data_url (overrides the default; capped at ~4 MB encoded for direct calls, ~48 MB for js_eval/widget callers).' },
+                    thumbnail: { description: 'read (images): true, a number, or {max: px} → also return thumbnail {data_url (JPEG), width, height} with the long edge <= max (default 512).' },
                     save_file: { type: 'boolean', description: 'read: also register a text file in the file store and return file_id.' },
                     pattern: { type: 'string', description: 'grep: regex (case-insensitive by default).' },
                     ignore_case: { type: 'boolean', description: 'grep: default true.' },
@@ -818,7 +846,7 @@ var TOOLS = [
         type: 'function',
         function: {
             name: 'list_instances',
-            description: 'List connected ServiceNow instances with connection status, user info (incl. roles — the user\'s directly-granted roles; check for `admin` before servicenow_run_script; empty = unknown/probe failed; the `maint` login — no sys_user, no roles, admin-level read of the roles table — is reported as isMaint:true with roles ["maint","admin"] and counts as admin) and short names — use it before targeting an instance with servicenow_api or iframe_tool. Tab ids for browser actions (iframe_tool / take_screenshot REQUIRE an explicit tab_id): instances[].activeTabs[].id; extensionTabs = the extension\'s own pages; selfTabId = the tab hosting this agent UI in full-tab mode (null in the sidepanel) — it can be screenshotted/read but never navigated. Instances the user DISABLED for agent use (header instance picker) are excluded and returned in disabledInstances: never target them — any call against a disabled instance (explicit instance arg or the active instance) is refused until re-enabled.',
+            description: 'List connected ServiceNow instances with connection status, user info (incl. roles — the user\'s directly-granted roles; check for `admin` before servicenow_run_script; empty = unknown/probe failed; the `maint` login — no sys_user, no roles, admin-level read of the roles table — is reported as isMaint:true with roles ["maint","admin"] and counts as admin) and short names — use it before targeting an instance with servicenow_api or iframe_tool. Tab ids for browser actions (iframe_tool / take_screenshot REQUIRE an explicit tab_id; any website is allowed, not only ServiceNow): instances[].activeTabs[].id = ServiceNow tabs; otherTabs[].id = every other open website tab (restricted:true = browser-internal page such as chrome:// or the Web Store: navigate/close only); extensionTabs = the extension\'s own pages; selfTabId = the tab hosting this agent UI in full-tab mode (null in the sidepanel) — it can be screenshotted/read but never navigated. Instances the user DISABLED for agent use (header instance picker) are excluded and returned in disabledInstances: never target them — any call against a disabled instance (explicit instance arg or the active instance) is refused until re-enabled.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -936,7 +964,7 @@ var TOOLS = [
         type: 'function',
         function: {
             name: 'agent_status',
-            description: 'Read-only, cheap, synchronous snapshot of sub-agents — use freely. Default: every sub of the current chat (running, sleeping, stopped, errored) in a COMPACT shape: agent_id, name, state, tier, timestamps, tool_calls_used (display-only lifetime counter, no limit), context_pct/saturated gauges (FIXED assumed 200k window; saturated at 100k = 50% — check before re-tasking a sub), review_state, truncated last_report (status + ~200 chars of summary), action_state {state, label}, and usage {calls, input_tokens, output_tokens, cost, tier} (cost is null unless the endpoint reports one — only OpenRouter does; no client-side pricing). Diagnostics (last_error, crash_cause, pending_approvals, awaiting_approval, escalation_suggestion, resurrectable, inbox_size, pending_handles) appear only when meaningful. verbose:true adds full last_report, last_assistant_message {text, at} (~600 chars in lists / ~2000 single), full action_state {state, label, tasks[], output}, usage.by_tier, pool position, wake_parent, retries, and user_interactions {last_user_message_at, last_user_approval_at, opened_by_user_at}.',
+            description: 'Read-only, cheap, synchronous snapshot of sub-agents — use freely. Default: every sub of the current chat (running, sleeping, stopped, errored) in a COMPACT shape: agent_id, name, state, tier, timestamps, tool_calls_used (display-only lifetime counter, no limit), context_pct/saturated gauges (FIXED assumed 200k window; saturated at 100k = 50% — check before re-tasking a sub), review_state, truncated last_report (status + ~200 chars of summary), action_state {state, label}, and usage {calls, input_tokens, output_tokens, cost, tier} (cost is null unless known — OpenRouter reports it; Hugging Face cost is computed from the live /v1/models price of the serving provider; no static pricing table). Diagnostics (last_error, crash_cause, pending_approvals, awaiting_approval, escalation_suggestion, resurrectable, inbox_size, pending_handles) appear only when meaningful. verbose:true adds full last_report, last_assistant_message {text, at} (~600 chars in lists / ~2000 single), full action_state {state, label, tasks[], output}, usage.by_tier, pool position, wake_parent, retries, and user_interactions {last_user_message_at, last_user_approval_at, opened_by_user_at}.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -1085,6 +1113,30 @@ var TOOLS = [
     {
         type: 'function',
         function: {
+            name: 'chat_history',
+            description: 'READ-ONLY access to the user\'s PAST CHAT transcripts stored by this extension (use it when the user asks about previous chats, earlier messages, or what they typed before). Requires user approval by default (permission "ask", changeable in Settings). Reads only the chats store (+ chat_payloads to resolve offloaded payload stubs) in readonly transactions — never writes, never other stores. Results are safe-serialized (4KB per string, 64KB total).\nActions:\n- list {since, until, limit}: chats newest first (by updatedAt/createdAt) → {id, title, createdAt, updatedAt, message_count, is_sub_agent, parent_chat_id}; limit default 20, max 200.\n- search {pattern, flags, chat_id, path, since, limit}: regex over string fields of chat records → matches {chat_id, title, path, excerpt ±60 chars}; flags default \'i\'; limit default 20, max 100; with chat_id also scans that chat\'s offloaded text payloads (cached tool results).\n- get {chat_id, path | from, to}: one chat — a messages slice [from, to) (default 0..20, max 50 messages; negative from counts from the end) or a dot/bracket path inside the record (e.g. "messages[3].content"); offloaded payload stubs get a _payload {id, present, chars, text?} annotation (binary payloads are never inlined).',
+            parameters: {
+                type: 'object',
+                properties: {
+                    action: { type: 'string', enum: ['list', 'search', 'get'], description: 'list (default) | search | get.' },
+                    chat_id: { type: 'string', description: 'get: REQUIRED chat id. search: restrict to one chat.' },
+                    pattern: { type: 'string', description: 'search: REQUIRED regex source.' },
+                    flags: { type: 'string', description: 'search: regex flags (default \'i\'; g/y are ignored).' },
+                    path: { type: 'string', description: 'get: dot/bracket path inside the chat record, e.g. "messages[2].content". search: only scan this sub-path of each record.' },
+                    since: { type: ['string', 'number'], description: 'list/search: only chats updated at/after this ISO date or epoch ms.' },
+                    until: { type: ['string', 'number'], description: 'list: only chats updated at/before this ISO date or epoch ms.' },
+                    from: { type: 'number', description: 'get: first message index (inclusive, default 0; negative = from the end).' },
+                    to: { type: 'number', description: 'get: end message index (exclusive; default from+20; at most 50 messages per call).' },
+                    limit: { type: 'number', description: 'list: max chats (default 20, max 200). search: max matches (default 20, max 100).' },
+                    status_message: { type: 'string', description: 'Short human-friendly description of this call, shown in the UI header.' }
+                },
+                required: []
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
             name: 'get_tool_schema',
             description: 'Fetch the full JSON schema + description for tools in the deferred tool catalog (system prompt). Call it BEFORE using a catalog tool whose parameters you do not know; the schema stays in the conversation for the rest of the chat. Pure read — nothing is loaded or registered. Batch several names per call.',
             parameters: {
@@ -1177,6 +1229,9 @@ var HEADLESS_TOOLS = {
     // — so they run wherever js_eval runs.
     run_js_file: true,
     run_tests: true,
+    // chat_history (tools/165-chat-history.js, WORKER_SHARED_FILES) only needs
+    // openDatabase() (core/130, shared) — readonly IDB reads, fully headless.
+    chat_history: true,
     read_attached_file: true,
     document: true,
     list_instances: true,
@@ -1206,6 +1261,8 @@ var HEADLESS_TOOLS = {
     widget_eval: false,
     // pin_widget mutates dashboardWidgets + re-renders the dashboard/home grids — page only.
     pin_widget: false,
+    // split_view mounts/closes the split widget pane in the panel DOM — page only.
+    split_view: false,
     display: false,
     prompt_user: false,
     // github_setup opens a modal in the side panel DOM (impl in
@@ -1244,6 +1301,7 @@ var TOOL_SHORT_DESCRIPTIONS = {
     manage_skill: 'Create, update, edit, activate, or delete AI skills and their files (live runtime copy).',
     html_widget: 'Render (or version) a custom interactive HTML widget inline in chat when no display template fits.',
     pin_widget: 'Pin, move, or unpin an existing widget on the main or home dashboard.',
+    split_view: 'Split the chat screen to show one widget beside the chat for interactive editing (open/replace/close/status).',
     take_screenshot: 'Capture a PNG screenshot of the browser panel, a widget, or an element for visual analysis (browser/extension-dev profiles).',
     screenshot_by_id: 'Retrieve a previously taken screenshot by its ID.',
     get_file: 'Retrieve any stored file by ID — view it (attach) or hand the user a download.',
@@ -1251,7 +1309,7 @@ var TOOL_SHORT_DESCRIPTIONS = {
     update_action_state: 'Maintain the live progress card (state + todo list) for multi-step work.',
     show_action_button: 'Render a one-click skill Action button inline in chat.',
     prompt_user: 'Show a blocking inline form to collect structured user input or confirm a plan.',
-    web_fetch: 'Fetch a URL (GET/POST); for HTML pages, fetch and parse via js_eval instead.',
+    web_fetch: 'Fetch a URL (GET/POST); for HTML pages, fetch and parse via js_eval instead. 403/503/999 = may be bot protection (429 = rate limit, back off): retry with tab_id or read it in a browser tab; 401 = likely not logged in.',
     local_folder: 'List/read/grep/write files in connected folders (Agent Files virtual folder + user folders) — load images for upload or fetch.',
     get_cookie: 'Read browser cookies for a URL (chrome.cookies) so js_eval can do authenticated, cookie-gated fetches (browser/research profiles).',
     workspace: 'Clone, browse, edit, and push GitHub repos — the code-editing workspace.',
@@ -1274,6 +1332,7 @@ var TOOL_SHORT_DESCRIPTIONS = {
     eval_runner: 'Sandboxed grader for the ServiceNow eval skill lifecycle (init, setup, verify, teardown).',
     github_setup: 'Open the GitHub setup popup to connect an account or clone a repo.',
     runtime_inspect: 'Dev-mode only: introspect and drive the AppAgent extension runtime — page state, service worker, and IndexedDB incl. past chat transcripts.',
+    chat_history: 'Read-only search/list/read of past chat transcripts (asks for approval by default).',
     get_tool_schema: 'Fetch full JSON schemas for catalog tools before calling one whose parameters you do not know.'
 };
 for (var _ti = 0; _ti < TOOLS.length; _ti++) {

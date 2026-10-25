@@ -102,7 +102,7 @@ AppAgent is een Chrome-extensie met een ingebouwde agentlus. U beschrijft wat u 
 ## Installatie
 
 1. **Installeren** — Installeer de AppAgent-extensie via de Chrome Web Store (of laad deze uitgepakt voor ontwikkeling)
-2. **Een API-sleutel regelen** — Meld u aan bij [OpenRouter](https://openrouter.ai), gebruik Anthropic/OpenAI rechtstreeks, of koppel uw Claude Code-abonnement (Enterprise of Personal)
+2. **Een API-sleutel regelen** — Meld u aan bij [OpenRouter](https://openrouter.ai) of [Hugging Face](https://huggingface.co/docs/inference-providers), gebruik Anthropic/OpenAI rechtstreeks, of koppel uw Claude Code-abonnement (Enterprise of Personal)
 3. **Configureren** — Open de extensie en voeg uw API-sleutel toe (of meld u aan met Claude) via Instellingen → API-providers
 4. **Beginnen met bouwen** — Open uw ServiceNow-instantie in een tabblad (deze wordt automatisch gedetecteerd) en begin met chatten
 

@@ -124,6 +124,7 @@ if (typeof executeIframeTool !== 'function') var executeIframeTool = async funct
 if (typeof executeDisplay !== 'function') var executeDisplay = function() { return { success: false, error: 'display unavailable in SW context' }; };
 if (typeof executeHtmlWidget !== 'function') var executeHtmlWidget = function() { return { success: false, error: 'html_widget unavailable in SW context' }; };
 if (typeof executeWidgetEval !== 'function') var executeWidgetEval = async function() { return { success: false, error: 'widget_eval requires the exact foreground widget render; unavailable in SW context' }; };
+if (typeof executeSplitView !== 'function') var executeSplitView = async function() { return { success: false, error: 'split_view unavailable in SW context' }; };
 if (typeof executePinWidget !== 'function') var executePinWidget = async function() { return { success: false, error: 'pin_widget unavailable in SW context' }; };
 if (typeof executeStartChat !== 'function') var executeStartChat = async function() { return { success: false, error: 'start_chat unavailable in SW context' }; };
 if (typeof executePromptUser !== 'function') var executePromptUser = async function() { return { success: false, error: 'prompt_user unavailable in SW context' }; };

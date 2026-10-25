@@ -102,7 +102,7 @@ AppAgent เป็นส่วนขยายของ Chrome ที่มีล
 ## การตั้งค่า
 
 1. **ติดตั้ง** — ติดตั้งส่วนขยาย AppAgent จาก Chrome Web Store (หรือโหลดแบบ unpacked สำหรับการพัฒนา)
-2. **รับคีย์ API** — สมัครที่ [OpenRouter](https://openrouter.ai) ใช้ Anthropic/OpenAI โดยตรง หรือเชื่อมต่อการสมัครใช้งาน Claude Code ของคุณ (Enterprise หรือ Personal)
+2. **รับคีย์ API** — สมัครที่ [OpenRouter](https://openrouter.ai) หรือ [Hugging Face](https://huggingface.co/docs/inference-providers) ใช้ Anthropic/OpenAI โดยตรง หรือเชื่อมต่อการสมัครใช้งาน Claude Code ของคุณ (Enterprise หรือ Personal)
 3. **กำหนดค่า** — เปิดส่วนขยายแล้วเพิ่มคีย์ API ของคุณ (หรือลงชื่อเข้าใช้ด้วย Claude) ใน การตั้งค่า → ผู้ให้บริการ API
 4. **เริ่มสร้าง** — เปิดอินสแตนซ์ ServiceNow ของคุณในแท็บ (ระบบจะตรวจพบโดยอัตโนมัติ) แล้วเริ่มแชทได้เลย
 

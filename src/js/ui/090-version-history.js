@@ -5,12 +5,14 @@
 // the new helpers at runtime via global hoisting.
 
 // Common helper function for sys_upload.do with scope support
-async function uploadXml(xml, table, sysId) {
+// `target` (optional, from resolveRecordTarget in core/150-record-helpers.js)
+// sends the import to the entry's own instance; omitted = active instance.
+async function uploadXml(xml, table, sysId, target) {
     if (!xml) return { success: false, error: 'No XML provided' };
     
     try {
         // Get the record's scope for cross-scope operations
-        var recordScope = sysId ? await getRecordScope(table, sysId) : null;
+        var recordScope = sysId ? await getRecordScope(table, sysId, target) : null;
         
         var form = new FormData();
         var blob = new Blob([xml], { type: 'application/xml' });
@@ -24,9 +26,8 @@ async function uploadXml(xml, table, sysId) {
             uploadUrl += '?sysparm_record_scope=' + encodeURIComponent(recordScope);
         }
         
-        var res = await fetch(uploadUrl, {
+        var res = await recordFetch(target, uploadUrl, {
             method: 'POST',
-            headers: { 'X-UserToken': window.sessionToken },
             body: form
         });
         
@@ -50,11 +51,19 @@ async function uploadXml(xml, table, sysId) {
     }
 }
 
-async function getVersionXml(versionSysId) {
+// Cross-instance sidebar actions refuse (never fall back to the active
+// instance) when no token can be obtained for the entry's instance.
+function recordTargetRefusalMessage(instanceUrl) {
+    return t('No session for {instance}. Open a tab on that instance and try again. Nothing was changed.', { instance: normalizeInstanceUrl(instanceUrl) });
+}
+function refuseRecordTarget(instanceUrl) {
+    showSnackbar(recordTargetRefusalMessage(instanceUrl), 'error');
+}
+
+async function getVersionXml(versionSysId, target) {
     if (!versionSysId || !_recValidSysId.test(versionSysId)) return null;
     try {
-        var headers = { 'X-UserToken': window.sessionToken, 'Accept': 'application/json' };
-        var res = await fetch('/api/now/table/sys_update_version/' + versionSysId + '?sysparm_fields=payload', { headers: headers });
+        var res = await recordFetch(target, '/api/now/table/sys_update_version/' + versionSysId + '?sysparm_fields=payload', { headers: { 'Accept': 'application/json' } });
         if (!res.ok) return null;
         var data = await res.json();
         if (data.result && data.result.payload) {
@@ -91,25 +100,27 @@ function getRecordXmlBody(recXml) {
 // (incident, sys_user, …) are not update-set tracked and have NO versions,
 // so without the export fallback download/preview dead-ends with
 // "No version to download".
-async function getLatestRecordXml(table, sysId) {
+// `instanceUrl` = the entry's instance (omitted = active). Never falls back to
+// the active instance: no token for the entry's instance -> null.
+async function getLatestRecordXml(table, sysId, instanceUrl) {
     try {
+        var target = await resolveRecordTarget(instanceUrl);
+        if (!target) return null;
         var latestAfterVersion = (typeof getLatestAfterVersion === 'function')
-            ? getLatestAfterVersion(table, sysId) : null;
+            ? getLatestAfterVersion(table, sysId, instanceUrl) : null;
         // TB-8: each source must be a real record export (getRecordXmlBody),
         // else the next one is tried: .do?XML can answer 200 with a login
         // page, or with an empty <xml/> for a missing or unreadable record.
-        var xml = latestAfterVersion ? await getVersionXml(latestAfterVersion) : null;
+        var xml = latestAfterVersion ? await getVersionXml(latestAfterVersion, target) : null;
         if (!getRecordXmlBody(xml)) xml = null;
         if (!xml) {
-            var liveVersion = await getRecordVersion(table, sysId);
-            if (liveVersion) xml = await getVersionXml(liveVersion.sys_id);
+            var liveVersion = await getRecordVersion(table, sysId, target.active ? null : target);
+            if (liveVersion) xml = await getVersionXml(liveVersion.sys_id, target);
             if (!getRecordXmlBody(xml)) xml = null;
         }
         if (!xml) {
             if (!_recValidTable.test(table) || !_recValidSysId.test(sysId)) return null;
-            var res = await fetch('/' + table + '.do?XML&sys_id=' + sysId, {
-                headers: { 'X-UserToken': window.sessionToken }
-            });
+            var res = await recordFetch(target, '/' + table + '.do?XML&sys_id=' + sysId, {});
             if (res.ok) xml = await res.text();
             if (!getRecordXmlBody(xml)) xml = null;
         }
@@ -197,13 +208,15 @@ function getChangesForUserMessage(userMsgIndex) {
 }
 
 // Get the first version (before chat started) for a record
-function getFirstVersionForRecord(table, sysId) {
+// All record lookups below match on recordEntryKey / isSameRecordEntry
+// (core/150-record-helpers.js): instance + table + sys_id, where a missing
+// instanceUrl means the active instance.
+function getFirstVersionForRecord(table, sysId, instanceUrl) {
     var entries = [];
     getVersionHistorySources().forEach(function(src) {
         src.entries.forEach(function(v) {
             if (v.chatId === src.chatId &&
-                v.table === table &&
-                v.sysId === sysId &&
+                isSameRecordEntry(v, table, sysId, instanceUrl) &&
                 v.action !== 'REVERT' &&
                 !v.invalidated) {
                 entries.push(v);
@@ -243,10 +256,10 @@ function getVersionHistorySources() {
 // Invalidate (or un-invalidate) every non-REVERT entry for a record across
 // the active chat AND its sub-agent chats — revert/redo must act on the
 // OWNING chat's entries now that the sidebar rolls up sub-agent artifacts.
-function setRecordEntriesInvalidated(table, sysId, invalidated) {
+function setRecordEntriesInvalidated(table, sysId, invalidated, instanceUrl) {
     getVersionHistorySources().forEach(function(src) {
         src.entries.forEach(function(v) {
-            if (v.table === table && v.sysId === sysId && v.action !== 'REVERT') {
+            if (isSameRecordEntry(v, table, sysId, instanceUrl) && v.action !== 'REVERT') {
                 v.invalidated = invalidated;
             }
         });
@@ -256,10 +269,10 @@ function setRecordEntriesInvalidated(table, sysId, invalidated) {
 // Remove REVERT entries for a record across the active chat and its
 // sub-agent chats (redo path). filter() returns a new array, so the owning
 // chat's array is reassigned and the active-chat mirror kept in sync.
-function removeRevertEntriesForRecord(table, sysId) {
+function removeRevertEntriesForRecord(table, sysId, instanceUrl) {
     getVersionHistorySources().forEach(function(src) {
         var filtered = src.entries.filter(function(v) {
-            return !(v.table === table && v.sysId === sysId && v.action === 'REVERT');
+            return !(isSameRecordEntry(v, table, sysId, instanceUrl) && v.action === 'REVERT');
         });
         if (filtered.length !== src.entries.length) {
             if (chats[src.chatId]) chats[src.chatId].versionHistory = filtered;
@@ -275,11 +288,14 @@ function getAllChangedFiles() {
     getVersionHistorySources().forEach(function(src) {
         src.entries.forEach(function(v) {
             if (v.chatId === src.chatId && v.action !== 'REVERT' && v.action !== 'USER_DELETE' && !v.invalidated) {
-                var key = v.table + '_' + v.sysId;
+                // Cross-instance entries carry instanceUrl — keep them distinct
+                // (untagged and active-tagged entries share one key).
+                var key = recordEntryKey(v);
                 if (!files[key]) {
                     files[key] = {
                         table: v.table,
                         sysId: v.sysId,
+                        instanceUrl: recordInstanceKey(v.instanceUrl) || undefined,
                         displayName: v.displayName,
                         firstBeforeVersion: v.beforeVersion,
                         worker: src.worker,
@@ -305,18 +321,19 @@ function getRevertedFiles() {
     sources.forEach(function(src) {
         src.entries.forEach(function(v) {
         if (v.chatId === src.chatId && v.action === 'REVERT' && v.afterVersion && v.table !== 'batch') {
-            var key = v.table + '_' + v.sysId;
+            var key = recordEntryKey(v);
             // Only show if the original changes are invalidated (the entries
             // may live in a sub-agent chat's history — check all sources)
             var hasInvalidated = sources.some(function(s2) {
                 return s2.entries.some(function(h) {
-                    return h.table === v.table && h.sysId === v.sysId && h.invalidated;
+                    return isSameRecordEntry(h, v.table, v.sysId, v.instanceUrl) && h.invalidated;
                 });
             });
             if (hasInvalidated) {
                 reverted[key] = {
                     table: v.table,
                     sysId: v.sysId,
+                    instanceUrl: recordInstanceKey(v.instanceUrl) || undefined,
                     displayName: v.displayName,
                     revertedToVersion: v.afterVersion,
                     revertTimestamp: v.timestamp
@@ -329,13 +346,12 @@ function getRevertedFiles() {
 }
 
 // Get the latest after version for a record (to redo changes)
-function getLatestAfterVersion(table, sysId) {
+function getLatestAfterVersion(table, sysId, instanceUrl) {
     var entries = [];
     getVersionHistorySources().forEach(function(src) {
         src.entries.forEach(function(v) {
             if (v.chatId === src.chatId &&
-                v.table === table &&
-                v.sysId === sysId &&
+                isSameRecordEntry(v, table, sysId, instanceUrl) &&
                 v.action !== 'REVERT' &&
                 v.action !== 'USER_DELETE' &&
                 v.afterVersion) {
@@ -373,7 +389,7 @@ async function downloadChangesXml() {
             // its sys_attachment_doc chunks, which are not exported), so it
             // would import as a broken attachment: list it as not exported.
             if (file.table === 'sys_attachment') { skipped.push(t('{name} (attachment)', { name: label })); continue; }
-            var xml = await getLatestRecordXml(file.table, file.sysId);
+            var xml = await getLatestRecordXml(file.table, file.sysId, file.instanceUrl);
             if (getRecordXmlBody(xml)) recordXmls.push(xml); // TB-8: a record, not any 200 text
             else skipped.push(label);
         }
@@ -483,9 +499,9 @@ function renderInlineChanges(userMsgIdx) {
     // Group active changes by file
     var activeByFile = {};
     allChanges.active.forEach(function(c) {
-        var key = c.table + '_' + c.sysId;
+        var key = recordEntryKey(c);
         if (!activeByFile[key]) {
-            activeByFile[key] = { displayName: c.displayName, table: c.table, sysId: c.sysId, entries: [], beforeVersion: c.beforeVersion, isNew: false };
+            activeByFile[key] = { displayName: c.displayName, table: c.table, sysId: c.sysId, instanceUrl: recordInstanceKey(c.instanceUrl) || undefined, entries: [], beforeVersion: c.beforeVersion, isNew: false };
         }
         activeByFile[key].entries.push(c);
         activeByFile[key].afterVersion = c.afterVersion;
@@ -495,9 +511,9 @@ function renderInlineChanges(userMsgIdx) {
     // Group reverted changes by file
     var revertedByFile = {};
     allChanges.reverted.forEach(function(c) {
-        var key = c.table + '_' + c.sysId;
+        var key = recordEntryKey(c);
         if (!revertedByFile[key]) {
-            revertedByFile[key] = { displayName: c.displayName, table: c.table, sysId: c.sysId, entries: [], isNew: false };
+            revertedByFile[key] = { displayName: c.displayName, table: c.table, sysId: c.sysId, instanceUrl: recordInstanceKey(c.instanceUrl) || undefined, entries: [], isNew: false };
         }
         revertedByFile[key].entries.push(c);
         revertedByFile[key].afterVersion = c.afterVersion;
@@ -533,6 +549,7 @@ function renderInlineChanges(userMsgIdx) {
         var jsTable = escapeJsString(file.table);
         var jsSysId = escapeJsString(file.sysId);
         var jsDisplayName = escapeJsString(file.displayName);
+        var jsInst = escapeJsString(file.instanceUrl || '');
 
         html += '<div class="sn-artifact-card">';
         html += '<div class="sn-artifact-icon sn-icon-' + file.table.replace(/_/g, '-') + '">' + tableIcon + '</div>';
@@ -542,19 +559,19 @@ function renderInlineChanges(userMsgIdx) {
         html += '</div>';
         html += '<div class="sn-artifact-actions-row">';
         // View diff button
-        html += '<button class="sn-artifact-icon-btn" onclick="openDiffViewer(\'' + jsTable + '\', \'' + jsSysId + '\', \'' + jsDisplayName + '\')" title="' + escapeHtml(t('View changes')) + '">' + UI_ICONS.eye + '</button>';
+        html += '<button class="sn-artifact-icon-btn" onclick="openDiffViewer(\'' + jsTable + '\', \'' + jsSysId + '\', \'' + jsDisplayName + '\', \'' + jsInst + '\')" title="' + escapeHtml(t('View changes')) + '">' + UI_ICONS.eye + '</button>';
         // Download button
-        html += '<button class="sn-artifact-icon-btn" onclick="downloadSingleFile(\'' + jsTable + '\', \'' + jsSysId + '\', \'' + jsDisplayName + '\')" title="' + escapeHtml(t('Download XML')) + '">' + UI_ICONS.download + '</button>';
+        html += '<button class="sn-artifact-icon-btn" onclick="downloadSingleFile(\'' + jsTable + '\', \'' + jsSysId + '\', \'' + jsDisplayName + '\', \'' + jsInst + '\')" title="' + escapeHtml(t('Download XML')) + '">' + UI_ICONS.download + '</button>';
         // Open in browser for UI pages
         if (file.table === 'sys_ui_page') {
-            html += '<button class="sn-artifact-icon-btn" onclick="openUIPageInBrowser(\'' + jsDisplayName + '\')" title="' + escapeHtml(t('Open in Browser')) + '">' + UI_ICONS.globe + '</button>';
-            html += '<button class="sn-artifact-icon-btn" onclick="screenshotUIPage(\'' + jsDisplayName + '\')" title="' + escapeHtml(t('Screenshot')) + '">' + UI_ICONS.camera + '</button>';
+            html += '<button class="sn-artifact-icon-btn" onclick="openUIPageInBrowser(\'' + jsDisplayName + '\', \'' + jsInst + '\')" title="' + escapeHtml(t('Open in Browser')) + '">' + UI_ICONS.globe + '</button>';
+            html += '<button class="sn-artifact-icon-btn" onclick="screenshotUIPage(\'' + jsDisplayName + '\', \'' + jsInst + '\')" title="' + escapeHtml(t('Screenshot')) + '">' + UI_ICONS.camera + '</button>';
         }
         // Undo/Delete button
         if (isNew) {
-            html += '<button class="sn-artifact-icon-btn danger" onclick="deleteNewRecord(\'' + jsTable + '\', \'' + jsSysId + '\', \'' + jsDisplayName + '\', ' + userMsgIdx + ')" title="' + escapeHtml(t('Delete')) + '">' + UI_ICONS.trash + '</button>';
+            html += '<button class="sn-artifact-icon-btn danger" onclick="deleteNewRecord(\'' + jsTable + '\', \'' + jsSysId + '\', \'' + jsDisplayName + '\', ' + userMsgIdx + ', \'' + jsInst + '\')" title="' + escapeHtml(t('Delete')) + '">' + UI_ICONS.trash + '</button>';
         } else if (beforeVer) {
-            html += '<button class="sn-artifact-icon-btn" onclick="revertInlineChange(\'' + beforeVer + '\', \'' + jsTable + '\', \'' + jsSysId + '\', \'' + jsDisplayName + '\', ' + userMsgIdx + ')" title="' + escapeHtml(t('Undo')) + '">' + UI_ICONS.undo + '</button>';
+            html += '<button class="sn-artifact-icon-btn" onclick="revertInlineChange(\'' + beforeVer + '\', \'' + jsTable + '\', \'' + jsSysId + '\', \'' + jsDisplayName + '\', ' + userMsgIdx + ', \'' + jsInst + '\')" title="' + escapeHtml(t('Undo')) + '">' + UI_ICONS.undo + '</button>';
         }
         html += '</div>';
         html += '</div>';
@@ -569,6 +586,7 @@ function renderInlineChanges(userMsgIdx) {
         var jsTable = escapeJsString(file.table);
         var jsSysId = escapeJsString(file.sysId);
         var jsDisplayName = escapeJsString(file.displayName);
+        var jsInst = escapeJsString(file.instanceUrl || '');
 
         html += '<div class="sn-artifact-card reverted">';
         html += '<div class="sn-artifact-icon sn-icon-reverted">' + tableIcon + '</div>';
@@ -578,7 +596,7 @@ function renderInlineChanges(userMsgIdx) {
         html += '</div>';
         html += '<div class="sn-artifact-actions-row">';
         if (afterVer) {
-            html += '<button class="sn-artifact-icon-btn" onclick="redoInlineChange(\'' + afterVer + '\', \'' + jsTable + '\', \'' + jsSysId + '\', \'' + jsDisplayName + '\', ' + userMsgIdx + ')" title="' + escapeHtml(t('Redo')) + '">' + UI_ICONS.redo + '</button>';
+            html += '<button class="sn-artifact-icon-btn" onclick="redoInlineChange(\'' + afterVer + '\', \'' + jsTable + '\', \'' + jsSysId + '\', \'' + jsDisplayName + '\', ' + userMsgIdx + ', \'' + jsInst + '\')" title="' + escapeHtml(t('Redo')) + '">' + UI_ICONS.redo + '</button>';
         }
         html += '</div>';
         html += '</div>';
@@ -589,7 +607,7 @@ function renderInlineChanges(userMsgIdx) {
 }
 
 // Revert a single inline change (only for changes in a specific user message range)
-async function revertInlineChange(versionSysId, table, sysId, displayName, userMsgIdx) {
+async function revertInlineChange(versionSysId, table, sysId, displayName, userMsgIdx, instanceUrl) {
     if (!await showConfirmModal(t('Undo Changes'), t('Undo changes to "{name}"? This will restore the file to its state before this AI response.', { name: escapeHtml(displayName) }))) return;
     
     // Find the message range for this user message
@@ -605,20 +623,22 @@ async function revertInlineChange(versionSysId, table, sysId, displayName, userM
     try {
         showSpinner(t('Reverting {name}...', { name: displayName }));
         
-        var xml = await getVersionXml(versionSysId);
+        var _tgt = await resolveRecordTarget(instanceUrl);
+        if (!_tgt) { hideSpinner(); refuseRecordTarget(instanceUrl); return; }
+        var xml = await getVersionXml(versionSysId, _tgt);
         if (!xml) {
             hideSpinner();
             showSnackbar(t('Could not get version data'), 'error');
             return;
         }
 
-        var result = await uploadXml(xml, table, sysId);
+        var result = await uploadXml(xml, table, sysId, _tgt);
         hideSpinner();
 
         if (result.success) {
             // Only mark entries for this file within this message range as invalidated
             versionHistory.forEach(function(v, idx) {
-                if (v.table === table && v.sysId === sysId && v.chatId === currentChatId &&
+                if (isSameRecordEntry(v, table, sysId, instanceUrl) && v.chatId === currentChatId &&
                     v.messageIndex >= userMsgIdx && v.messageIndex < nextUserMsgIdx &&
                     v.action !== 'REVERT') {
                     versionHistory[idx].invalidated = true;
@@ -632,6 +652,7 @@ async function revertInlineChange(versionSysId, table, sysId, displayName, userM
                 timestamp: Date.now(),
                 table: table,
                 sysId: sysId,
+                instanceUrl: recordStoredInstanceUrl(instanceUrl),
                 displayName: displayName,
                 action: 'REVERT',
                 messageIndex: userMsgIdx,
@@ -660,9 +681,9 @@ async function revertAllInlineChanges(userMsgIdx) {
     // Group by file and track afterVersion for redo
     var filesByKey = {};
     allChanges.active.forEach(function(c) {
-        var key = c.table + '_' + c.sysId;
+        var key = recordEntryKey(c);
         if (!filesByKey[key]) {
-            filesByKey[key] = { table: c.table, sysId: c.sysId, displayName: c.displayName, beforeVersion: c.beforeVersion, afterVersion: c.afterVersion, isNew: c.action === 'POST' };
+            filesByKey[key] = { table: c.table, sysId: c.sysId, instanceUrl: recordInstanceKey(c.instanceUrl) || undefined, displayName: c.displayName, beforeVersion: c.beforeVersion, afterVersion: c.afterVersion, isNew: c.action === 'POST' };
         }
         // Keep the latest afterVersion for redo
         if (c.afterVersion) {
@@ -689,19 +710,18 @@ async function revertAllInlineChanges(userMsgIdx) {
     for (var i = 0; i < files.length; i++) {
         var file = files[i];
         try {
+            var _ftgt = await resolveRecordTarget(file.instanceUrl);
+            if (!_ftgt) { errors.push(file.displayName + ': ' + recordTargetRefusalMessage(file.instanceUrl)); continue; }
             if (file.isNew) {
                 // Delete new records - first check if it exists
                 try {
-                    var checkRes = await fetch('/api/now/table/' + file.table + '/' + file.sysId + '?sysparm_fields=sys_id', { 
-                        method: 'GET', 
-                        headers: { 'X-UserToken': window.sessionToken, 'Accept': 'application/json' } 
-                    });
+                    var checkRes = await recordFetch(_ftgt, '/api/now/table/' + file.table + '/' + file.sysId + '?sysparm_fields=sys_id', { method: 'GET', headers: { 'Accept': 'application/json' } });
                     if (checkRes.ok) {
                         // Record exists, delete it
-                        var recordScope = await getRecordScope(file.table, file.sysId);
+                        var recordScope = await getRecordScope(file.table, file.sysId, _ftgt.active ? null : _ftgt);
                         var deleteUrl = '/api/now/table/' + file.table + '/' + file.sysId;
                         if (recordScope) deleteUrl += '?sysparm_record_scope=' + encodeURIComponent(recordScope);
-                        var res = await fetch(deleteUrl, { method: 'DELETE', headers: { 'X-UserToken': window.sessionToken, 'Accept': 'application/json' } });
+                        var res = await recordFetch(_ftgt, deleteUrl, { method: 'DELETE', headers: { 'Accept': 'application/json' } });
                         if (res.ok || res.status === 204) {
                             successCount++;
                         } else {
@@ -718,7 +738,7 @@ async function revertAllInlineChanges(userMsgIdx) {
                 }
                 // Mark as invalidated regardless
                 versionHistory.forEach(function(v, idx) {
-                    if (v.table === file.table && v.sysId === file.sysId && v.chatId === currentChatId &&
+                    if (isSameRecordEntry(v, file.table, file.sysId, file.instanceUrl) && v.chatId === currentChatId &&
                         v.messageIndex >= userMsgIdx && v.messageIndex < nextUserMsgIdx && v.action !== 'REVERT') {
                         versionHistory[idx].invalidated = true;
                     }
@@ -726,7 +746,7 @@ async function revertAllInlineChanges(userMsgIdx) {
                 // Add REVERT entry for new files so they can be redone/recreated
                 var latestAfterVersionNew = null;
                 versionHistory.forEach(function(v) {
-                    if (v.table === file.table && v.sysId === file.sysId && v.chatId === currentChatId && 
+                    if (isSameRecordEntry(v, file.table, file.sysId, file.instanceUrl) && v.chatId === currentChatId && 
                         v.afterVersion && v.action !== 'REVERT') {
                         latestAfterVersionNew = v.afterVersion;
                     }
@@ -738,6 +758,7 @@ async function revertAllInlineChanges(userMsgIdx) {
                         timestamp: Date.now(),
                         table: file.table,
                         sysId: file.sysId,
+                        instanceUrl: file.instanceUrl,
                         displayName: file.displayName,
                         action: 'REVERT',
                         messageIndex: userMsgIdx,
@@ -748,13 +769,13 @@ async function revertAllInlineChanges(userMsgIdx) {
                 }
             } else if (file.beforeVersion) {
                 // Revert existing records
-                var xml = await getVersionXml(file.beforeVersion);
+                var xml = await getVersionXml(file.beforeVersion, _ftgt);
                 if (xml) {
-                    var result = await uploadXml(xml, file.table, file.sysId);
+                    var result = await uploadXml(xml, file.table, file.sysId, _ftgt);
                     if (result.success) {
                         successCount++;
                         versionHistory.forEach(function(v, idx) {
-                            if (v.table === file.table && v.sysId === file.sysId && v.chatId === currentChatId &&
+                            if (isSameRecordEntry(v, file.table, file.sysId, file.instanceUrl) && v.chatId === currentChatId &&
                                 v.messageIndex >= userMsgIdx && v.messageIndex < nextUserMsgIdx && v.action !== 'REVERT') {
                                 versionHistory[idx].invalidated = true;
                             }
@@ -762,7 +783,7 @@ async function revertAllInlineChanges(userMsgIdx) {
                         // Add REVERT entry so file appears in "Reverted Changes" for redo
                         var latestAfterVersion = null;
                         versionHistory.forEach(function(v) {
-                            if (v.table === file.table && v.sysId === file.sysId && v.chatId === currentChatId && 
+                            if (isSameRecordEntry(v, file.table, file.sysId, file.instanceUrl) && v.chatId === currentChatId && 
                                 v.afterVersion && v.action !== 'REVERT') {
                                 latestAfterVersion = v.afterVersion;
                             }
@@ -774,6 +795,7 @@ async function revertAllInlineChanges(userMsgIdx) {
                                 timestamp: Date.now(),
                                 table: file.table,
                                 sysId: file.sysId,
+                                instanceUrl: file.instanceUrl,
                                 displayName: file.displayName,
                                 action: 'REVERT',
                                 messageIndex: userMsgIdx,
@@ -804,7 +826,7 @@ async function revertAllInlineChanges(userMsgIdx) {
 }
 
 // Redo an inline change that was reverted
-async function redoInlineChange(versionSysId, table, sysId, displayName, userMsgIdx) {
+async function redoInlineChange(versionSysId, table, sysId, displayName, userMsgIdx, instanceUrl) {
     if (!await showConfirmModal(t('Redo Changes'), t('Redo changes to "{name}"? This will restore the AI-made changes.', { name: escapeHtml(displayName) }))) return;
     
     // Find the message range for this user message
@@ -820,20 +842,22 @@ async function redoInlineChange(versionSysId, table, sysId, displayName, userMsg
     try {
         showSpinner(t('Restoring {name}...', { name: displayName }));
         
-        var xml = await getVersionXml(versionSysId);
+        var _tgt = await resolveRecordTarget(instanceUrl);
+        if (!_tgt) { hideSpinner(); refuseRecordTarget(instanceUrl); return; }
+        var xml = await getVersionXml(versionSysId, _tgt);
         if (!xml) {
             hideSpinner();
             showSnackbar(t('Could not get version data'), 'error');
             return;
         }
 
-        var result = await uploadXml(xml, table, sysId);
+        var result = await uploadXml(xml, table, sysId, _tgt);
         hideSpinner();
 
         if (result.success) {
             // Un-invalidate entries for this file within this message range
             versionHistory.forEach(function(v, idx) {
-                if (v.table === table && v.sysId === sysId && v.chatId === currentChatId &&
+                if (isSameRecordEntry(v, table, sysId, instanceUrl) && v.chatId === currentChatId &&
                     v.messageIndex >= userMsgIdx && v.messageIndex < nextUserMsgIdx &&
                     v.action !== 'REVERT') {
                     versionHistory[idx].invalidated = false;
@@ -842,7 +866,7 @@ async function redoInlineChange(versionSysId, table, sysId, displayName, userMsg
 
             // Remove the revert entry for this specific user message
             versionHistory = versionHistory.filter(function(v) {
-                return !(v.table === table && v.sysId === sysId && v.chatId === currentChatId &&
+                return !(isSameRecordEntry(v, table, sysId, instanceUrl) && v.chatId === currentChatId &&
                          v.action === 'REVERT' && v.revertedUserMsgIdx === userMsgIdx);
             });
 
@@ -871,9 +895,9 @@ async function redoAllInlineChanges(userMsgIdx) {
     // Group by file
     var filesByKey = {};
     allChanges.reverted.forEach(function(c) {
-        var key = c.table + '_' + c.sysId;
+        var key = recordEntryKey(c);
         if (!filesByKey[key]) {
-            filesByKey[key] = { table: c.table, sysId: c.sysId, displayName: c.displayName, afterVersion: c.afterVersion };
+            filesByKey[key] = { table: c.table, sysId: c.sysId, instanceUrl: recordInstanceKey(c.instanceUrl) || undefined, displayName: c.displayName, afterVersion: c.afterVersion };
         }
         if (c.afterVersion) {
             filesByKey[key].afterVersion = c.afterVersion;
@@ -899,10 +923,12 @@ async function redoAllInlineChanges(userMsgIdx) {
     for (var i = 0; i < files.length; i++) {
         var file = files[i];
         try {
+            var _ftgt = await resolveRecordTarget(file.instanceUrl);
+            if (!_ftgt) { errors.push(file.displayName + ': ' + recordTargetRefusalMessage(file.instanceUrl)); continue; }
             // Find the latest afterVersion for this file
             var latestAfterVersion = null;
             versionHistory.forEach(function(v) {
-                if (v.table === file.table && v.sysId === file.sysId && v.chatId === currentChatId && 
+                if (isSameRecordEntry(v, file.table, file.sysId, file.instanceUrl) && v.chatId === currentChatId && 
                     v.afterVersion && v.action !== 'REVERT') {
                     latestAfterVersion = v.afterVersion;
                 }
@@ -913,18 +939,18 @@ async function redoAllInlineChanges(userMsgIdx) {
                 continue;
             }
             
-            var xml = await getVersionXml(latestAfterVersion);
+            var xml = await getVersionXml(latestAfterVersion, _ftgt);
             if (!xml) {
                 errors.push(t('{name}: Could not get version data', { name: file.displayName }));
                 continue;
             }
             
-            var result = await uploadXml(xml, file.table, file.sysId);
+            var result = await uploadXml(xml, file.table, file.sysId, _ftgt);
             if (result.success) {
                 successCount++;
                 // Un-invalidate entries for this file within this message range
                 versionHistory.forEach(function(v, idx) {
-                    if (v.table === file.table && v.sysId === file.sysId && v.chatId === currentChatId &&
+                    if (isSameRecordEntry(v, file.table, file.sysId, file.instanceUrl) && v.chatId === currentChatId &&
                         v.messageIndex >= userMsgIdx && v.messageIndex < nextUserMsgIdx &&
                         v.action !== 'REVERT') {
                         versionHistory[idx].invalidated = false;
@@ -932,7 +958,7 @@ async function redoAllInlineChanges(userMsgIdx) {
                 });
                 // Remove REVERT entries for this file within this message range
                 versionHistory = versionHistory.filter(function(v) {
-                    return !(v.table === file.table && v.sysId === file.sysId && v.chatId === currentChatId && 
+                    return !(isSameRecordEntry(v, file.table, file.sysId, file.instanceUrl) && v.chatId === currentChatId && 
                              v.action === 'REVERT' && v.revertedUserMsgIdx === userMsgIdx);
                 });
             } else {
@@ -956,26 +982,29 @@ async function redoAllInlineChanges(userMsgIdx) {
 }
 
 // Delete a newly created record
-async function deleteNewRecord(table, sysId, displayName, userMsgIdx) {
+async function deleteNewRecord(table, sysId, displayName, userMsgIdx, instanceUrl) {
     if (!await showConfirmModal(t('Delete Record'), t('Delete "{name}"? This will permanently delete this newly created record.', { name: escapeHtml(displayName) }), 'danger')) return;
 
     try {
         showSpinner(t('Deleting {name}...', { name: displayName }));
 
-        var headers = { 
-            'X-UserToken': window.sessionToken, 
+        var _tgt = await resolveRecordTarget(instanceUrl);
+        if (!_tgt) { hideSpinner(); refuseRecordTarget(instanceUrl); return; }
+
+        // X-UserToken is set by recordFetch from the resolved target.
+        var headers = {
             'Accept': 'application/json',
             'Content-Type': 'application/json'
         };
         
         // Get record's scope for delete request
-        var recordScope = await getRecordScope(table, sysId);
+        var recordScope = await getRecordScope(table, sysId, _tgt.active ? null : _tgt);
         var deleteUrl = '/api/now/table/' + table + '/' + sysId;
         if (recordScope) {
             deleteUrl += '?sysparm_record_scope=' + encodeURIComponent(recordScope);
         }
 
-        var res = await fetch(deleteUrl, {
+        var res = await recordFetch(_tgt, deleteUrl, {
             method: 'DELETE',
             headers: headers
         });
@@ -995,7 +1024,7 @@ async function deleteNewRecord(table, sysId, displayName, userMsgIdx) {
 
             // Mark entries for this file within this message range as invalidated
             versionHistory.forEach(function(v, idx) {
-                if (v.table === table && v.sysId === sysId && v.chatId === currentChatId &&
+                if (isSameRecordEntry(v, table, sysId, instanceUrl) && v.chatId === currentChatId &&
                     v.messageIndex >= userMsgIdx && v.messageIndex < nextUserMsgIdx &&
                     v.action !== 'REVERT') {
                     versionHistory[idx].invalidated = true;
@@ -1009,6 +1038,7 @@ async function deleteNewRecord(table, sysId, displayName, userMsgIdx) {
                 timestamp: Date.now(),
                 table: table,
                 sysId: sysId,
+                instanceUrl: recordStoredInstanceUrl(instanceUrl),
                 displayName: displayName,
                 action: 'USER_DELETE',
                 messageIndex: userMsgIdx
@@ -1043,11 +1073,11 @@ function loadVersionHistory() {
 }
 
 // Get all versions for a specific file in this chat (incl. sub-agent chats)
-function getVersionsForFile(table, sysId) {
+function getVersionsForFile(table, sysId, instanceUrl) {
     var versions = [];
     getVersionHistorySources().forEach(function(src) {
     src.entries.forEach(function(v) {
-        if (v.chatId === src.chatId && v.table === table && v.sysId === sysId &&
+        if (v.chatId === src.chatId && isSameRecordEntry(v, table, sysId, instanceUrl) &&
             v.action !== 'REVERT' && v.action !== 'USER_DELETE' && !v.invalidated) {
             if (v.beforeVersion) {
                 var exists = versions.some(function(ver) { return ver.versionId === v.beforeVersion; });
@@ -1081,10 +1111,12 @@ function getVersionsForFile(table, sysId) {
 }
 
 // Fetch historical versions for a record from sys_update_version (before the chat)
-async function getHistoricalVersions(table, sysId, excludeVersionIds) {
+// `instanceUrl` = the entry's instance (omitted = active); no token -> [].
+async function getHistoricalVersions(table, sysId, excludeVersionIds, instanceUrl) {
     try {
-        var headers = { 'X-UserToken': window.sessionToken, 'Accept': 'application/json' };
-        var res = await fetch('/api/now/table/sys_update_version?sysparm_query=name=' + table + '_' + sysId + '^ORDERBYDESCsys_created_on&sysparm_fields=sys_id,sys_created_on,sys_created_by&sysparm_limit=10', { headers: headers });
+        var target = await resolveRecordTarget(instanceUrl);
+        if (!target) return [];
+        var res = await recordFetch(target, '/api/now/table/sys_update_version?sysparm_query=name=' + table + '_' + sysId + '^ORDERBYDESCsys_created_on&sysparm_fields=sys_id,sys_created_on,sys_created_by&sysparm_limit=10', { headers: { 'Accept': 'application/json' } });
         var data = await res.json();
         if (data.result && data.result.length > 0) {
             return data.result

@@ -346,6 +346,7 @@
                         <input type="text" id="history-search-input" data-i18n-attr="placeholder,aria-label" class="sidebar-search-input" placeholder="Search chats, skills, tools, widgets..." oninput="handleHistorySearch(event)" aria-label="Search history" />
 <button class="sidebar-search-clear" id="history-search-clear" data-i18n-attr="title,aria-label" onclick="clearHistorySearch()" title="Clear search" aria-label="Clear search">×</button>
                     </div>
+                    <label class="history-search-inner-toggle" data-i18n-attr="title" title="Also search tool calls and tool results"><input type="checkbox" id="history-search-inner" onchange="toggleHistorySearchInner(event)" /><span data-i18n>Include inner model text</span></label>
                     <span class="history-stats widget-library-count" id="history-stats"></span>
                     <span class="page-toolbar-layout" id="history-layout-toggle"></span>
                 </div>

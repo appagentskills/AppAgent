@@ -650,6 +650,11 @@ describe('ui sidebar › search', function() {
     test('search snippet label escapes the tool name (renderChatItem typeLabel)', async function() {
         var bad = '<img src=x onerror=1>';
         var t = await mountSidebar({ a: chat('a', 'A', { messages: [{ role: 'assistant', content: '', tool_calls: [{ function: { name: bad, arguments: '{"q":"needle"}' } }] }] }) }, { chatSearchQuery: 'needle' });
+        // Tool calls are inner model text: searched only with the shared
+        // "Include inner model text" setting on (PR #1172).
+        t.m.renderChatList();
+        assert.strictEqual(t.dom.$('#chat-list .snippet-type'), null, 'default scope skips tool calls');
+        t.s.searchIncludeInner = true;
         t.m.renderChatList();
         assert.strictEqual(t.dom.$('#chat-list img'), null);
         assert.match(t.dom.$('#chat-list .snippet-type').textContent, /<img src=x onerror=1>/);

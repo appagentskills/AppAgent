@@ -102,7 +102,7 @@ AppAgent, yerleşik bir ajan döngüsüne sahip bir Chrome uzantısıdır. Ne is
 ## Kurulum
 
 1. **Yükleyin** — AppAgent uzantısını Chrome Web Mağazası'ndan yükleyin (veya geliştirme için paketlenmemiş olarak yükleyin)
-2. **API Anahtarı Edinin** — [OpenRouter](https://openrouter.ai) üzerinde kaydolun, doğrudan Anthropic/OpenAI kullanın veya Claude Code aboneliğinizi (Enterprise veya Personal) bağlayın
+2. **API Anahtarı Edinin** — [OpenRouter](https://openrouter.ai) veya [Hugging Face](https://huggingface.co/docs/inference-providers) üzerinde kaydolun, doğrudan Anthropic/OpenAI kullanın veya Claude Code aboneliğinizi (Enterprise veya Personal) bağlayın
 3. **Yapılandırın** — Uzantıyı açın ve Ayarlar → API Sağlayıcıları bölümünde API anahtarınızı ekleyin (veya Claude ile oturum açın)
 4. **Oluşturmaya Başlayın** — ServiceNow örneğinizi bir sekmede açın (otomatik olarak algılanır) ve sohbete başlayın
 

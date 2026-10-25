@@ -2564,6 +2564,17 @@ async function loadLlmEndpoints() {
     var stored = await getSetting('llmEndpoints', null);
     if (Array.isArray(stored)) {
         llmEndpoints = stored;
+        // One-time seed of defaults added after the user's first load (e.g.
+        // Hugging Face). Tracked per id so a default the user deleted is
+        // never re-added. Installs that predate the tracker were seeded with
+        // OpenRouter only.
+        try {
+            var seeded = await getSetting('llmEndpointsSeededIds', null);
+            if (!Array.isArray(seeded)) seeded = ['openrouter'];
+            var added = mergeNewDefaultLlmEndpoints(llmEndpoints, seeded);
+            if (added.length) await saveLlmEndpoints();
+            await setSetting('llmEndpointsSeededIds', DEFAULT_LLM_ENDPOINTS.map(function(d) { return d.id; }));
+        } catch (eSeed) { console.warn('LLM endpoint default seed failed:', eSeed); }
         return;
     }
     var legacy = [];
@@ -2581,7 +2592,24 @@ async function loadLlmEndpoints() {
     llmEndpoints = (legacy && legacy.length)
         ? legacy.map(function(ep) { return { id: ep.id, name: ep.name || ep.id, url: ep.url || '', apiKey: ep.apiKey || '' }; })
         : DEFAULT_LLM_ENDPOINTS.map(function(d) { return Object.assign({}, d); });
+    if (legacy && legacy.length) mergeNewDefaultLlmEndpoints(llmEndpoints, ['openrouter']);
     await saveLlmEndpoints();
+    try { await setSetting('llmEndpointsSeededIds', DEFAULT_LLM_ENDPOINTS.map(function(d) { return d.id; })); } catch (eSeed2) {}
+}
+
+// Append (in place) every DEFAULT_LLM_ENDPOINTS entry whose id is neither
+// already seeded nor present (by id or url). Returns the added entries.
+function mergeNewDefaultLlmEndpoints(list, seededIds) {
+    var added = [];
+    DEFAULT_LLM_ENDPOINTS.forEach(function(d) {
+        if (seededIds.indexOf(d.id) !== -1) return;
+        var exists = list.some(function(ep) { return ep && (ep.id === d.id || (ep.url && ep.url === d.url)); });
+        if (exists) return;
+        var copy = Object.assign({}, d);
+        list.push(copy);
+        added.push(copy);
+    });
+    return added;
 }
 
 async function saveLlmEndpoints() {

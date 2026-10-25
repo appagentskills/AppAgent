@@ -705,7 +705,28 @@ async function _lfRequest(args, options) {
     }
 }
 
+// Inline data_url caps (encoded chars). Direct LLM tool calls keep the ~1 MB
+// guard (the result lands in the context window). Programmatic callers —
+// js_eval / skill-tool sandboxes (options.fromSandbox, set by the offscreen
+// 'sw-exec-tool' relay in platform/extension/background.js and the page
+// sandbox bridge) and html_widget executeTool (options.fromWidget, set by
+// ui/070-dashboard-ui.js) — never feed the result to the model, so they get
+// the full data_url up to a transport ceiling: the sandbox result returns
+// through chrome.runtime.sendMessage, whose JSON message cap is 64 MiB, so
+// 48 MiB of encoded data leaves headroom for the envelope (~36 MB file).
+// max_bytes (raw file bytes) overrides: lowers it for anyone; raises it up
+// to the ceiling for programmatic callers, up to 4 MiB encoded for direct.
 var LF_DATA_URL_MAX_CHARS = 1024 * 1024;
+var LF_DATA_URL_PROGRAMMATIC_MAX_CHARS = 48 * 1024 * 1024;
+var LF_DATA_URL_DIRECT_OVERRIDE_MAX_CHARS = 4 * 1024 * 1024;
+function lfIsProgrammaticCaller(options) { return !!(options && (options.fromSandbox || options.fromWidget)); }
+function lfDataUrlCharLimit(args, options) {
+    var prog = lfIsProgrammaticCaller(options);
+    var ceiling = prog ? LF_DATA_URL_PROGRAMMATIC_MAX_CHARS : LF_DATA_URL_DIRECT_OVERRIDE_MAX_CHARS;
+    var mb = (args && args.max_bytes != null) ? Number(args.max_bytes) : NaN;
+    if (isFinite(mb) && mb > 0) return Math.min(4 * Math.ceil(mb / 3) + 128, ceiling);
+    return prog ? LF_DATA_URL_PROGRAMMATIC_MAX_CHARS : LF_DATA_URL_MAX_CHARS;
+}
 async function executeLocalFolder(args, options) {
     args = args || {};
     var action = args.action;
@@ -723,19 +744,32 @@ async function executeLocalFolder(args, options) {
             var out = { success: true, folder: st.folder, path: st.path, name: st.name, mime: st.mime, mime_type: st.mime, size: st.size, binary: binary };
             // Text (and base64/panel-fallback) reads need the bytes; a plain
             // binary read only registers a lazy folder pointer.
-            var r = (!binary || wantB64 || args._lf_panel_fallback) ? await lfReadFileBytes(args.folder, args.path) : null;
+            var thumbMax = (typeof fileStoreThumbMax === 'function') ? fileStoreThumbMax(args.thumbnail) : 0;
+            var r = (!binary || wantB64 || thumbMax || args._lf_panel_fallback) ? await lfReadFileBytes(args.folder, args.path) : null;
             if (binary || wantB64 || args.save_file) {
                 // Panel fallback ran because the SW cannot open this handle,
                 // so a SW-side lazy pointer would not resolve: store a Blob copy.
                 out.file_id = args._lf_panel_fallback
                     ? await _lfRegister({ type: 'memory', data: r.bytes, name: st.name, mime: st.mime })
                     : await _lfRegister({ kind: 'folder', type: 'folder', folder: st.folder, path: st.path, name: st.name, size: st.size, mime: st.mime, lastModified: st.lastModified });
-                var dataUrl = (wantB64 && r) ? 'data:' + st.mime + ';base64,' + lfBytesToBase64(r.bytes) : '';
+                if (thumbMax && r && typeof fileStoreThumbnail === 'function') {
+                    var th = await fileStoreThumbnail(r.bytes, st.mime, thumbMax);
+                    if (th.data_url) out.thumbnail = th; else out.thumbnail_error = th.error;
+                }
                 if (wantB64) {
-                    // Cap the inline data_url (~1 MB) — larger payloads flood the
-                    // context; the file_id carries the full bytes.
-                    if (dataUrl.length <= LF_DATA_URL_MAX_CHARS) out.data_url = dataUrl;
-                    else { out.data_url_omitted = true; out.note = 'data_url omitted: the encoded file is ' + dataUrl.length + ' chars (over ~1 MB). Use file_id instead (servicenow_api attachment_file_id, web_fetch body_file_id / form, get_file).'; }
+                    // Cap the inline data_url (caller-aware, see lfDataUrlCharLimit):
+                    // over the cap the file_id carries the full bytes. Length is
+                    // computed before encoding so an oversized file is never
+                    // base64-encoded just to be dropped.
+                    var limit = lfDataUrlCharLimit(args, options);
+                    var prefix = 'data:' + st.mime + ';base64,';
+                    var encLen = r ? prefix.length + 4 * Math.ceil(r.bytes.length / 3) : 0;
+                    if (r && encLen <= limit) out.data_url = prefix + lfBytesToBase64(r.bytes);
+                    else {
+                        out.data_url_omitted = true;
+                        out.data_url_limit_chars = limit;
+                        out.note = 'data_url omitted: the encoded file is ' + encLen + ' chars (over the ' + limit + '-char limit for this caller; direct tool calls ~1 MB, js_eval/widget executeTool ~48 MB, max_bytes overrides). The file_id carries the full bytes: servicenow_api attachment_file_id, web_fetch body_file_id / form, get_file {id} (returns data as a data URL to js_eval/widgets; thumbnail:{max:512} for a small JPEG).';
+                    }
                 }
                 else if (binary) out.hint = 'Binary file saved to the file store: pass file_id to servicenow_api (attachment_file_id), web_fetch (body_file_id / form), or get_file {attach:true} to view it.';
             }

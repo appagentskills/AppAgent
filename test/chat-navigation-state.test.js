@@ -42,7 +42,7 @@ function runChatNavigationAudit(sources) {
         'async ' + declaration(sources['src/js/tools/150-start-chat.js'], 'executeStartChat')].join('\n');
     // CHAT-CONTROLS SSOT: the REAL 020 derive, excerpted for the paint tests below.
     var controls = sources['src/js/app/020-api-messages.js'];
-    var deriveCode = ['_isStoppedActionChat', '_chatControlsState', '_setChatControlVisible', 'syncChatControlsUI', 'syncPauseButtonUI']
+    var deriveCode = ['_isStoppedActionChat', '_isChatLoopActive', '_chatHasLiveSubAgents', '_chatControlsState', '_setChatControlVisible', 'syncChatControlsUI', 'syncPauseButtonUI']
         .map(function(name) { return declaration(controls, name); }).join('\n');
     function fixture(view, overrides, extra) {
         var elements = {};
@@ -241,7 +241,8 @@ function runChatNavigationAudit(sources) {
     test('search match navigation explicitly restores highlights after selectChat', function() {
         var match = declaration(sources['src/js/ui/180-search.js'], 'navigateToSearchMatch');
         var selectIndex = match.indexOf('selectChat(chatId)');
-        var highlightIndex = match.indexOf('window.currentSearchHighlight = chatSearchQuery');
+        // The history page passes its own query (PR #1172): `query || chatSearchQuery`.
+        var highlightIndex = match.indexOf('window.currentSearchHighlight = query || chatSearchQuery');
         check(selectIndex >= 0 && highlightIndex >= 0 && selectIndex < highlightIndex, 'search restore ordering changed or required call/assignment missing');
     });
     return results;

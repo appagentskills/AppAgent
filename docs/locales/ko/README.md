@@ -102,7 +102,7 @@ AppAgent는 에이전트 루프가 내장된 Chrome 확장 프로그램입니다
 ## 설정
 
 1. **설치** — Chrome 웹 스토어에서 AppAgent 확장 프로그램을 설치합니다(개발용으로는 압축 해제된 확장 프로그램 로드)
-2. **API 키 받기** — [OpenRouter](https://openrouter.ai)에 가입하거나, Anthropic/OpenAI를 직접 사용하거나, Claude Code 구독(Enterprise 또는 Personal)을 연결합니다
+2. **API 키 받기** — [OpenRouter](https://openrouter.ai) 또는 [Hugging Face](https://huggingface.co/docs/inference-providers)에 가입하거나, Anthropic/OpenAI를 직접 사용하거나, Claude Code 구독(Enterprise 또는 Personal)을 연결합니다
 3. **구성** — 확장 프로그램을 열고 설정 → API 공급자에서 API 키를 추가하거나 Claude로 로그인합니다
 4. **만들기 시작** — 탭에서 ServiceNow 인스턴스를 열고(자동으로 감지됨) 채팅을 시작합니다
 

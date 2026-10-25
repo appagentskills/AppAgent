@@ -104,7 +104,10 @@ describe('maint detection', function() {
     test('background snGetInstancesDetailed: maint marked with ONE probe; roles/named/failed => ZERO probes', async function() {
         var bg = await loadFile('src/platform/extension/background.js');
         assert.strictEqual(bg.indexOf('function snDetectMaint'), -1, 'no local copy — uses the shared helper');
-        var src = between(bg, '// Probe one tab for { token, userName }', '// Probe a fresh g_ck for a specific instance URL');
+        // Start at the timeout helpers (snTimeoutMs / snWithTimeout / snFetchWithTimeout)
+        // that the tab probe + fetches now depend on.
+        var src = between(bg, '// Bound a probe promise', '// Probe a fresh g_ck for a specific instance URL');
+        assert.ok(src.indexOf('// Probe one tab for { token, userName }') !== -1, 'probe section included');
         async function run(o, userName) {
             var f = await mods([], router(o));
             var chrome = { scripting: { executeScript: async function() { return [{ result: { token: 'tk', userName: userName || '' } }]; } },

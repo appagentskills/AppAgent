@@ -57,6 +57,21 @@
 .sdoc-line-del { background: var(--danger-lighter); }
 .sdoc-line-del .sdoc-diff-text { color: var(--danger); }
 .sdoc-line-ctx .sdoc-diff-text { color: var(--text-muted); }
+/* GitHub-style hunks: stats, line-number gutters, @@ headers, expandable unchanged folds.
+   (.sdoc-diff .sdoc-diff-line / -hunk in 29-documents-page.css style the workspace diff; the
+   .sdoc-diff-body scoping keeps the version diff a flex row.) */
+.sdoc-diff-header .sdoc-diff-stat { margin-inline-start: auto; font-size: var(--text-xs); font-family: var(--font-mono); }
+.sdoc-diff .sdoc-diff-body .sdoc-diff-line { display: flex; white-space: pre-wrap; }
+.sdoc-diff-num { width: 3.5em; flex-shrink: 0; text-align: end; padding-inline-end: var(--space-3); color: var(--text-muted); opacity: 0.6; user-select: none; }
+.sdoc-diff-num-new { border-inline-end: 1px solid var(--secondary-border); }
+.sdoc-diff-body .sdoc-diff-hunk { padding: var(--space-1) var(--space-6); font-size: var(--text-xs); }
+.sdoc-diff-gap { background: var(--bg-secondary); border-block: 1px solid var(--secondary-border); }
+.sdoc-diff-expand { display: block; width: 100%; padding: var(--space-1) var(--space-6); border: 0; background: none; color: var(--primary); font: inherit; font-size: var(--text-xs); text-align: start; cursor: pointer; }
+span.sdoc-diff-expand { color: var(--text-muted); cursor: default; }
+button.sdoc-diff-expand:hover { background: var(--primary-lighter); }
+.sdoc-diff-expand:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
+.sdoc-diff-fold[hidden] { display: none; }
+.sdoc-diff-empty { padding: var(--space-6); color: var(--text-muted); font-family: var(--font-sans); }
 
 /* ─── Prompts ─── */
 .sdoc-prompts { border-top: 1px solid var(--secondary-border); padding: var(--space-6) var(--space-7); }

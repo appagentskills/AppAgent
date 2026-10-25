@@ -102,7 +102,7 @@ Az AppAgent egy beépített ügynökciklussal rendelkező Chrome-bővítmény. �
 ## Beállítás
 
 1. **Telepítés** — Telepítse az AppAgent bővítményt a Chrome Internetes áruházból (vagy fejlesztéshez töltse be kicsomagolva)
-2. **API-kulcs beszerzése** — Regisztráljon az [OpenRouter](https://openrouter.ai) oldalon, használja közvetlenül az Anthropicot/OpenAI-t, vagy csatlakoztassa Claude Code-előfizetését (Enterprise vagy Personal)
+2. **API-kulcs beszerzése** — Regisztráljon az [OpenRouter](https://openrouter.ai) vagy [Hugging Face](https://huggingface.co/docs/inference-providers) oldalon, használja közvetlenül az Anthropicot/OpenAI-t, vagy csatlakoztassa Claude Code-előfizetését (Enterprise vagy Personal)
 3. **Konfigurálás** — Nyissa meg a bővítményt, és adja meg az API-kulcsát (vagy jelentkezzen be Claude-dal) a Beállítások → API-szolgáltatók részben
 4. **Kezdje el az építést** — Nyissa meg a ServiceNow-példányát egy lapon (a rendszer automatikusan felismeri), és kezdjen el csevegni
 

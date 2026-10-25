@@ -85,6 +85,8 @@ function renderHistoryPage() {
 
     // Initialize icons (burger icon is in HTML)
     if (historySearchIcon) historySearchIcon.innerHTML = UI_ICONS.search;
+    var innerToggle = document.getElementById('history-search-inner');
+    if (innerToggle) innerToggle.checked = !!searchIncludeInner;
     if (historyDownloadIcon) historyDownloadIcon.innerHTML = UI_ICONS.download;
     
     if (!historyList) return;
@@ -158,12 +160,20 @@ function renderHistoryPage() {
     // When searching, use sidebar's exact search result display (renderChatItem)
     if (isSearching) {
         // Temporarily set chatSearchQuery to use renderChatItem properly
+        // Trimmed, so snippets use the same skeleton memo slot as the filter;
+        // late skeleton snippets re-render THIS page (not just the sidebar).
         var oldQuery = chatSearchQuery;
-        chatSearchQuery = historySearchQuery;
-        historyList.innerHTML = sortedChats.map(function(c) {
-            return renderChatItem(c);
-        }).join('');
-        chatSearchQuery = oldQuery;
+        var oldOnLate = _chatItemSearchOnLate;
+        chatSearchQuery = historySearchQuery.trim();
+        _chatItemSearchOnLate = _historyRerender;
+        try {
+            historyList.innerHTML = sortedChats.map(function(c) {
+                return renderChatItem(c);
+            }).join('');
+        } finally {
+            chatSearchQuery = oldQuery;
+            _chatItemSearchOnLate = oldOnLate;
+        }
     } else {
         // Normal view: use history chat cards
         historyList.innerHTML = sortedChats.map(function(c) {
@@ -548,6 +558,17 @@ function filterHistoryChats(query) {
         var chat = chats[id];
         return _vis(chat) && chatMatchesSearch(chat, q, _historyRerender);
     });
+}
+
+// "Include inner model text" checkbox (#history-search-inner): widen the
+// search to tool calls/results and re-run the current query (history page
+// and sidebar share the scope).
+function toggleHistorySearchInner(e) {
+    searchIncludeInner = !!(e && e.target && e.target.checked);
+    try { appStorage.setItem('searchIncludeInner', searchIncludeInner ? '1' : '0'); } catch (err) {}
+    if (typeof searchMatchesCache !== 'undefined') searchMatchesCache = {};
+    renderHistoryPage();
+    if (typeof renderChatList === 'function') renderChatList();
 }
 
 function clearHistorySearch() {

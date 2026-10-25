@@ -102,7 +102,7 @@ AppAgent je rozšíření Chrome s vestavěnou smyčkou agenta. Popíšete, co c
 ## Nastavení
 
 1. **Instalace** — Nainstalujte rozšíření AppAgent z Internetového obchodu Chrome (nebo ho pro vývoj načtěte jako rozbalené)
-2. **Získání klíče API** — Zaregistrujte se na [OpenRouter](https://openrouter.ai), použijte přímo Anthropic/OpenAI, nebo připojte své předplatné Claude Code (Enterprise nebo Personal)
+2. **Získání klíče API** — Zaregistrujte se na [OpenRouter](https://openrouter.ai) nebo [Hugging Face](https://huggingface.co/docs/inference-providers), použijte přímo Anthropic/OpenAI, nebo připojte své předplatné Claude Code (Enterprise nebo Personal)
 3. **Konfigurace** — Otevřete rozšíření a v Nastavení → Poskytovatelé API přidejte svůj klíč API (nebo se přihlaste přes Claude)
 4. **Začněte tvořit** — Otevřete svou instanci ServiceNow v kartě (rozpozná se automaticky) a začněte chatovat
 

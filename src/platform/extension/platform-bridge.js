@@ -156,8 +156,13 @@
     }
 
     // Refresh the full instance list from background (probes all open SN tabs)
+    // Bounded: resolves with the last-known registry after ~10s if the background
+    // probe has not answered; a late answer still updates Platform.instances.
     Platform.refreshInstances = function() {
-        return new Promise(function(resolve) {
+        return new Promise(function(_resolve) {
+            var _settled = false;
+            var _t = setTimeout(function() { resolve(Platform.instances); }, 10000);
+            function resolve(v) { if (_settled) return; _settled = true; clearTimeout(_t); _resolve(v); }
             chrome.runtime.sendMessage({ type: 'list-sn-instances-detailed' }, function(response) {
                 if (chrome.runtime.lastError || !response || !response.instances) {
                     resolve(Platform.instances);

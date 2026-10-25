@@ -102,7 +102,7 @@ AppAgent 是內建代理程式迴圈的 Chrome 擴充功能。您描述想要的
 ## 設定
 
 1. **安裝** — 從 Chrome 線上應用程式商店安裝 AppAgent 擴充功能（或在開發時以「載入未封裝項目」方式載入）
-2. **取得 API 金鑰** — 在 [OpenRouter](https://openrouter.ai) 註冊、直接使用 Anthropic/OpenAI，或連結您的 Claude Code 訂閱（企業版或個人版）
+2. **取得 API 金鑰** — 在 [OpenRouter](https://openrouter.ai) 或 [Hugging Face](https://huggingface.co/docs/inference-providers) 註冊、直接使用 Anthropic/OpenAI，或連結您的 Claude Code 訂閱（企業版或個人版）
 3. **進行設定** — 開啟擴充功能，並在 設定 → API 提供者 中新增 API 金鑰（或使用 Claude 登入）
 4. **開始建置** — 在分頁中開啟您的 ServiceNow 執行個體（系統會自動偵測），然後開始對話
 

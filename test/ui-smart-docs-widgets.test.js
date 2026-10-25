@@ -912,7 +912,7 @@ describe('ui html_widget › fullscreen, pin and sidebar', function() {
         assert.strictEqual(hdr.querySelector('.widget-title').textContent, 'Sales <b>board</b>');
         assert.strictEqual(hdr.querySelector('.widget-title b'), null);
         var titles = Array.prototype.map.call(hdr.querySelectorAll('.widget-ctrl-btn'), function(b) { return b.title; });
-        assert.deepStrictEqual(titles, ['Deactivate Widget', 'Pin to dashboard\u2026', 'Print', 'Screenshot', 'Open in new tab', 'Edit', 'Edit code']);
+        assert.deepStrictEqual(titles, ['Deactivate Widget', 'Pin to dashboard\u2026', 'Print', 'Screenshot', 'Export HTML', 'Open in new tab', 'Edit', 'Edit code']);
         assert.strictEqual(hdr.querySelector('.widget-stop-btn').getAttribute('data-widget-id'), 'widget_a');
         assert.ok(!hdr.querySelector('.widget-dashboard-btn').classList.contains('on-dashboard'));
         var frame = ov.querySelector('.widget-fullscreen-content iframe.widget-iframe');

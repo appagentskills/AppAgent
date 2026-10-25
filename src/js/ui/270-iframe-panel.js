@@ -838,22 +838,30 @@ function openBrowserWithUrl(source, openedByAI) {
     navigateIframe(url);
 }
 
-// Open a UI page in the browser panel by name
-function openUIPageInBrowser(pageName) {
+// Absolute page URL on the entry's OWN instance when it is not the active one
+// (recordInstanceKey, core/150); relative (active instance) otherwise.
+function _uiPageUrl(pageName, instanceUrl) {
+    var path = '/' + pageName + '.do';
+    var key = (typeof recordInstanceKey === 'function') ? recordInstanceKey(instanceUrl) : '';
+    return key ? key + path : path;
+}
+
+// Open a UI page in the browser panel by name (optionally on another instance)
+function openUIPageInBrowser(pageName, instanceUrl) {
     if (!pageName) return;
-    var url = '/' + pageName + '.do';
+    var url = _uiPageUrl(pageName, instanceUrl);
     var urlInput = document.getElementById('browser-url-input');
     if (urlInput) urlInput.value = url;
     openIframePanel();
     navigateIframe(url);
 }
 
-async function screenshotUIPage(pageName) {
+async function screenshotUIPage(pageName, instanceUrl) {
     if (!pageName) return;
-    var url = '/' + pageName + '.do';
+    var url = _uiPageUrl(pageName, instanceUrl);
 
     // Open page in a temp tab, screenshot, download, close
-    var fullUrl = (Platform.instanceUrl || '') + url;
+    var fullUrl = /^https?:\/\//i.test(url) ? url : (Platform.instanceUrl || '') + url;
     var tab = await chrome.tabs.create({ url: fullUrl, active: false });
     await new Promise(function(resolve) {
         function onUpdated(tabId, info) {

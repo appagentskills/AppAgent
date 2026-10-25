@@ -475,6 +475,7 @@ async function executeGetFile(args) {
 
     // Full mode: include data and generate persistent download URL
     var fname = file.name || 'download';
+    var thumbMax = (args.thumbnail != null && typeof fileStoreThumbMax === 'function') ? fileStoreThumbMax(args.thumbnail) : 0;
     var downloadUrl = 'file-download.html?id=' + encodeURIComponent(id) + '&name=' + encodeURIComponent(fname);
     if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.getURL) {
         downloadUrl = chrome.runtime.getURL(downloadUrl);
@@ -490,6 +491,22 @@ async function executeGetFile(args) {
         width: file.width || undefined,
         height: file.height || undefined
     };
+
+    // Thumbnail mode: a small JPEG data URL instead of the full data (a
+    // gallery widget wants many small images, not N full-size payloads).
+    if (thumbMax && !args.attach) {
+        var tmime = (file.mime || dataUrlMime(String(file.data || '')) || '').toLowerCase();
+        var tsrc = file.data != null ? _ufsToBlobSync(file.data, tmime).blob : null;
+        var th = tsrc ? await fileStoreThumbnail(tsrc, tmime, thumbMax) : { error: 'thumbnail: file has no data' };
+        if (th.data_url) {
+            result.thumbnail = th;
+            delete result.data;
+            result.data_omitted = true;
+            result.note = 'thumbnail returned instead of data (omit thumbnail to get the full data URL).';
+        } else {
+            result.thumbnail_error = th.error;
+        }
+    }
 
     // Attach mode: inject the file into the conversation so the model can see it directly
     if (args.attach && file.data) {
@@ -826,6 +843,41 @@ async function resolveFile(fileId) {
     var blob = c.blob.type === mime ? c.blob : c.blob.slice(0, c.blob.size, mime);
     return { id: fileId, kind: 'pointer', blob: blob, name: f.name || null, mime: mime, size: blob.size, width: f.width || null, height: f.height || null };
 }
+// ─── thumbnails ───
+// thumbnail arg (get_file / local_folder read): true → 512 px, a number, or
+// {max}. Returns the clamped long-edge px, or 0 when not requested.
+function fileStoreThumbMax(v) {
+    if (v == null || v === false) return 0;
+    var n = v === true ? 512 : (typeof v === 'object' ? Number(v.max) || 512 : Number(v));
+    if (!isFinite(n) || n <= 0) return 0;
+    return Math.max(16, Math.min(2048, Math.round(n)));
+}
+// Downscale an image (bytes | Blob) to a JPEG data URL whose long edge is
+// <= max px (never upscales). Uses createImageBitmap + OffscreenCanvas, both
+// available in the panel page and the service worker. Never throws: returns
+// {error} for non-images / undecodable input (e.g. SVG in a worker).
+async function fileStoreThumbnail(src, mime, max) {
+    try {
+        if (!/^image\//i.test(mime || '')) return { error: 'thumbnail: not an image (' + (mime || 'unknown') + ')' };
+        if (typeof createImageBitmap !== 'function' || typeof OffscreenCanvas === 'undefined') return { error: 'thumbnail: image decoding is unavailable in this context' };
+        var blob = (typeof Blob !== 'undefined' && src instanceof Blob) ? src : new Blob([src], { type: mime });
+        var bmp = await createImageBitmap(blob);
+        var sw = bmp.width, sh = bmp.height;
+        var scale = Math.min(1, max / Math.max(sw, sh, 1));
+        var w = Math.max(1, Math.round(sw * scale)), h = Math.max(1, Math.round(sh * scale));
+        var canvas = new OffscreenCanvas(w, h);
+        var ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h); // JPEG has no alpha
+        ctx.drawImage(bmp, 0, 0, w, h);
+        if (bmp.close) bmp.close();
+        var out = await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.85 });
+        var u8 = new Uint8Array(await out.arrayBuffer());
+        return { data_url: 'data:image/jpeg;base64,' + _ufsBytesToB64(u8), width: w, height: h, source_width: sw, source_height: sh };
+    } catch (e) {
+        return { error: 'thumbnail failed: ' + ((e && e.message) || e) };
+    }
+}
+
 async function _ufsToLegacyShape(r) {
     var u8 = r.bytes || new Uint8Array(await r.blob.arrayBuffer());
     return { id: r.id, name: r.name, mime: r.mime, size: r.size, data: 'data:' + r.mime + ';base64,' + _ufsBytesToB64(u8), width: r.width || null, height: r.height || null };

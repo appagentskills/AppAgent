@@ -4,7 +4,7 @@
 
 AppAgent is your development partner for ServiceNow. It can create and maintain apps, and run tests for them. It does the testing by filling forms and taking screenshots. No technical knowledge required.
 
-You bring your own API key (BYOK) and that's it! It's compatible with OpenAI, OpenRouter, Claude API, and even Claude Code plans (contact us privately).
+You bring your own API key (BYOK) and that's it! It's compatible with OpenAI, OpenRouter, Hugging Face Inference Providers, Claude API, and even Claude Code plans (contact us privately).
 
 It is a Chrome extension that stores all of the chat in your browser (does not even leave your browser). It only interacts with your ServiceNow instance and your model API provider.
 
@@ -102,7 +102,7 @@ AppAgent is a Chrome extension with a built-in agent loop. You describe what you
 ## Setup
 
 1. **Install** — Install the AppAgent extension from the Chrome Web Store (or load unpacked for development)
-2. **Get an API Key** — Sign up at [OpenRouter](https://openrouter.ai), use Anthropic/OpenAI directly, or connect your Claude Code subscription (Enterprise or Personal)
+2. **Get an API Key** — Sign up at [OpenRouter](https://openrouter.ai) or [Hugging Face](https://huggingface.co/docs/inference-providers), use Anthropic/OpenAI directly, or connect your Claude Code subscription (Enterprise or Personal)
 3. **Configure** — Open the extension and add your API key (or sign in with Claude) in Settings → API Providers
 4. **Start Building** — Open your ServiceNow instance in a tab (it is detected automatically) and start chatting
 

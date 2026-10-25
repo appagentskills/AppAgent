@@ -102,7 +102,7 @@ AppAgent er en Chrome-udvidelse med en indbygget agentløkke. Du beskriver, hvad
 ## Opsætning
 
 1. **Installér** – Installér AppAgent-udvidelsen fra Chrome Web Store (eller indlæs den upakket til udvikling)
-2. **Skaf en API-nøgle** – Opret en konto hos [OpenRouter](https://openrouter.ai), brug Anthropic/OpenAI direkte, eller forbind dit Claude Code-abonnement (Enterprise eller Personal)
+2. **Skaf en API-nøgle** – Opret en konto hos [OpenRouter](https://openrouter.ai) eller [Hugging Face](https://huggingface.co/docs/inference-providers), brug Anthropic/OpenAI direkte, eller forbind dit Claude Code-abonnement (Enterprise eller Personal)
 3. **Konfigurer** – Åbn udvidelsen, og tilføj din API-nøgle (eller log ind med Claude) under Indstillinger → API-udbydere
 4. **Begynd at bygge** – Åbn din ServiceNow-instans i en fane (den registreres automatisk), og begynd at chatte
 

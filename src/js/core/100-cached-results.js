@@ -1027,6 +1027,10 @@ function getSystemPromptWithContext(chatId) {
     if (typeof _maybeAppendResponseLanguage === 'function') {
         expanded = _maybeAppendResponseLanguage(expanded);
     }
+    // Split widget view state is NOT appended here (it changed the system
+    // prompt on every pane change and broke the prompt cache): it rides as a
+    // tail role:'context' row instead (maybePushSplitViewTailContext,
+    // core/082-split-view.js, pushed from app/030-agent-loop.js).
     if (typeof _maybeAppendSubAgentPreamble === 'function') {
         expanded = _maybeAppendSubAgentPreamble(expanded, chatId);
     }

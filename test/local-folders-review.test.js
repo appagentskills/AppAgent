@@ -264,6 +264,27 @@ describe('local folders review: 170 module fixes', function() {
         assert.match(rs.data_url, /^data:/);
     }, { tags: ['unit'] });
 
+    test('read encoding:base64 is caller-aware: js_eval/widget callers get the full data_url; max_bytes overrides', async function() {
+        var dir = await opfs.getDirectoryHandle(m.LOCAL_FOLDER_OPFS_DIR, { create: true });
+        var big = await dir.getFileHandle('big2.bin', { create: true }); big._bytes = new Uint8Array(900 * 1024);
+        var direct = await m.executeLocalFolder({ action: 'read', path: 'big2.bin', encoding: 'base64' }, {});
+        assert.strictEqual(direct.data_url_omitted, true, 'direct LLM call keeps the ~1 MB guard');
+        assert.strictEqual(direct.data_url_limit_chars, m.LF_DATA_URL_MAX_CHARS);
+        var sb = await m.executeLocalFolder({ action: 'read', path: 'big2.bin', encoding: 'base64' }, { fromSandbox: true });
+        assert.strictEqual(sb.data_url_omitted, undefined);
+        assert.strictEqual(sb.data_url.length, ('data:' + sb.mime + ';base64,').length + 4 * Math.ceil(900 * 1024 / 3));
+        var wg = await m.executeLocalFolder({ action: 'read', path: 'big2.bin', encoding: 'base64' }, { fromWidget: true });
+        assert.match(wg.data_url, /^data:/);
+        assert.ok(wg.file_id, 'file_id still returned');
+        var low = await m.executeLocalFolder({ action: 'read', path: 'big2.bin', encoding: 'base64', max_bytes: 1000 }, { fromWidget: true });
+        assert.strictEqual(low.data_url_omitted, true, 'max_bytes lowers the limit');
+        var up = await m.executeLocalFolder({ action: 'read', path: 'big2.bin', encoding: 'base64', max_bytes: 2 * 1024 * 1024 }, {});
+        assert.match(up.data_url, /^data:/, 'max_bytes raises the direct limit');
+        assert.strictEqual(m.lfDataUrlCharLimit({ max_bytes: 1e9 }, {}), m.LF_DATA_URL_DIRECT_OVERRIDE_MAX_CHARS);
+        assert.strictEqual(m.lfDataUrlCharLimit({ max_bytes: 1e9 }, { fromSandbox: true }), m.LF_DATA_URL_PROGRAMMATIC_MAX_CHARS);
+        assert.strictEqual(m.lfDataUrlCharLimit({}, { fromWidget: true }), m.LF_DATA_URL_PROGRAMMATIC_MAX_CHARS);
+    }, { tags: ['unit'] });
+
     // ── fix 7 ──
     test('lfFetchBodyConflict: form/body_* with GET/DELETE or with body is a clear error', async function() {
         assert.strictEqual(m.lfFetchBodyConflict({ method: 'POST', body: 'x' }), null);

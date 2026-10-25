@@ -569,10 +569,17 @@ function togglePause() {
     if (typeof _dismissHaltChats !== 'undefined' && _dismissHaltChats) delete _dismissHaltChats[chatId];
     var wasPaused = pausedChats[chatId] === true;
     var nowPaused = !wasPaused;
+    // PAUSE-SUBS: an IDLE chat whose sub-agents are still running gets a Pause
+    // too (_chatControlsState). That pause only stands the subs down; the
+    // persisted chat.pausedSubsOnly rider makes the matching Resume re-queue
+    // them WITHOUT starting a run of this chat. Read before the unpause clears it.
+    var _cpChat = (typeof chats !== 'undefined' && chats) ? chats[chatId] : null;
+    var resumeSubsOnly = wasPaused && !!_cpChat && _cpChat.pausedSubsOnly === true;
+    var pauseSubsOnly = nowPaused && !_isChatLoopActive(chatId) && _chatHasLiveSubAgents(chatId);
     // Persist the user-pause on the chat record too (chat.pausedByUser) so the
     // paused state survives a panel reload — see setChatPausedPersistent
     // (core/030-config.js); loadChatsFromStorage rehydrates pausedChats from it.
-    setChatPausedPersistent(chatId, nowPaused);
+    setChatPausedPersistent(chatId, nowPaused, nowPaused ? { subsOnly: pauseSubsOnly } : undefined);
     // Mirror foreground state into the legacy global so legacy reads (after-response
     // hooks, browser-notification gate) reflect the focused chat. Background chats
     // that pause/resume independently do NOT touch the global — their loops only
@@ -631,7 +638,7 @@ function togglePause() {
     // SWM-T5: bump the interrupt generation too, so a stale interrupt(false) retry
     // chain armed during a port-down window can't survive resume and abort the run.
     if (typeof _supersedeInterruptToggle === 'function') _supersedeInterruptToggle(chatId);
-    if (wasPaused && !nowPaused && !runningChatIds[chatId]) {
+    if (wasPaused && !nowPaused && !runningChatIds[chatId] && !resumeSubsOnly) {
         runAgent();
     }
     // The runAgent shim marks runningChatIds synchronously, so this paints Pause with no
@@ -992,11 +999,32 @@ function _isStoppedActionChat(chatId, chat) {
     return !!(a && a.chatId === chatId && a.state === 'stopped');
 }
 
+function _isChatLoopActive(chatId) {
+    return !!((typeof runningChatIds !== 'undefined' && runningChatIds && runningChatIds[chatId]) ||
+        (typeof isChatControlsHeld === 'function' && isChatControlsHeld(chatId)));
+}
+
+// PAUSE-SUBS: does `chatId` have at least one LIVE (state 'running', not
+// parent-paused, not user-paused) sub-agent anywhere in its subtree? Reads the
+// SubAgents registry (page mirror via applySnapshot; SW realm: the real one).
+function _chatHasLiveSubAgents(chatId) {
+    if (!chatId || typeof SubAgents === 'undefined' || !SubAgents || typeof SubAgents.listAll !== 'function') return false;
+    var all;
+    try { all = SubAgents.listAll() || []; } catch (e) { return false; }
+    for (var i = 0; i < all.length; i++) {
+        var r = all[i];
+        if (!r || r.state !== 'running' || r.paused_by_parent_chat) continue;
+        if ((r.root_chat_id || r.parent_chat_id) !== chatId && r.parent_chat_id !== chatId) continue;
+        if (r.chat_id && typeof pausedChats !== 'undefined' && pausedChats && pausedChats[r.chat_id] === true) continue;
+        return true;
+    }
+    return false;
+}
+
 function _chatControlsState(chatId) {
     if (!chatId || typeof chats === 'undefined' || !chats || !chats[chatId]) return 'none';
     var chat = chats[chatId];
-    var running = !!((typeof runningChatIds !== 'undefined' && runningChatIds && runningChatIds[chatId]) ||
-        (typeof isChatControlsHeld === 'function' && isChatControlsHeld(chatId)));
+    var running = _isChatLoopActive(chatId);
     var paused = typeof pausedChats !== 'undefined' && !!pausedChats && pausedChats[chatId] === true;
     if (paused && _isStoppedActionChat(chatId, chat)) return 'none';
     if (running) {
@@ -1005,6 +1033,8 @@ function _chatControlsState(chatId) {
     }
     if (chat.isSubAgent) return 'none';
     if (paused) return 'resume';
+    // PAUSE-SUBS: idle chat, but its sub-agents still work → Pause them.
+    if (_chatHasLiveSubAgents(chatId)) return 'pause';
     var errored = (typeof lastApiError !== 'undefined' && lastApiError && lastApiError.chatId === chatId) ||
         !!chat._lastApiError;
     if (errored) return 'retry';

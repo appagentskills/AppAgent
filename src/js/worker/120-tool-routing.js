@@ -1662,7 +1662,9 @@ if (typeof requestProgrammaticToolApproval !== 'function') {
         // web_fetch to the CONFIGURED GitHub REST base is agent-governed via
         // the `confirm` param (mirrors the page gate in ui/150-tool-approval.js).
         // Downgrade the DEFAULT 'ask' only; explicit user overrides aren't 'ask'.
+        // NOT for tab_id (in-tab) calls: they keep the normal web_fetch approval.
         if (toolName === 'web_fetch' && permission === 'ask' && args && args.url
+            && !(args.tab_id != null && args.tab_id !== '')
             && typeof isConfiguredGitHubApiUrl === 'function'
             && (await isConfiguredGitHubApiUrl(args.url))) {
             permission = 'auto';

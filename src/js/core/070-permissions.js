@@ -41,6 +41,8 @@ var GLOBAL_READ_KEYS = [
     'get_tool_schema',
     'display',
     'prompt_user',
+    // split_view only changes panel layout (shows/closes a widget pane).
+    'split_view',
     'take_screenshot',
     'screenshot_by_id',
     'get_file',
@@ -118,7 +120,11 @@ var GLOBAL_WRITE_KEYS = [
     'show_action_button',
     'github_setup',
     'runtime_inspect',
-    'start_chat'
+    'start_chat',
+    // chat_history: read-only past-chat transcripts (tools/165-chat-history.js).
+    // Listed as a write key so it shows in Settings; default 'ask' (below) —
+    // past chats may hold sensitive content, so every read prompts by default.
+    'chat_history'
 ];
 
 var GLOBAL_PERMISSION_KEYS = GLOBAL_READ_KEYS.concat(GLOBAL_WRITE_KEYS);
@@ -132,7 +138,9 @@ var GLOBAL_PERMISSION_KEYS = GLOBAL_READ_KEYS.concat(GLOBAL_WRITE_KEYS);
 var GLOBAL_ASK_DEFAULT_KEYS = [
     'web_fetch',
     'local_folder:delete',
-    'local_folder:write_local'
+    'local_folder:write_local',
+    // chat_history exposes past chat transcripts — prompt by default.
+    'chat_history'
 ];
 
 // Default permission of a GLOBAL key when the user has stored nothing.

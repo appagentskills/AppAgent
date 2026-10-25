@@ -1,10 +1,17 @@
 // Download single file from sidebar
-async function downloadSingleFile(table, sysId, displayName) {
+// `instanceUrl` = the entry's instance (omitted = active instance).
+async function downloadSingleFile(table, sysId, displayName, instanceUrl) {
     showSpinner(t('Downloading...'));
     try {
         // getLatestRecordXml (ui/090-version-history.js) falls back to the
         // <table>.do?XML export for data tables with no sys_update_version rows.
-        var xml = await getLatestRecordXml(table, sysId);
+        // Cross-instance entries: no token for their instance -> refuse.
+        if (recordInstanceKey(instanceUrl) && !(await resolveRecordTarget(instanceUrl))) {
+            hideSpinner();
+            refuseRecordTarget(instanceUrl);
+            return;
+        }
+        var xml = await getLatestRecordXml(table, sysId, instanceUrl);
         if (!xml) {
             hideSpinner();
             showSnackbar(t('No version to download'), 'warning');
@@ -30,7 +37,9 @@ async function downloadSingleFile(table, sysId, displayName) {
 }
 
 // Delete a new record from the sidebar (simpler version without userMsgIdx)
-async function deleteNewRecordFromSidebar(table, sysId, displayName) {
+// `instanceUrl` = the entry's instance; the DELETE goes THERE (never the active
+// instance, where the same sys_id may exist) and refuses without a token.
+async function deleteNewRecordFromSidebar(table, sysId, displayName, instanceUrl) {
     // displayName is RECORD-CONTROLLED (getRecordDisplayValue in core/150-record-helpers.js
     // returns name || number || short_description straight off the ServiceNow Table API),
     // and showModal renders the confirm message as HTML. Escape it here — the same
@@ -40,18 +49,18 @@ async function deleteNewRecordFromSidebar(table, sysId, displayName) {
     try {
         showSpinner(t('Deleting {name}...', { name: displayName }));
 
-        var recordScope = await getRecordScope(table, sysId);
+        var tgt = await resolveRecordTarget(instanceUrl);
+        if (!tgt) { hideSpinner(); refuseRecordTarget(instanceUrl); return; }
+
+        var recordScope = await getRecordScope(table, sysId, tgt.active ? null : tgt);
         var deleteUrl = '/api/now/table/' + table + '/' + sysId;
         if (recordScope) {
             deleteUrl += '?sysparm_record_scope=' + encodeURIComponent(recordScope);
         }
 
-        var res = await fetch(deleteUrl, {
+        var res = await recordFetch(tgt, deleteUrl, {
             method: 'DELETE',
-            headers: {
-                'X-UserToken': window.sessionToken,
-                'Accept': 'application/json'
-            }
+            headers: { 'Accept': 'application/json' }
         });
 
         hideSpinner();
@@ -62,7 +71,7 @@ async function deleteNewRecordFromSidebar(table, sysId, displayName) {
             // entries may be owned by a sub chat whose artifact rolled up
             // into this sidebar, see getVersionHistorySources in
             // 090-version-history.js).
-            setRecordEntriesInvalidated(table, sysId, true);
+            setRecordEntriesInvalidated(table, sysId, true, instanceUrl);
 
             // Add delete entry
             addVersionHistoryEntry({
@@ -71,6 +80,7 @@ async function deleteNewRecordFromSidebar(table, sysId, displayName) {
                 timestamp: Date.now(),
                 table: table,
                 sysId: sysId,
+                instanceUrl: recordStoredInstanceUrl(instanceUrl),
                 displayName: displayName,
                 action: 'USER_DELETE',
                 messageIndex: -1
@@ -110,7 +120,9 @@ async function revertToVersion(versionSysId, historyIndex, revertType) {
         showSpinner(t('Fetching version XML...'));
         
         // Get the XML payload from sys_update_version
-        var xml = await getVersionXml(versionSysId);
+        var tgt = await resolveRecordTarget(entry.instanceUrl);
+        if (!tgt) { hideSpinner(); refuseRecordTarget(entry.instanceUrl); return; }
+        var xml = await getVersionXml(versionSysId, tgt);
         if (!xml) {
             hideSpinner();
             showSnackbar(t('Failed to get version XML'), 'error');
@@ -119,13 +131,13 @@ async function revertToVersion(versionSysId, historyIndex, revertType) {
         
         showSpinner(t('Importing XML to revert...'));
         
-        var result = await uploadXml(xml, entry.table, entry.sysId);
+        var result = await uploadXml(xml, entry.table, entry.sysId, tgt);
         hideSpinner();
         
         if (result.success) {
             // Mark subsequent entries for the same record as invalid
             for (var i = historyIndex + 1; i < versionHistory.length; i++) {
-                if (versionHistory[i].table === entry.table && versionHistory[i].sysId === entry.sysId) {
+                if (isSameRecordEntry(versionHistory[i], entry.table, entry.sysId, entry.instanceUrl)) {
                     versionHistory[i].invalidated = true;
                 }
             }
@@ -137,6 +149,7 @@ async function revertToVersion(versionSysId, historyIndex, revertType) {
                 timestamp: Date.now(),
                 table: entry.table,
                 sysId: entry.sysId,
+                instanceUrl: recordStoredInstanceUrl(entry.instanceUrl),
                 displayName: entry.displayName,
                 action: 'REVERT',
                 messageIndex: -1,

@@ -881,45 +881,114 @@ async function sdocCompare(docId, versionStr, fromEl) {
     var oldLabel = oldVer.author === 'user' ? t('v{version} (user)', { version: oldVer.version })
         : oldVer.author === 'agent' ? t('v{version} (agent)', { version: oldVer.version })
         : 'v' + oldVer.version + ' (' + oldVer.author + ')';
-    diff.innerHTML = sdocRenderDiff(oldVer.content.split('\n'), doc.currentContent.split('\n'),
+    diff.innerHTML = sdocRenderDiff(_sdocDiffSplit(oldVer.content), _sdocDiffSplit(doc.currentContent),
         oldLabel, t('v{version} (current)', { version: doc.currentVersion }));
 }
 
+// '' -> [] (an empty version has no lines, not one blank line); otherwise split on \n.
+function _sdocDiffSplit(s) { s = s == null ? '' : String(s); return s ? s.split('\n') : []; }
+
+// GitHub-style version diff: only the changed hunks with SDOC_DIFF_CONTEXT lines of context,
+// an "@@ -a,b +c,d @@" header per hunk, old/new line-number gutters, and a click-to-expand
+// "N unchanged lines" fold for each collapsed run (runs over SDOC_DIFF_FOLD_MAX stay collapsed
+// so a huge unchanged stretch is never put in the DOM).
+var SDOC_DIFF_CONTEXT = 3, SDOC_DIFF_FOLD_MAX = 2000;
 function sdocRenderDiff(oldLines, newLines, oldLabel, newLabel) {
+    var model = sdocDiffHunks(sdocComputeDiff(oldLines || [], newLines || []), SDOC_DIFF_CONTEXT);
+    var statLbl = t('Lines added: {added}, removed: {removed}', { added: model.added, removed: model.removed });
     var html = '<div class="sdoc-diff-header">';
     html += '<span class="sdoc-diff-label sdoc-diff-old">' + escDisplay(oldLabel) + '</span>';
     html += '<span class="sdoc-diff-arrow">\u2192</span>';
     html += '<span class="sdoc-diff-label sdoc-diff-new">' + escDisplay(newLabel) + '</span>';
+    html += '<span class="sdoc-diff-stat" role="note" aria-label="' + escDisplay(statLbl) + '" title="' + escDisplay(statLbl) + '"><span class="sdoc-diff-stat-add" aria-hidden="true">+' + model.added + '</span> <span class="sdoc-diff-stat-del" aria-hidden="true">-' + model.removed + '</span></span>';
     html += '</div><div class="sdoc-diff-body">';
-
-    var changes = sdocComputeDiff(oldLines, newLines);
-    changes.forEach(function(ch) {
-        var cls = ch.type === 'add' ? 'sdoc-line-add' : ch.type === 'del' ? 'sdoc-line-del' : 'sdoc-line-ctx';
-        var prefix = ch.type === 'add' ? '+' : ch.type === 'del' ? '-' : ' ';
-        html += '<div class="sdoc-diff-line ' + cls + '"><span class="sdoc-diff-prefix">' + prefix + '</span><span class="sdoc-diff-text">' + escDisplay(ch.text) + '</span></div>';
+    html += sdocDiffBodyHtml(model, 'sdoc-diff', function(r) {
+        var cls = r.type === 'add' ? 'sdoc-line-add' : r.type === 'del' ? 'sdoc-line-del' : 'sdoc-line-ctx';
+        var prefix = r.type === 'add' ? '+' : r.type === 'del' ? '-' : ' ';
+        return '<div class="sdoc-diff-line ' + cls + '"><span class="sdoc-diff-num sdoc-diff-num-old">' + (r.oldNo || '') + '</span><span class="sdoc-diff-num sdoc-diff-num-new">' + (r.newNo || '') + '</span><span class="sdoc-diff-prefix">' + prefix + '</span><span class="sdoc-diff-text">' + escDisplay(r.text) + '</span></div>';
     });
     html += '</div>';
     return html;
 }
 
-function sdocComputeDiff(oldLines, newLines) {
-    var m = oldLines.length, n = newLines.length;
-    if (m + n > 2000) return sdocSimpleDiff(oldLines, newLines);
-    var dp = [];
-    for (var i = 0; i <= m; i++) { dp[i] = []; for (var j = 0; j <= n; j++) { if (i === 0 || j === 0) dp[i][j] = 0; else if (oldLines[i-1] === newLines[j-1]) dp[i][j] = dp[i-1][j-1] + 1; else dp[i][j] = Math.max(dp[i-1][j], dp[i][j-1]); } }
-    var changes = []; var i = m, j = n;
-    while (i > 0 || j > 0) { if (i > 0 && j > 0 && oldLines[i-1] === newLines[j-1]) { changes.unshift({ type: 'ctx', text: oldLines[i-1] }); i--; j--; } else if (j > 0 && (i === 0 || dp[i][j-1] >= dp[i-1][j])) { changes.unshift({ type: 'add', text: newLines[j-1] }); j--; } else { changes.unshift({ type: 'del', text: oldLines[i-1] }); i--; } }
-    return changes;
+// Hunk model shared by the version diff and the `diff` display template (old_text/new_text):
+// rows = [{type:'add'|'del'|'ctx', text, oldNo?, newNo?}], hunks = [{start, end (row indexes,
+// end exclusive), oldStart, oldCount, newStart, newCount}]. A row is kept when it is within
+// `ctx` rows of a change, so hunks closer than 2*ctx+1 rows merge (like git/GitHub).
+function sdocDiffHunks(changes, ctx) {
+    ctx = typeof ctx === 'number' && ctx >= 0 ? Math.floor(ctx) : SDOC_DIFF_CONTEXT;
+    var rows = [], o = 0, n = 0, added = 0, removed = 0, i;
+    (changes || []).forEach(function(ch) {
+        if (!ch) return;
+        var type = ch.type === 'add' || ch.type === 'del' ? ch.type : 'ctx', r = { type: type, text: ch.text == null ? '' : String(ch.text) };
+        if (type !== 'add') r.oldNo = ++o;
+        if (type !== 'del') r.newNo = ++n;
+        if (type === 'add') added++; else if (type === 'del') removed++;
+        rows.push(r);
+    });
+    var keep = new Uint8Array(rows.length), last = -Infinity;
+    for (i = 0; i < rows.length; i++) { if (rows[i].type !== 'ctx') last = i; if (i - last <= ctx) keep[i] = 1; }
+    last = Infinity;
+    for (i = rows.length - 1; i >= 0; i--) { if (rows[i].type !== 'ctx') last = i; if (last - i <= ctx) keep[i] = 1; }
+    var hunks = [], oBefore = 0, nBefore = 0, h = null;
+    function close(end) {
+        hunks.push({ start: h.start, end: end, oldStart: h.oldCount ? h.oB + 1 : h.oB, oldCount: h.oldCount, newStart: h.newCount ? h.nB + 1 : h.nB, newCount: h.newCount });
+        h = null;
+    }
+    for (i = 0; i < rows.length; i++) {
+        var r = rows[i];
+        if (keep[i]) {
+            if (!h) h = { start: i, oB: oBefore, nB: nBefore, oldCount: 0, newCount: 0 };
+            if (r.oldNo) h.oldCount++;
+            if (r.newNo) h.newCount++;
+        } else if (h) close(i);
+        if (r.oldNo) oBefore = r.oldNo;
+        if (r.newNo) nBefore = r.newNo;
+    }
+    if (h) close(rows.length);
+    return { rows: rows, hunks: hunks, added: added, removed: removed };
 }
 
-function sdocSimpleDiff(oldLines, newLines) {
-    var changes = []; var max = Math.max(oldLines.length, newLines.length);
-    for (var i = 0; i < max; i++) {
-        if (i < oldLines.length && i < newLines.length) { if (oldLines[i] === newLines[i]) changes.push({ type: 'ctx', text: oldLines[i] }); else { changes.push({ type: 'del', text: oldLines[i] }); changes.push({ type: 'add', text: newLines[i] }); } }
-        else if (i < oldLines.length) changes.push({ type: 'del', text: oldLines[i] });
-        else changes.push({ type: 'add', text: newLines[i] });
+// Hunks -> HTML: '<p>-gap' fold (button + hidden rows), '<p>-hunk' header, rows via lineHtml(row).
+// No hunks -> a single '<p>-empty' "No differences" line instead of the whole document.
+function sdocDiffBodyHtml(model, p, lineHtml) {
+    var rows = model.rows, html = '', prev = 0;
+    if (!model.hunks.length) return '<div class="' + p + '-empty">' + escDisplay(t('No differences')) + '</div>';
+    function gap(from, to) {
+        var cnt = to - from;
+        if (cnt <= 0) return '';
+        var lbl = '\u22ef ' + escDisplay(tn(cnt, '{count} unchanged line', '{count} unchanged lines'));
+        if (cnt > SDOC_DIFF_FOLD_MAX) return '<div class="' + p + '-gap"><span class="' + p + '-expand">' + lbl + '</span></div>';
+        var g = '<div class="' + p + '-gap"><button type="button" class="' + p + '-expand" aria-expanded="false" onclick="sdocDiffExpand(this)">' + lbl + '</button></div><div class="' + p + '-fold" hidden>';
+        for (var k = from; k < to; k++) g += lineHtml(rows[k]);
+        return g + '</div>';
     }
-    return changes;
+    model.hunks.forEach(function(hk) {
+        html += gap(prev, hk.start);
+        html += '<div class="' + p + '-hunk">@@ -' + hk.oldStart + ',' + hk.oldCount + ' +' + hk.newStart + ',' + hk.newCount + ' @@</div>';
+        for (var k = hk.start; k < hk.end; k++) html += lineHtml(rows[k]);
+        prev = hk.end;
+    });
+    return html + gap(prev, rows.length);
+}
+
+// Expand a collapsed run: reveal the fold right after the clicked gap row and drop the row.
+function sdocDiffExpand(btn) {
+    var gap = btn && btn.parentNode, fold = gap && gap.nextElementSibling;
+    if (!fold || !/-diff-fold$/.test(fold.className)) return;
+    fold.hidden = false;
+    if (gap.parentNode) gap.parentNode.removeChild(gap);
+}
+
+// [{type:'add'|'del'|'ctx', text}] via the trimmed LCS of _sdocLineDiffArr (whole-rewrite
+// fallback past SDOC_DIFF_MAX_CELLS).
+function sdocComputeDiff(oldLines, newLines) {
+    var out = [];
+    _sdocLineDiffArr(oldLines || [], newLines || []).forEach(function(g) {
+        var type = g.type === 'eq' ? 'ctx' : g.type;
+        g.lines.forEach(function(l) { out.push({ type: type, text: l }); });
+    });
+    return out;
 }
 
 function sdocExportMd(docId) {
@@ -1378,6 +1447,7 @@ function openDocumentsView() {
             } catch (e) {}
         }
         renderDocumentsPage();
+        if (typeof afScheduleRefresh === 'function') afScheduleRefresh(0);
         // The repo list is fetched here (and on picker focus / mode switch / Retry), never from a render.
         if (_sdocConnMode() === 'github') sdocGhLoadRepos();
     }
@@ -1878,7 +1948,7 @@ var SDOC_SRC_HITS_MAX = 200;   // file rows shown per source (then a "+N more" n
 // gen bumps on every reset so a load started before a reset (page reopen,
 // connect/disconnect) can never write stale sources/listings into the new cache.
 // scrolledSel = the sel last scrolled into view (the strip re-renders often; scroll only on change).
-var sdocSrcState = { sel: 'all', path: '', addAccess: 'read', addMode: 'folder', sources: null, loading: null, listings: {}, wsRows: {}, rendered: [], gen: 0, scrolledSel: null };
+var sdocSrcState = { sel: 'all', path: '', addAccess: 'read', addMode: 'folder', addHandle: null, sources: null, loading: null, listings: {}, wsRows: {}, rendered: [], gen: 0, scrolledSel: null };
 // Connect card, GitHub mode. repos = the /user/repos list (all pages), cached for one page
 // open (openDocumentsView clears it); status = {text, kind, noToken, settings} shown under the inputs.
 // errorKind = _sdocGhClassify kind of the list error; active = the combobox's highlighted
@@ -2049,19 +2119,25 @@ function sdocSrcPickAccess(opt) {
     var was = group.querySelector('.radio-option.selected');
     _sdocRadioSelect(group, v);
     var fid = group.getAttribute('data-folder-id');
-    if (!fid) { sdocSrcState.addAccess = v; return null; } // "Connect folder" card: remembered across re-renders
+    if (!fid) { // Add-source dialog: remembered across re-renders; the hint updates in place (no re-render).
+        sdocSrcState.addAccess = v;
+        var hn = typeof document !== 'undefined' ? document.getElementById('sdoc-add-acc-hint') : null;
+        if (hn) hn.textContent = _sdocAddAccHint(v);
+        return null;
+    }
     var src = sdocSrcById('lf:' + fid);
     if (was && was.getAttribute('data-value') === v && !(src && v === 'readwrite' && src.permission !== 'granted')) return null;
     return sdocSrcSetAccess(fid, v);
 }
 function sdocSrcAccessKeydown(e) { return _sdocRadioKeydown(e, sdocSrcPickAccess); }
 // Shared roving-radio keys: Enter/Space pick, arrows (flipped in RTL) move + pick.
-function _sdocRadioKeydown(e, pick) {
+function _sdocRadioKeydown(e, pick, sel) {
+    sel = sel || '.radio-option';
     if (!e || e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
     var group = e.currentTarget;
     if (!group || !group.querySelectorAll) return;
-    var opts = Array.prototype.slice.call(group.querySelectorAll('.radio-option'));
-    var cur = opts.indexOf(e.target && e.target.closest ? e.target.closest('.radio-option') : null);
+    var opts = Array.prototype.slice.call(group.querySelectorAll(sel));
+    var cur = opts.indexOf(e.target && e.target.closest ? e.target.closest(sel) : null);
     if (cur < 0) return;
     if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); pick(opts[cur]); return; }
     if (typeof kbdRadioNextIndex !== 'function') return;
@@ -2072,32 +2148,6 @@ function _sdocRadioKeydown(e, pick) {
     opts[next].focus();
     pick(opts[next]);
 }
-
-// ─── Connect card: Local folder / GitHub repo ───
-// Same segmented radio as the access picker; shown only when both kinds can be connected.
-function _sdocConnModeRadioHtml(mode) {
-    var choices = [
-        { v: 'folder', icon: UI_ICONS.folder, label: t('Local folder') },
-        { v: 'github', icon: UI_ICONS.git, label: t('GitHub repo') }
-    ];
-    var html = '<div class="radio-group radio-group-small sdoc-access-radio sdoc-conn-mode" role="radiogroup" aria-label="' + _sdsEsc(t('Document source')) + '"' +
-        ' onclick="event.stopPropagation()" onkeydown="sdocSrcModeKeydown(event)">';
-    choices.forEach(function(c) {
-        var on = c.v === mode;
-        html += '<div class="radio-option' + (on ? ' selected' : '') + '" role="radio" aria-checked="' + (on ? 'true' : 'false') + '" data-value="' + c.v + '" data-fk="mode:' + c.v + '"' +
-            ' tabindex="' + (on ? '0' : '-1') + '" title="' + _sdsEsc(c.label) + '" onclick="sdocSrcPickMode(this)">' +
-            '<span class="radio-option-icon" aria-hidden="true">' + c.icon + '</span><span>' + _sdsEsc(c.label) + '</span></div>';
-    });
-    return html + '</div>';
-}
-function sdocSrcPickMode(opt) {
-    var v = opt && opt.getAttribute('data-value') === 'github' ? 'github' : 'folder';
-    if (v === sdocSrcState.addMode) return null;
-    sdocSrcState.addMode = v;
-    sdocRenderSourcesStrip();
-    return v === 'github' ? sdocGhLoadRepos() : null;
-}
-function sdocSrcModeKeydown(e) { return _sdocRadioKeydown(e, sdocSrcPickMode); }
 
 // label (and aria) must already be translated: pass t('literal') so the extractor sees it.
 // Same compact button as the Widget Library / file rows (.widget-library-btn, css/19b).
@@ -2162,8 +2212,11 @@ function _sdocRailSelId() {
 }
 function _sdocRailItemHtml(e) {
     var on = _sdocRailSelId() === e.id, aria = e.countText ? e.label + ', ' + e.countText : e.label;
-    var end = e.warn ? '<span class="sdoc-rail-count sdoc-src-warn" aria-hidden="true">' + (UI_ICONS.alert || '!') + '</span>'
-        : (e.count !== '' && e.count != null ? '<span class="sdoc-rail-count" aria-hidden="true">' + _sdsEsc(String(e.count)) + '</span>' : '');
+    // Agent Files with unseen files: a dot after the name (tools/175-agent-files-unseen.js).
+    var unseen = e.type === 'virtual' && typeof afHasUnseen === 'function' && afHasUnseen('');
+    if (unseen) aria += ', ' + t('new');
+    var end = (unseen ? '<span class="af-unseen-dot" title="' + _sdsEsc(t('new')) + '" aria-hidden="true"></span>' : '') + (e.warn ? '<span class="sdoc-rail-count sdoc-src-warn" aria-hidden="true">' + (UI_ICONS.alert || '!') + '</span>'
+        : (e.count !== '' && e.count != null ? '<span class="sdoc-rail-count" aria-hidden="true">' + _sdsEsc(String(e.count)) + '</span>' : ''));
     return '<button type="button" class="sdoc-rail-item' + (e.type === 'pr' ? ' sdoc-rail-pr sdoc-rail-pr--' + _sdsEsc(e.state) : '') + (on ? ' active' : '') + (sdocUploadTarget(e.type === 'virtual' || e.type === 'local' ? (sdocSrcById(e.id) || e) : null) ? ' sdoc-src-drop' : '') + '"' +
         ' data-src-id="' + _sdsEsc(e.id) + '" data-fk="' + _sdsEsc('sel:' + e.id) + '"' + (on ? ' aria-current="true"' : '') +
         ' aria-label="' + _sdsEsc(aria) + '" title="' + _sdsEsc(e.title || e.label) + '" onclick="sdocSelectSource(\'' + sdocJsArg(e.id) + '\')">' +
@@ -2273,79 +2326,121 @@ function _sdocPaneHeadHtml(sel) {
         '</div></div>' + (acts ? '<div class="sdoc-pane-acts">' + acts + '</div>' : '');
 }
 
-// "Add source" modal opened by the rail's + button (#sdoc-add-modal on <body>): one card per
-// source type, then the Local folder / GitHub repo switch (when both are available) with the
-// folder access picker or the repo picker.
+// "Add source" modal opened by the rail's + button (#sdoc-add-modal on <body>), in two steps:
+// 1 · Source type (radio cards: Local folder / GitHub repository), 2 · Configure (Browse… + Agent
+// access, or the repo combobox + branch). The footer's primary button stays disabled until valid.
 // Effective mode ('' when neither kind can be connected).
 function _sdocConnMode() {
-    var canFolder = typeof pickLocalFolder === 'function', canGh = typeof wsClone === 'function';
+    var canFolder = typeof addLocalFolder === 'function', canGh = typeof wsClone === 'function';
     if (!canFolder && !canGh) return '';
     return !canFolder ? 'github' : !canGh ? 'folder' : sdocSrcState.addMode === 'github' ? 'github' : 'folder';
 }
-// Source-type cards: icon, title, one-line description, "N connected" status and a primary button.
-function _sdocAddCardList(mode) {
-    var nRead = 0, nRw = 0, nWs = 0, files = null;
-    (sdocSrcState.sources || []).forEach(function(s) {
-        if (s.type === 'local') { if (s.access === 'readwrite') nRw++; else nRead++; }
-        else if (s.type === 'ws') nWs++;
-        else if (s.type === 'virtual') files = s;
+// Typed repo → { repo ('' = invalid), branch (from a /tree/<branch> URL), raw }. Accepts
+// owner/repo, github.com/owner/repo and full URLs (only the first two path segments count).
+function sdocGhNormRepo(s) {
+    var v = String(s || '').trim(), branch = '', url = /^(https?:\/\/[^\/]+\/|(www\.)?github\.com\/)/i;
+    if (url.test(v)) {
+        var seg = v.replace(url, '').split(/[?#]/)[0].split('/').filter(Boolean);
+        v = seg.length >= 2 ? seg[0] + '/' + seg[1].replace(/\.git$/i, '') : seg.join('/');
+        if (seg[2] === 'tree' && seg[3]) branch = seg[3];
+    } else v = v.replace(/\/+$/, '').replace(/\.git$/i, '');
+    return { repo: /^[\w.-]+\/[\w.-]+$/.test(v) ? v : '', branch: branch, raw: v };
+}
+function _sdocAddAccHint(access) {
+    return access === 'readwrite'
+        ? t('The agent can also create, edit and delete files. Your browser will ask to allow editing.')
+        : t('The agent can list and read files but not change them.');
+}
+// Step 1: one radio card per connectable type, with a sibling "N connected" link (never inside role=radio).
+function _sdocAddTypeList() {
+    var n = { local: 0, ws: 0 }, list = [];
+    (sdocSrcState.sources || []).forEach(function(s) { if (s && (s.type === 'local' || s.type === 'ws')) n[s.type]++; });
+    if (typeof addLocalFolder === 'function') list.push({ v: 'folder', tile: 'local', show: 'local', n: n.local, title: t('Local folder'), desc: t('A folder on this computer, read only or read & write.') });
+    if (typeof wsClone === 'function') list.push({ v: 'github', tile: 'ws', show: 'ws', n: n.ws, title: t('GitHub repository'), desc: t('Clone a repository so the agent can browse and edit its files.') });
+    return list;
+}
+function _sdocAddTypesHtml(mode) {
+    var html = '<div class="sdoc-add-types" role="radiogroup" aria-labelledby="sdoc-add-type-h" onkeydown="sdocAddTypeKeydown(event)">';
+    _sdocAddTypeList().forEach(function(c) {
+        var on = c.v === mode, id = 'sdoc-add-type-' + c.v;
+        html += '<div class="sdoc-add-type' + (on ? ' is-selected' : '') + '">' +
+            '<div class="sdoc-add-type-radio" role="radio" aria-checked="' + (on ? 'true' : 'false') + '" data-value="' + c.v + '" data-fk="type:' + c.v + '"' +
+                ' tabindex="' + (on ? '0' : '-1') + '" aria-labelledby="' + id + '-t" aria-describedby="' + id + '-d" onclick="sdocAddPickType(this)">' +
+                _sdocTileHtml(c.tile, true) +
+                '<span class="sdoc-add-type-text"><span class="sdoc-add-type-title" id="' + id + '-t">' + _sdsEsc(c.title) + '</span>' +
+                '<span class="sdoc-add-type-desc" id="' + id + '-d">' + _sdsEsc(c.desc) + '</span></span>' +
+                '<span class="sdoc-add-type-check" aria-hidden="true">' + _sdsIco(UI_ICONS.check) + '</span></div>' +
+            (c.n ? '<button type="button" class="sdoc-gh-link sdoc-add-type-n" data-fk="add:show:' + c.show + '" onclick="event.stopPropagation(); sdocAddShowConnected(\'' + c.show + '\')">' +
+                _sdsEsc(tn(c.n, '{count} connected', '{count} connected')) + '</button>' : '') +
+            '</div>';
     });
-    var cards = [], busy = !!sdocSrcState.addBusy;
-    if (typeof pickLocalFolder === 'function') {
-        cards.push({ k: 'read', tile: 'local', icon: UI_ICONS.lock, title: t('Read-only folder'), desc: t('The agent can list and read files in a folder on this computer.'), n: nRead, btn: t('Choose folder\u2026'), busy: busy, active: mode === 'folder' && sdocSrcState.addAccess !== 'readwrite' });
-        cards.push({ k: 'readwrite', tile: 'local', icon: UI_ICONS.edit, title: t('Read & write folder'), desc: t('The agent can also create, edit and delete files in the folder.'), n: nRw, btn: t('Choose folder\u2026'), busy: busy, active: mode === 'folder' && sdocSrcState.addAccess === 'readwrite' });
-    }
-    if (typeof wsClone === 'function') {
-        cards.push({ k: 'github', tile: 'ws', icon: UI_ICONS.gitBranch, title: t('GitHub repository'), desc: t('Clone a repository so the agent can browse and edit its files.'), n: nWs, btn: t('Choose repo'), busy: !!(typeof sdocGhState !== 'undefined' && sdocGhState && sdocGhState.busy), active: mode === 'github' });
-    }
-    // Title = the source's own label, same as the rail item ("Agent Files").
-    if (files) cards.push({ k: 'files', tile: 'virtual', icon: UI_ICONS.storage, title: files.label, desc: t('Built-in storage for uploads and files the agent creates.'), connected: true, btn: t('Open') });
-    return cards;
+    return html + '</div>';
 }
-function _sdocAddCardHtml(c) {
-    var id = 'sdoc-add-card-' + c.k, status = c.connected ? t('Connected') : c.n ? tn(c.n, '{count} connected', '{count} connected') : '';
-    var btnLbl = c.busy ? t('Connecting\u2026') : c.btn;
-    return '<li class="sdoc-add-card' + (c.active ? ' is-active' : '') + (status ? ' is-connected' : '') + '" data-card="' + c.k + '">' +
-        '<div class="sdoc-add-card-head">' + _sdocTileHtml(c.tile, true) +
-            '<div class="sdoc-add-card-text"><h3 class="sdoc-add-card-title" id="' + id + '-t">' + _sdsIco(c.icon) + '<span>' + _sdsEsc(c.title) + '</span></h3>' +
-            '<p class="sdoc-add-card-desc" id="' + id + '-d">' + _sdsEsc(c.desc) + '</p></div></div>' +
-        '<div class="sdoc-add-card-foot">' + (status ? '<span class="sdoc-add-card-status">' + _sdsIco(UI_ICONS.check) + '<span>' + _sdsEsc(status) + '</span></span>' : '<span></span>') +
-            '<button type="button" class="widget-library-btn sdoc-src-btn sdoc-src-btn-primary sdoc-add-card-btn" data-fk="card:' + c.k + '"' +
-            ' aria-labelledby="' + id + '-b ' + id + '-t" aria-describedby="' + id + '-d"' + (c.busy ? _SDOC_BUSY_ATTR : '') +
-            ' onclick="event.stopPropagation(); sdocAddPickCard(\'' + c.k + '\')"><span id="' + id + '-b">' + _sdsEsc(btnLbl) + '</span></button></div></li>';
-}
-function _sdocAddPopHtml(mode) {
-    var modeHtml = typeof pickLocalFolder === 'function' && typeof wsClone === 'function' ? _sdocConnModeRadioHtml(mode) : '';
-    var cancel = _sdocSrcBtn(t('Cancel'), 'sdocAddClose(true)', 'add:cancel');
-    var body;
+// Step 2: the selected type's fields.
+function _sdocAddConfigHtml(mode) {
     if (mode === 'folder') {
-        body = '<div class="sdoc-add-label">' + _sdsEsc(_sdsT('Access')) + '</div>' +
-            _sdocAccessRadioHtml({ folderId: null, access: sdocSrcState.addAccess }) +
-            '<p class="sdoc-add-hint">' + _sdsEsc(_sdsT("You'll choose the folder in the next step.")) + '</p>' +
-            '<div class="sdoc-add-foot">' + cancel + _sdocSrcBtn(t('Choose folder\u2026'), 'sdocSrcConnect()', 'connect', 'sdoc-src-btn-primary') + '</div>';
-    } else {
-        // No fetch here: sdocAddToggle / sdocSrcPickMode / the input's focus / Retry start it.
-        var g = sdocGhState, c = _sdocGhCombo(), hint = _sdocGhHintHtml();
-        // Combobox with list autocomplete (WAI-ARIA APG): focus stays in the input,
-        // the highlighted option is aria-activedescendant (sdocGhRepoKeydown). The listbox and its
-        // options swallow mousedown so a press on an option, the scrollbar or padding never blurs the input.
-        // The listbox and the transient hint share an overlay popup anchored under the input (.sdoc-gh-combo).
-        body = '<div class="sdoc-gh-combo">' +
-        '<input type="search" role="combobox" class="sdoc-gh-input sdoc-gh-repo" data-fk="gh:repo" autocomplete="off" spellcheck="false" placeholder="owner/repo"' +
-            ' aria-label="' + _sdsEsc(t('Repository (owner/repo)')) + '" aria-autocomplete="list" aria-controls="sdoc-gh-list" aria-expanded="' + (c.expanded ? 'true' : 'false') + '"' +
+        var h = sdocSrcState.addHandle, acc = sdocSrcState.addAccess === 'readwrite' ? 'readwrite' : 'read';
+        return '<div class="form-label" id="sdoc-add-folder-l">' + _sdsEsc(t('Folder')) + '</div>' +
+            '<div class="sdoc-add-folder-row"><span class="sdoc-add-folder-name' + (h ? '' : ' is-empty') + '" id="sdoc-add-folder-name">' +
+                _sdsIco(UI_ICONS.folder) + '<span>' + _sdsEsc(h ? h.name : t('No folder selected')) + '</span></span>' +
+            '<button type="button" class="modal-btn secondary sdoc-add-browse" data-fk="add:browse" aria-describedby="sdoc-add-folder-l sdoc-add-folder-name"' +
+                (sdocSrcState.addBusy ? ' disabled' : '') + ' onclick="event.stopPropagation(); sdocAddBrowse()">' + _sdsEsc(t('Browse\u2026')) + '</button></div>' +
+            '<div class="form-label" id="sdoc-add-acc-l">' + _sdsEsc(t('Agent access')) + '</div>' +
+            _sdocAccessRadioHtml({ folderId: null, access: acc }) +
+            '<p class="sdoc-add-hint" id="sdoc-add-acc-hint">' + _sdsEsc(_sdocAddAccHint(acc)) + '</p>';
+    }
+    // No fetch here: sdocAddToggle / sdocAddPickType / the input's focus / Retry start it.
+    var g = sdocGhState, c = _sdocGhCombo(), hint = _sdocGhHintHtml();
+    // Combobox with list autocomplete (WAI-ARIA APG): focus stays in the input,
+    // the highlighted option is aria-activedescendant (sdocGhRepoKeydown). The listbox and its
+    // options swallow mousedown so a press on an option, the scrollbar or padding never blurs the input.
+    // The listbox and the transient hint share an overlay popup anchored under the input (.sdoc-gh-combo).
+    return '<label class="form-label" for="sdoc-gh-repo-in">' + _sdsEsc(t('Repository')) + '</label>' +
+        '<div class="sdoc-gh-combo">' +
+        '<input type="search" role="combobox" id="sdoc-gh-repo-in" class="sdoc-gh-input sdoc-gh-repo" data-fk="gh:repo" autocomplete="off" spellcheck="false"' +
+            ' placeholder="' + _sdsEsc(t('owner/repo or https://github.com/owner/repo')) + '" aria-describedby="sdoc-add-gh-note"' +
+            ' aria-autocomplete="list" aria-controls="sdoc-gh-list" aria-expanded="' + (c.expanded ? 'true' : 'false') + '"' +
             (c.activeId ? ' aria-activedescendant="' + _sdsEsc(c.activeId) + '"' : '') + ' value="' + _sdsEsc(g.query) + '"' +
             ' oninput="sdocGhInput(this)" onfocus="sdocGhLoadRepos()" onblur="sdocGhRepoBlur()" onkeydown="sdocGhRepoKeydown(event)">' +
         '<div class="sdoc-gh-pop" id="sdoc-gh-pop" onmousedown="event.preventDefault()"' + (_sdocGhPopOpen(c, hint) ? '' : ' hidden') + '>' +
             '<div class="sdoc-gh-list" id="sdoc-gh-list" role="listbox" aria-label="' + _sdsEsc(t('Your repositories')) + '" onmousedown="event.preventDefault()"' + (c.expanded ? '' : ' hidden') + '>' + c.html + '</div>' +
             '<div class="sdoc-gh-hint" id="sdoc-gh-hint">' + hint + '</div></div>' +
-            '</div>' +
+        '</div>' +
+        '<p class="sdoc-add-hint" id="sdoc-add-gh-note">' + _sdsEsc(t('Private repos use your connected GitHub token.')) + '</p>' +
         _sdocGhNoteBoxHtml() +
-        '<input type="text" class="sdoc-gh-input sdoc-gh-branch" data-fk="gh:branch" autocomplete="off" spellcheck="false"' +
-            ' placeholder="' + _sdsEsc(t('Branch (optional)')) + '" aria-label="' + _sdsEsc(t('Branch (optional)')) + '" value="' + _sdsEsc(g.branch) + '"' +
+        '<label class="form-label" for="sdoc-gh-branch-in">' + _sdsEsc(t('Branch')) +
+            ' <span class="sdoc-add-opt">' + _sdsEsc(t("\u00B7 optional, defaults to the repo's default branch")) + '</span></label>' +
+        '<input type="text" id="sdoc-gh-branch-in" class="sdoc-gh-input sdoc-gh-branch" data-fk="gh:branch" autocomplete="off" spellcheck="false"' +
+            ' placeholder="' + _sdsEsc(t('Default branch')) + '" value="' + _sdsEsc(g.branch) + '"' +
             ' oninput="sdocGhBranchInput(this)" onkeydown="sdocGhKeydown(event)">' +
-        '<div class="sdoc-gh-status" id="sdoc-gh-status" role="status" aria-live="polite">' + _sdocGhStatusHtml() + '</div>' +
-            '<div class="sdoc-add-foot">' + cancel + _sdocSrcBtn(t('Clone repo'), 'sdocSrcConnectRepo()', 'connect-gh', 'sdoc-src-btn-primary', '', '', g.busy) + '</div>';
-    }
+        '<div class="sdoc-gh-status" id="sdoc-gh-status" role="status" aria-live="polite">' + _sdocGhStatusHtml() + '</div>';
+}
+// Primary enabled only when valid: folder = a picked handle; GitHub = a parseable repo. Never while busy.
+function _sdocAddPrimaryOk(mode) {
+    if (mode === 'github') return !!sdocGhNormRepo(sdocGhState.query).repo && !sdocGhState.busy;
+    return !!sdocSrcState.addHandle && !sdocSrcState.addBusy;
+}
+// Live toggle for partial updates (typing, picking, busy end) that skip the full re-render.
+function _sdocAddSyncPrimary() {
+    if (typeof document === 'undefined') return;
+    var pop = document.getElementById('sdoc-add-pop'), b = pop && pop.querySelector('[data-fk="connect-gh"], [data-fk="connect"]');
+    if (b) b.disabled = !_sdocAddPrimaryOk(_sdocConnMode());
+}
+function _sdocAddFootHtml(mode) {
+    var files = (sdocSrcState.sources || []).find(function(s) { return s && s.type === 'virtual'; });
+    var gh = mode === 'github', busy = gh ? !!sdocGhState.busy : !!sdocSrcState.addBusy;
+    var lbl = gh ? (busy ? t('Cloning\u2026') : t('Clone repository')) : (busy ? t('Connecting\u2026') : t('Connect folder'));
+    var note = files ? '<p class="sdoc-add-foot-note">' + _sdsIco(UI_ICONS.check) +
+        '<span>' + _sdsEsc(t('{name} is always available', { name: files.label })) + ' \u00B7 </span>' +
+        '<button type="button" class="sdoc-gh-link" data-fk="add:files" onclick="event.stopPropagation(); sdocAddOpenFiles()">' + _sdsEsc(t('Open')) + '</button></p>' : '<span></span>';
+    return '<div class="sdoc-add-foot">' + note + '<div class="sdoc-add-foot-btns">' +
+        '<button type="button" class="modal-btn secondary" data-fk="add:cancel" onclick="event.stopPropagation(); sdocAddClose(true)">' + _sdsEsc(t('Cancel')) + '</button>' +
+        '<button type="button" class="modal-btn primary sdoc-add-primary" data-fk="' + (gh ? 'connect-gh' : 'connect') + '"' +
+            (_sdocAddPrimaryOk(mode) ? '' : ' disabled') + (busy ? ' aria-busy="true"' : '') +
+            ' onclick="event.stopPropagation(); ' + (gh ? 'sdocSrcConnectRepo()' : 'sdocSrcConnect()') + '">' + _sdsEsc(lbl) + '</button>' +
+        '</div></div>';
+}
+function _sdocAddPopHtml(mode) {
     var err = sdocSrcState.addErr ? '<div class="sdoc-add-err" role="alert">' + _sdsIco(UI_ICONS.alert) + '<span>' + _sdsEsc(sdocSrcState.addErr) + '</span></div>' : '';
     var closeLbl = _sdsEsc(t('Close'));
     return '<div class="modal-dialog sdoc-add-dialog" id="sdoc-add-pop" role="dialog" aria-modal="true" aria-labelledby="sdoc-add-title" aria-describedby="sdoc-add-sub"' +
@@ -2354,9 +2449,9 @@ function _sdocAddPopHtml(mode) {
             '<p class="sdoc-add-sub" id="sdoc-add-sub">' + _sdsEsc(t('Connect a folder or a repository as a document source.')) + '</p></div>' +
             '<button type="button" class="sdoc-add-x" data-fk="add:x" title="' + closeLbl + '" aria-label="' + closeLbl + '" onclick="event.stopPropagation(); sdocAddClose(true)">' + (UI_ICONS.close || '\u00D7') + '</button></div>' +
         '<div class="modal-body sdoc-add-body">' + err +
-            '<ul class="sdoc-add-cards" aria-label="' + _sdsEsc(t('Source types')) + '">' + _sdocAddCardList(mode).map(_sdocAddCardHtml).join('') + '</ul>' +
-            '<section class="sdoc-add-details" aria-labelledby="sdoc-add-opts"><h3 class="sdoc-add-label" id="sdoc-add-opts">' + _sdsEsc(t('Options')) + '</h3>' + modeHtml + body + '</section>' +
-        '</div></div>';
+            '<section class="sdoc-add-step" aria-labelledby="sdoc-add-type-h"><h3 class="sdoc-add-label" id="sdoc-add-type-h">' + _sdsEsc(t('1 \u00B7 Source type')) + '</h3>' + _sdocAddTypesHtml(mode) + '</section>' +
+            '<section class="sdoc-add-step sdoc-add-config" aria-labelledby="sdoc-add-config-h"><h3 class="sdoc-add-label" id="sdoc-add-config-h">' + _sdsEsc(t('2 \u00B7 Configure')) + '</h3>' + _sdocAddConfigHtml(mode) + '</section>' +
+        '</div>' + _sdocAddFootHtml(mode) + '</div>';
 }
 // Mounts / refreshes / removes the modal on <body> from sdocSrcState.addOpen (every strip re-render
 // calls this, so the existing refresh paths keep the modal in sync). DOM-only: no-op in the service worker.
@@ -2391,33 +2486,54 @@ function _sdocAddFocusables(root) {
         return !el.disabled && el.getAttribute('tabindex') !== '-1' && !(el.closest && el.closest('[hidden]'));
     });
 }
-// Card buttons: folder cards open the folder picker right away (synchronously, inside the gesture);
-// GitHub switches the options to the repo picker; Agent Files selects the built-in source.
-function sdocAddPickCard(kind) {
-    if (kind === 'files') { sdocAddClose(false); return sdocSelectSource('lf:virtual'); }
-    if (kind === 'github') {
-        if (sdocSrcState.addMode !== 'github') { sdocSrcState.addMode = 'github'; sdocRenderSourcesStrip(); }
-        var inp = typeof document !== 'undefined' ? document.querySelector('#sdoc-add-pop .sdoc-gh-repo') : null;
-        if (inp && typeof inp.focus === 'function') inp.focus();
-        return sdocGhLoadRepos();
+// Step 1 radio cards (click / Enter / Space / arrows). GitHub starts the repo list fetch.
+function sdocAddPickType(opt) {
+    var v = opt && opt.getAttribute('data-value') === 'github' ? 'github' : 'folder';
+    if (v === _sdocConnMode()) return null;
+    sdocSrcState.addMode = v; sdocSrcState.addErr = '';
+    sdocRenderSourcesStrip();
+    return v === 'github' ? sdocGhLoadRepos() : null;
+}
+function sdocAddTypeKeydown(e) { return _sdocRadioKeydown(e, sdocAddPickType, '.sdoc-add-type-radio'); }
+// "N connected": close and reveal the first connected source of that type in the rail.
+function sdocAddShowConnected(type) {
+    var s = (sdocSrcState.sources || []).find(function(x) { return x && x.type === type; });
+    sdocAddClose(false);
+    return s ? sdocSelectSource(s.id) : null;
+}
+function sdocAddOpenFiles() { sdocAddClose(false); return sdocSelectSource('lf:virtual'); }
+// Browse…: only picks (and remembers) the handle; "Connect folder" adds it. Picker inside the click's activation.
+function sdocAddBrowse() {
+    var w = typeof window !== 'undefined' ? window : null, p;
+    if (!w || typeof w.showDirectoryPicker !== 'function') {
+        sdocSrcState.addErr = t('This browser cannot open a folder picker.'); _sdocAddModalRender(); return Promise.resolve(null);
     }
-    sdocSrcState.addMode = 'folder';
-    sdocSrcState.addAccess = kind === 'readwrite' ? 'readwrite' : 'read';
-    return sdocSrcConnect();
+    var mode = sdocSrcState.addAccess === 'readwrite' ? 'readwrite' : 'read';
+    try { p = w.showDirectoryPicker({ id: 'appagent-connected-folder', mode: mode }); } catch (e) { p = Promise.reject(e); }
+    return Promise.resolve(p).then(function(h) {
+        if (!h) return null;
+        sdocSrcState.addHandle = h; sdocSrcState.addErr = '';
+        _sdocAddModalRender();
+        return h;
+    }, function(e) {
+        if (e && e.name === 'AbortError') return null; // picker cancelled
+        sdocSrcState.addErr = t('Could not open the folder') + ': ' + String((e && e.message) || e); _sdocAddModalRender();
+        return null;
+    });
 }
 function sdocAddToggle() {
     if (sdocSrcState.addOpen) return sdocAddClose(true);
     sdocSrcState.addOpen = true; sdocSrcState.addErr = '';
     sdocRenderSourcesStrip();
     var pop = document.getElementById('sdoc-add-pop');
-    // Initial focus: the first card button, else the first control (document order).
-    var f = pop && (pop.querySelector('.sdoc-add-card-btn:not([disabled])') || _sdocAddFocusables(pop)[0]);
+    // Initial focus: the checked source-type card, else the first control (document order).
+    var f = pop && (pop.querySelector('.sdoc-add-type-radio[aria-checked="true"]') || _sdocAddFocusables(pop)[0]);
     if (f && typeof f.focus === 'function') f.focus();
     return _sdocConnMode() === 'github' ? sdocGhLoadRepos() : null;
 }
 function sdocAddClose(restoreFocus) {
     if (!sdocSrcState.addOpen) return null;
-    sdocSrcState.addOpen = false; sdocSrcState.addErr = '';
+    sdocSrcState.addOpen = false; sdocSrcState.addErr = ''; sdocSrcState.addHandle = null;
     sdocRenderSourcesStrip();
     _sdocAddModalRender(); // removes the overlay even when the strip host is gone
     if (restoreFocus) { var b = document.querySelector('.sdoc-rail-add'); if (b && typeof b.focus === 'function') b.focus(); }
@@ -2550,9 +2666,17 @@ function sdocGhInput(el) {
     var g = sdocGhState;
     g.query = el ? el.value : ''; g.open = true; g.active = null;
     if (g.status && g.status.kind === 'error') _sdocGhSetStatus(null);
+    // A pasted .../tree/<branch> URL pre-fills a blank (or previously auto-filled) branch.
+    var nb = sdocGhNormRepo(g.query).branch;
+    if (nb ? (!g.branch || g.branchAuto) : g.branchAuto) {
+        g.branch = nb; g.branchAuto = !!nb;
+        var bi = document.querySelector('.sdoc-gh-branch');
+        if (bi) bi.value = nb;
+    }
     _sdocGhRefreshList();
+    _sdocAddSyncPrimary();
 }
-function sdocGhBranchInput(el) { sdocGhState.branch = el ? el.value : ''; }
+function sdocGhBranchInput(el) { sdocGhState.branch = el ? el.value : ''; sdocGhState.branchAuto = false; }
 // Blur collapses the listbox, deferred: a re-render that restores focus to the
 // (new) input, or a pick (options keep focus via mousedown preventDefault), keeps it.
 function sdocGhRepoBlur() {
@@ -2575,6 +2699,7 @@ function _sdocGhPickFull(full) {
     if (inp) inp.value = full;
     _sdocGhSetStatus(null);
     _sdocGhRefreshList();
+    _sdocAddSyncPrimary();
     var b = document.querySelector('.sdoc-gh-branch');
     if (b) { try { b.focus(); } catch (e) {} }
 }
@@ -2737,7 +2862,7 @@ function _sdocSetBusyBtns(fks, on) {
         if (on) b.setAttribute('aria-busy', 'true'); else b.removeAttribute('aria-busy');
     });
 }
-function _sdocGhSetBusy(on) { sdocGhState.busy = !!on; _sdocSetBusyBtns(['connect-gh'], on); }
+function _sdocGhSetBusy(on) { sdocGhState.busy = !!on; _sdocSetBusyBtns(['connect-gh'], on); if (!on) _sdocAddSyncPrimary(); }
 // An existing workspace repo equal to repo ignoring case (its casing), else repo.
 function _sdocGhWsCanonRepo(repo) {
     var lo = String(repo).toLowerCase(), hit = (sdocSrcState.sources || []).find(function(s) {
@@ -2748,15 +2873,15 @@ function _sdocGhWsCanonRepo(repo) {
 // Clone the typed / picked repo (read-only source; never a local_folder).
 async function sdocSrcConnectRepo() {
     var g = sdocGhState;
-    var repo = String(g.query || '').trim().replace(/^https?:\/\/[^\/]+\//i, '').replace(/\.git$/i, '').replace(/\/+$/, '');
+    var norm = sdocGhNormRepo(g.query), repo = norm.repo || norm.raw;
     if (!repo) { _sdocGhSetStatus({ kind: 'error', text: t('Enter a repo (owner/repo)') }); return null; }
-    if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) { _sdocGhSetStatus({ kind: 'error', text: t('Format: owner/repo') }); return null; }
+    if (!norm.repo) { _sdocGhSetStatus({ kind: 'error', text: t('Format: owner/repo') }); return null; }
     if (g.busy || typeof wsClone !== 'function') return null;
     var picked = (g.repos || []).find(function(r) { return r.full.toLowerCase() === repo.toLowerCase(); });
     // Canonical case: "Octo/Alpha" typed clones as GitHub's "octo/alpha" (one workspace key, one card).
     if (picked) repo = picked.full;
     // Blank branch: the picked repo's default branch, else GitHub's default_branch (lookup below).
-    var branch = String(g.branch || '').trim() || (picked && picked.def) || undefined;
+    var branch = String(g.branch || '').trim() || norm.branch || (picked && picked.def) || undefined;
     _sdocGhSetBusy(true);
     try {
         // Not in the list (unlisted, or the list is loading / failed): always look the
@@ -2919,6 +3044,8 @@ function sdocSrcListing(src, path, recursive) {
               function(e) { cache[key] = { entries: [], error: String((e && e.message) || e), needsGrant: !!(e && e.code === 'PERMISSION_REQUIRED') }; })
         .then(function() {
             if (cache !== sdocSrcState.listings) return; // reset while loading: the stale result stays in the dropped cache
+            // A fresh Agent Files listing (after upload / delete / reopen) re-scans the unseen set.
+            if (src.type === 'virtual' && typeof afScheduleRefresh === 'function') afScheduleRefresh();
             sdocRenderSourcesStrip(); renderDocumentsPageItems();
         });
     return null;
@@ -3014,7 +3141,10 @@ function sdocWsInfoHtml(info, compact) {
 // Past SDOC_DIFF_MAX_CELLS the middle becomes one removed block + one added block.
 var SDOC_DIFF_MAX_CELLS = 4000000;
 function sdocLineDiff(oldText, newText) {
-    var a = oldText ? String(oldText).split('\n') : [], b = newText ? String(newText).split('\n') : [], out = [];
+    return _sdocLineDiffArr(oldText ? String(oldText).split('\n') : [], newText ? String(newText).split('\n') : []);
+}
+function _sdocLineDiffArr(a, b) {
+    var out = [];
     function push(type, line) { var last = out[out.length - 1]; if (last && last.type === type) last.lines.push(line); else out.push({ type: type, lines: [line] }); }
     var pre = 0, suf = 0;
     while (pre < a.length && pre < b.length && a[pre] === b[pre]) pre++;
@@ -3381,11 +3511,13 @@ function buildDocumentsFileItem(row, idx) {
         (e.change ? ' \u00B7 ' + sdocWsChangeBadgeHtml(e.change) : e.dirty ? ' \u00B7 <span class="sdoc-src-dirty">' + _sdsEsc(t('modified')) + '</span>' : '');
     // Every file and folder row gets a checkbox (a folder stands for all its descendants).
     var selKey = sdocSelKeyOf({ kind: 'file', row: row }), picked = !!selKey && sdocSelection.has(selKey);
-    var html = '<div class="widget-library-item sdoc-lib-item sdoc-file-item' + (e.kind === 'directory' ? ' is-folder' : '') + (picked ? ' is-selected' : '') + (e.change ? ' sdoc-ws-change-' + e.change : '') + '" data-src-id="' + _sdsEsc(src.id) + '" data-path="' + _sdsEsc(e.path) + '" data-row-idx="' + idx + '"' + (selKey ? ' data-sel-key="' + _sdsEsc(selKey) + '"' : '') + ' role="button" tabindex="0"' +
+    // Unseen Agent Files (or a folder holding one): bold name + dot (tools/175-agent-files-unseen.js).
+    var unseen = src.type === 'virtual' && typeof afIsPathUnseen === 'function' && (e.kind === 'directory' ? afHasUnseen(e.path) : afIsPathUnseen(e.path));
+    var html = '<div class="widget-library-item sdoc-lib-item sdoc-file-item' + (e.kind === 'directory' ? ' is-folder' : '') + (picked ? ' is-selected' : '') + (unseen ? ' af-unseen' : '') + (e.change ? ' sdoc-ws-change-' + e.change : '') + '" data-src-id="' + _sdsEsc(src.id) + '" data-path="' + _sdsEsc(e.path) + '" data-row-idx="' + idx + '"' + (selKey ? ' data-sel-key="' + _sdsEsc(selKey) + '"' : '') + ' role="button" tabindex="0"' +
         ' title="' + _sdsEsc(e.path) + '" onclick="sdocOpenFileRow(' + idx + ')" onkeydown="sdocFileRowKey(event, ' + idx + ')">' +
         (selKey ? _sdocSelCheckHtml(selKey, e.name, picked) : '') +
         '<div class="sdoc-lib-icon sdoc-file-icon sdoc-ft-' + ft.kind + '"' + (sdocThumbEligible(e) ? ' data-thumb="1"' : '') + ' aria-hidden="true">' + sdocFileIcon(e) + '</div>' +
-        '<div class="sdoc-lib-info"><div class="widget-library-title sdoc-lib-title">' + _sdsEsc(e.name) + '</div>' +
+        '<div class="sdoc-lib-info"><div class="widget-library-title sdoc-lib-title">' + (unseen ? '<span class="af-unseen-dot" aria-hidden="true"></span><span class="sdoc-sr">' + _sdsEsc(t('new')) + ' </span>' : '') + _sdsEsc(e.name) + '</div>' +
         '<div class="widget-library-meta sdoc-lib-meta"><span class="sdoc-lib-stat">' + meta + '</span>' +
         // mtime is its own non-shrinking stat: the wrapping meta row moves it to a new line at narrow
         // widths instead of the ellipsis of the source/size stat clipping it away.
@@ -3663,6 +3795,7 @@ async function sdocPreviewFile(src, path) {
                 : '<pre class="wsf-code">' + _sdsEsc(String(rec.content || '').slice(0, 200000)) + '</pre>'), opts);
         }
         var g = await lfGetFile(src.folderId, path);
+        if (src.type === 'virtual' && typeof afMarkSeen === 'function') afMarkSeen(path, g.file && g.file.lastModified);
         var kind = sdocPreviewKind(g.name, g.mime);
         var head = '<div class="wsf-file-meta">' + _sdsEsc(src.label) + ' \u00B7 ' + _sdsEsc(_sdsSize(g.size)) + ' \u00B7 ' + _sdsEsc(g.mime) + '</div>';
         var tooBig = function() { return _sdocOverlay(path, head + sdocNoPreviewHtml(t('Too large to preview ({size}).', { size: _sdsSize(g.size) }), objUrl(g.file), g.name), opts); };
@@ -3842,6 +3975,8 @@ async function sdocUploadToSource(src, fileList, opts) {
         try {
             if (typeof lfWriteFileBytes !== 'function') throw new Error(_sdsT('Connected folders are not available in this build.'));
             await lfWriteFileBytes(tg.folderId, tg.dir ? tg.dir + '/' + name : name, new Uint8Array(await f.arrayBuffer()));
+            // The user's own upload is never "new" to them.
+            if (src.type === 'virtual' && typeof afMarkSeen === 'function') afMarkSeen(tg.dir ? tg.dir + '/' + name : name, Date.now());
             taken.add(name); ok++;
         } catch (e) { failed.push(f.name + ' (' + String((e && e.message) || e) + ')'); }
     }
@@ -3922,18 +4057,28 @@ function sdocBindAgentFilesDrop(host) {
         // otherwise (read-only folder, unknown source): ignore, no write.
     });
 }
+// "Connect folder": adds the handle picked by Browse…. Read & write asks for write permission
+// synchronously, inside this click's user activation (before any await).
 function sdocSrcConnect() {
     var access = sdocSrcState.addAccess === 'readwrite' ? 'readwrite' : 'read';
-    var p;
+    var h = sdocSrcState.addHandle, p;
     sdocSrcState.addErr = '';
-    // pickLocalFolder first: the directory picker needs the click's user activation.
-    try { p = pickLocalFolder(access, ''); } catch (e) { p = Promise.reject(e); }
+    if (!h) { sdocSrcState.addErr = t('Choose a folder first.'); _sdocAddModalRender(); return Promise.resolve(null); }
+    if (sdocSrcState.addBusy) return Promise.resolve(null);
+    try {
+        if (typeof addLocalFolder !== 'function') throw new Error(t('Local folders are not available here.'));
+        var perm = access === 'readwrite' && typeof h.requestPermission === 'function' ? h.requestPermission({ mode: 'readwrite' }) : null;
+        p = Promise.resolve(perm).then(function(state) {
+            if (perm && state !== 'granted') throw new Error(t('Write access was not granted ({state}).', { state: state }));
+            return addLocalFolder(h, { access: access, label: '' });
+        });
+    } catch (e) { p = Promise.reject(e); }
     sdocSrcState.addBusy = true; _sdocAddModalRender();
-    return Promise.resolve(p).then(function(entry) {
+    return p.then(function(entry) {
         sdocSrcState.addBusy = false;
         if (entry) {
-            // Close the add-source popover and select (and persist) the new folder.
-            sdocSrcState.addOpen = false; sdocSrcState.sel = 'lf:' + entry.id; sdocSrcState.path = '';
+            // Close the add-source dialog and select (and persist) the new folder.
+            sdocSrcState.addOpen = false; sdocSrcState.addHandle = null; sdocSrcState.sel = 'lf:' + entry.id; sdocSrcState.path = '';
             try { if (typeof appStorage !== 'undefined' && appStorage) appStorage.setItem('documentsPageSource', sdocSrcState.sel); } catch (e) {}
             if (typeof showSnackbar === 'function') showSnackbar(_sdsT('Connected {folder}', { folder: entry.label }), 'success');
         }

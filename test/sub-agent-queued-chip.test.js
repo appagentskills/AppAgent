@@ -130,7 +130,7 @@ describe('queued worker chip (ui/175)', function() {
     test('_chipKey changes on dequeue and stays legacy-identical when not queued', async function() {
         var R = await loadReg({ root: { messages: [] } });
         var ui = await loadUi(R.SA);
-        var chipKey = await chipKeyFn({ SubAgents: R.SA, currentChatId: 'root', chats: { root: { messages: [] } }, _subIsQueued: ui._subIsQueued });
+        var chipKey = await chipKeyFn({ SubAgents: R.SA, currentChatId: 'root', chats: { root: { messages: [] } }, _subIsQueued: ui._subIsQueued, _subIsPaused: ui._subIsPaused });
         R.SA.applySnapshot([rec()], { queue_ids: ['a1'] });
         var k1 = chipKey();
         R.SA.applySnapshot([rec()], { queue_ids: [] });

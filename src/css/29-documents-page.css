@@ -82,27 +82,42 @@
 .sdoc-add-sub { margin: var(--space-1) 0 0; font-size: var(--text-caption); font-weight: var(--font-normal); color: var(--text-secondary); }
 .sdoc-add-x { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; padding: 0; border: none; border-radius: var(--radius-md); background: transparent; color: var(--text-secondary); cursor: pointer; }
 .sdoc-add-x:hover { background: var(--secondary-light); color: var(--text-primary); }
-.sdoc-add-x:focus-visible, .sdoc-add-card-btn:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.sdoc-add-x:focus-visible, .sdoc-add-type-radio:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
 .sdoc-add-x .ui-icon { width: 16px; height: 16px; }
 .sdoc-add-body { display: flex; flex-direction: column; gap: var(--space-6); padding: var(--space-8); overflow-y: auto; font-size: var(--text-body); }
-.sdoc-add-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: var(--space-4); margin: 0; padding: 0; list-style: none; }
-.sdoc-add-card { display: flex; flex-direction: column; justify-content: space-between; gap: var(--space-4); padding: var(--space-6); border: 1px solid var(--secondary-border); border-radius: var(--radius-lg); background: var(--bg-white); transition: border-color var(--transition-fast), background var(--transition-fast); }
-.sdoc-add-card:hover { border-color: var(--primary-light); }
-.sdoc-add-card.is-active { border-color: var(--primary); background: var(--primary-lighter); }
-.sdoc-add-card-head { display: flex; align-items: flex-start; gap: var(--space-4); min-width: 0; }
-.sdoc-add-card-text { min-width: 0; }
-.sdoc-add-card-title { display: flex; align-items: center; gap: var(--space-2); margin: 0; font-size: var(--text-body); font-weight: var(--font-semibold); color: var(--text-primary); }
-.sdoc-add-card-title .sdoc-src-ico { color: var(--text-secondary); }
-.sdoc-add-card-desc { margin: var(--space-1) 0 0; font-size: var(--text-caption); line-height: var(--leading-relaxed); color: var(--text-secondary); }
-.sdoc-add-card-foot { display: flex; align-items: center; justify-content: space-between; gap: var(--space-4); }
-.sdoc-add-card-status { display: inline-flex; align-items: center; gap: var(--space-1); font-size: var(--text-caption); color: var(--success); }
-.sdoc-add-card-btn[aria-busy="true"] { cursor: progress; }
+/* Step 1: source-type radio cards (role=radio on .sdoc-add-type-radio; the "N connected" link is a sibling) */
+.sdoc-add-types { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-4); }
+.sdoc-add-type { position: relative; display: flex; flex-direction: column; gap: var(--space-2); padding: var(--space-6); border: 1px solid var(--secondary-border); border-radius: var(--radius-lg); background: var(--bg-white); transition: border-color var(--transition-fast), background var(--transition-fast); }
+.sdoc-add-type:hover { border-color: var(--primary-light); }
+.sdoc-add-type.is-selected { border-color: var(--primary); background: var(--primary-lighter); }
+.sdoc-add-type-radio { display: flex; align-items: flex-start; gap: var(--space-4); min-width: 0; padding-inline-end: var(--space-8); border-radius: var(--radius-md); cursor: pointer; }
+.sdoc-add-type-text { display: flex; flex-direction: column; gap: var(--space-1); min-width: 0; }
+.sdoc-add-type-title { font-size: var(--text-body); font-weight: var(--font-semibold); color: var(--text-primary); }
+.sdoc-add-type-desc { font-size: var(--text-caption); line-height: var(--leading-relaxed); color: var(--text-secondary); }
+.sdoc-add-type-check { position: absolute; top: var(--space-4); inset-inline-end: var(--space-4); display: none; align-items: center; justify-content: center; width: 20px; height: 20px; border-radius: 50%; background: var(--primary); color: var(--bg-white); }
+.sdoc-add-type-check .ui-icon, .sdoc-add-type-check svg { width: 12px; height: 12px; }
+.sdoc-add-type.is-selected .sdoc-add-type-check { display: inline-flex; }
+.sdoc-add-type-n { align-self: flex-start; margin-inline-start: calc(40px + var(--space-4)); }
 .sdoc-add-err { display: flex; align-items: flex-start; gap: var(--space-2); padding: var(--space-4) var(--space-6); border: 1px solid var(--danger); border-radius: var(--radius-md); background: var(--danger-light); color: var(--danger); font-size: var(--text-caption); }
-.sdoc-add-details { display: flex; flex-direction: column; gap: var(--space-4); padding-block-start: var(--space-6); border-top: 1px solid var(--secondary-border); }
-.sdoc-add-details > .sdoc-add-label { margin: 0; }
+.sdoc-add-step { display: flex; flex-direction: column; gap: var(--space-3, var(--space-2)); }
+.sdoc-add-config { gap: var(--space-2); padding-block-start: var(--space-6); border-top: 1px solid var(--secondary-border); }
+.sdoc-add-config .form-label { margin: var(--space-2) 0 0; }
+.sdoc-add-step > .sdoc-add-label { margin: 0 0 var(--space-2); }
 .sdoc-add-label { margin-block-end: calc(-1 * var(--space-2)); font-size: var(--text-caption); font-weight: var(--font-medium); color: var(--text-secondary); }
 .sdoc-add-hint { margin: 0; font-size: var(--text-caption); color: var(--text-secondary); }
-.sdoc-add-foot { display: flex; justify-content: flex-end; align-items: center; gap: var(--space-2); }
+.sdoc-add-opt { font-weight: var(--font-normal); color: var(--text-secondary); }
+/* Folder: picked name + Browse… */
+.sdoc-add-folder-row { display: flex; align-items: center; gap: var(--space-4); min-width: 0; }
+.sdoc-add-folder-name { flex: 1 1 auto; display: inline-flex; align-items: center; gap: var(--space-2); min-width: 0; padding: var(--space-2) var(--space-4); border: 1px solid var(--secondary-border); border-radius: var(--radius-md); background: var(--bg-white); color: var(--text-primary); font-size: var(--text-caption); }
+.sdoc-add-folder-name > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sdoc-add-folder-name.is-empty { color: var(--text-secondary); font-style: italic; }
+.sdoc-add-browse { flex: none; }
+/* Footer: Agent Files note on the start side, Cancel + primary on the end side */
+.sdoc-add-foot { display: flex; justify-content: space-between; align-items: center; gap: var(--space-4); padding: var(--space-4) var(--space-8); border-top: 1px solid var(--secondary-border); }
+.sdoc-add-foot-note { display: inline-flex; align-items: center; gap: var(--space-1); margin: 0; min-width: 0; font-size: var(--text-caption); color: var(--text-secondary); }
+.sdoc-add-foot-note > .sdoc-src-ico, .sdoc-add-foot-note > .ui-icon { color: var(--success); }
+.sdoc-add-foot-btns { display: flex; align-items: center; gap: var(--space-2); flex: none; }
+.sdoc-add-primary[aria-busy="true"] { cursor: progress; }
 
 /* Buttons: .widget-library-btn (19b-widget-library.css:62) + variants */
 .widget-library-btn.sdoc-src-btn { line-height: 1.4; font-family: inherit; }
@@ -242,7 +257,7 @@
     .sdoc-rail-groups { display: none; }
     .sdoc-rail-select { display: block; }
     .sdoc-pane-head { padding-block-start: var(--space-4); }
-    .sdoc-add-cards { grid-template-columns: 1fr; }
+    .sdoc-add-types { grid-template-columns: 1fr; }
     /* Side panel: row actions (folder download / delete) stay visible instead of hover-only (21c .layout-rows). */
     .layout-rows .sdoc-file-item .sdoc-lib-actions { opacity: 1; }
 }
@@ -319,3 +334,13 @@ a.sdoc-ws-pr:hover, a.sdoc-ws-pr:focus-visible { text-decoration: underline; }
 .sdoc-groupby .sdoc-groupby-option:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
 .sdoc-groupby .sdoc-groupby-option.selected { background: var(--primary-lighter); color: var(--text-link); font-weight: var(--font-medium); }
 .sdoc-groupby .sdoc-groupby-option.selected .sdoc-groupby-icon { color: var(--text-link); }
+
+/* Agent Files unseen indicators (tools/175-agent-files-unseen.js): accent dot on the rail item,
+   the sidebar Documents button and unseen file rows; unseen rows also get a bold name. */
+.af-unseen-dot { display: inline-block; flex-shrink: 0; width: 8px; height: 8px; border-radius: var(--radius-full); background: var(--primary); vertical-align: middle; }
+.sdoc-rail-item .af-unseen-dot { margin-inline-start: auto; }
+.sdoc-file-item.af-unseen .sdoc-lib-title { font-weight: var(--font-bold, 700); color: var(--text-primary); }
+.sdoc-file-item.af-unseen .sdoc-lib-title .af-unseen-dot { margin-inline-end: var(--space-3); }
+#documents-btn { position: relative; }
+#documents-btn .af-unseen-dot { margin-inline-start: auto; }
+.sidebar:not(.expanded) #documents-btn span.af-unseen-dot { display: block; position: absolute; top: var(--space-3); inset-inline-end: var(--space-4); width: 8px; height: 8px; max-width: none; font-size: 0; margin: 0; }

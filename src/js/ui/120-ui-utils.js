@@ -179,15 +179,37 @@ function scrollToFirstToolCall(msgIdx) {
 // 'versionSidebarHidden' (do NOT rename the key — existing users' saved prefs).
 // NOT the LEFT nav rail — that is sidebarCollapsed in core/030-config.js.
 var versionSidebarManuallyHidden = false;
+// Split mode (split widget pane visible) has its OWN global state, shared by
+// every split-mode chat: appStorage 'splitSidebarHidden'. While split mode is
+// on, toggles read/write ONLY that key; leaving split mode re-applies
+// 'versionSidebarHidden'. Neither key ever leaks into the other.
+var versionSidebarSplitMode = false;
+
+function versionSidebarStorageKey() {
+    return versionSidebarSplitMode ? 'splitSidebarHidden' : 'versionSidebarHidden';
+}
 
 function loadVersionSidebarState() {
-    var saved = appStorage.getItem('versionSidebarHidden');
-    // Default to open (false) if not set
-    versionSidebarManuallyHidden = saved === 'true';
+    var saved = appStorage.getItem(versionSidebarStorageKey());
+    // Normal mode defaults to open; split mode defaults to hidden (room for
+    // the widget pane) until the user toggles it once.
+    versionSidebarManuallyHidden = (saved === null || saved === undefined) ? versionSidebarSplitMode : saved === 'true';
 }
 
 function saveVersionSidebarState() {
-    appStorage.setItem('versionSidebarHidden', versionSidebarManuallyHidden ? 'true' : 'false');
+    appStorage.setItem(versionSidebarStorageKey(), versionSidebarManuallyHidden ? 'true' : 'false');
+}
+
+// Called by core/082-split-view.js _splitViewSyncVisibility on every sync:
+// switches the active key on a split-mode transition and re-applies it.
+function applyVersionSidebarMode(splitActive) {
+    splitActive = !!splitActive;
+    if (splitActive === versionSidebarSplitMode) return false;
+    versionSidebarSplitMode = splitActive;
+    loadVersionSidebarState();
+    updateVersionSidebarVisibility();
+    if (typeof resizeAllWidgets === 'function') { try { resizeAllWidgets(); } catch (e) {} }
+    return true;
 }
 
 function updateVersionSidebarVisibility() {
@@ -652,6 +674,38 @@ function _refreshSidebarPRStates(prs) {
     });
 }
 
+// One PR card (.pr-sidebar-item): git icon, title, "#N · → base" meta with an
+// optional worker chip, then the state (Merged / Merging spinner / Closed, or
+// the hover-revealed merge button while open) and the external-link glyph.
+// Shared by the chat sidebar's Pull Requests section (renderVersionSidebar)
+// and the Active Chats cards on the New Chat page / expand modal
+// (_jobsCardPrCardsHtml, tools/120-actions.js) so both render the SAME card.
+// opts.stopPropagation: the anchor swallows its click so a host that handles
+// clicks on an ancestor (the chat cards) is not toggled; the merge button
+// already stops propagation itself (mergeSidebarPR).
+function renderPrSidebarItemHtml(pr, prState, opts) {
+    opts = opts || {};
+    var title = pr.title || pr.branch || ('PR #' + pr.number);
+    var html = '<a class="pr-sidebar-item" href="' + escapeHtml(pr.url) + '" target="_blank" rel="noopener noreferrer" title="' + escapeHtml(pr.url) + '"' + (opts.stopPropagation ? ' onclick="event.stopPropagation()"' : '') + '>';
+    html += '<span class="pr-sidebar-icon">' + UI_ICONS.gitBranch + '</span>';
+    html += '<span class="pr-sidebar-info">';
+    html += '<span class="pr-sidebar-title">' + escapeHtml(title) + '</span>';
+    html += '<span class="pr-sidebar-meta">#' + escapeHtml(String(pr.number)) + (pr.base ? ' \u00b7 \u2192 ' + escapeHtml(pr.base) : '') + (pr.worker ? ' <span class="wsf-ws" title="' + t('Pushed by worker {worker}', { worker: escapeHtml(pr.worker) }) + '">' + escapeHtml(pr.worker) + '</span>' : '') + '</span>';
+    html += '</span>';
+    if (prState === 'merged') {
+        html += '<span class="pr-sidebar-state merged" title="' + t('Merged') + '">' + UI_ICONS.gitMerge + ' ' + t('Merged') + '</span>';
+    } else if (prState === 'merging') {
+        html += '<span class="pr-sidebar-state merging" title="' + t('Merging\u2026') + '">' + UI_ICONS.spinner + '</span>';
+    } else if (prState === 'closed') {
+        html += '<span class="pr-sidebar-state closed" title="' + t('Closed without merging') + '">' + UI_ICONS.close + ' ' + t('Closed') + '</span>';
+    } else {
+        html += '<button class="pr-sidebar-merge-btn" data-pr-url="' + escapeHtml(pr.url) + '" onclick="mergeSidebarPR(event, this)" title="' + t('Merge PR #{number} and sync workspace', { number: escapeHtml(String(pr.number)) }) + '">' + UI_ICONS.gitMerge + '</button>';
+    }
+    html += '<span class="pr-sidebar-open">' + UI_ICONS.externalLink + '</span>';
+    html += '</a>';
+    return html;
+}
+
 // Merge button click handler (sidebar PR item). Confirms, merges the PR via
 // the GitHub API, then syncs local workspaces — the merged head-branch
 // workspace auto-deletes (wsMaybeAutoDeleteMerged) and its base pulls the
@@ -907,24 +961,7 @@ function renderVersionSidebar() {
         html += '<div class="version-section-title">' + UI_ICONS.gitBranch + ' ' + t('Pull Requests ({count})', { count: pushedPRs.length }) + '</div>';
         html += '<div class="pr-sidebar-list">';
         pushedPRs.forEach(function(pr) {
-            var prState = _sidebarPRState[pr.url] || 'open';
-            html += '<a class="pr-sidebar-item" href="' + escapeHtml(pr.url) + '" target="_blank" rel="noopener noreferrer" title="' + escapeHtml(pr.url) + '">';
-            html += '<span class="pr-sidebar-icon">' + UI_ICONS.gitBranch + '</span>';
-            html += '<span class="pr-sidebar-info">';
-            html += '<span class="pr-sidebar-title">' + escapeHtml(pr.title) + '</span>';
-            html += '<span class="pr-sidebar-meta">#' + escapeHtml(String(pr.number)) + (pr.base ? ' \u00b7 \u2192 ' + escapeHtml(pr.base) : '') + (pr.worker ? ' <span class="wsf-ws" title="' + t('Pushed by worker {worker}', { worker: escapeHtml(pr.worker) }) + '">' + escapeHtml(pr.worker) + '</span>' : '') + '</span>';
-            html += '</span>';
-            if (prState === 'merged') {
-                html += '<span class="pr-sidebar-state merged" title="' + t('Merged') + '">' + UI_ICONS.gitMerge + ' ' + t('Merged') + '</span>';
-            } else if (prState === 'merging') {
-                html += '<span class="pr-sidebar-state merging" title="' + t('Merging\u2026') + '">' + UI_ICONS.spinner + '</span>';
-            } else if (prState === 'closed') {
-                html += '<span class="pr-sidebar-state closed" title="' + t('Closed without merging') + '">' + UI_ICONS.close + ' ' + t('Closed') + '</span>';
-            } else {
-                html += '<button class="pr-sidebar-merge-btn" data-pr-url="' + escapeHtml(pr.url) + '" onclick="mergeSidebarPR(event, this)" title="' + t('Merge PR #{number} and sync workspace', { number: escapeHtml(String(pr.number)) }) + '">' + UI_ICONS.gitMerge + '</button>';
-            }
-            html += '<span class="pr-sidebar-open">' + UI_ICONS.externalLink + '</span>';
-            html += '</a>';
+            html += renderPrSidebarItemHtml(pr, _sidebarPRState[pr.url] || 'open');
         });
         html += '</div>';
         html += '</div>';
@@ -1099,7 +1136,7 @@ function renderVersionSidebar() {
             var hasEdit = file.changes.some(function(c) { return c.action === 'PUT' || c.action === 'PATCH'; });
             var changeCount = file.changes.length;
 
-            var firstBeforeVersion = getFirstVersionForRecord(file.table, file.sysId);
+            var firstBeforeVersion = getFirstVersionForRecord(file.table, file.sysId, file.instanceUrl);
             var tableIcon = getTableIcon(file.table);
             var tableDisplayName = t(getTableDisplayName(file.table));
             var statusBadge = isNew ? '<span class="sn-status-badge sn-status-new">' + t('NEW') + '</span>' : (hasEdit ? '<span class="sn-status-badge sn-status-modified">' + t('MODIFIED') + '</span>' : '');
@@ -1109,6 +1146,7 @@ function renderVersionSidebar() {
             var jsTable = escapeJsString(file.table);
             var jsSysId = escapeJsString(file.sysId);
             var jsDisplayName = escapeJsString(file.displayName);
+            var jsInst = escapeJsString(file.instanceUrl || '');
 
             html += '<div class="sn-artifact-card sidebar-card">';
             html += '<div class="sn-artifact-icon sn-icon-' + file.table.replace(/_/g, '-') + '">' + tableIcon + '</div>';
@@ -1118,19 +1156,19 @@ function renderVersionSidebar() {
             html += '</div>';
             html += '<div class="sn-artifact-actions-row">';
             // View diff button
-            html += '<button class="sn-artifact-icon-btn" onclick="openDiffViewer(\'' + jsTable + '\', \'' + jsSysId + '\', \'' + jsDisplayName + '\')" title="' + t('View changes') + '">' + UI_ICONS.eye + '</button>';
+            html += '<button class="sn-artifact-icon-btn" onclick="openDiffViewer(\'' + jsTable + '\', \'' + jsSysId + '\', \'' + jsDisplayName + '\', \'' + jsInst + '\')" title="' + t('View changes') + '">' + UI_ICONS.eye + '</button>';
             // Download button
-            html += '<button class="sn-artifact-icon-btn" onclick="downloadSingleFile(\'' + jsTable + '\', \'' + jsSysId + '\', \'' + jsDisplayName + '\')" title="' + t('Download XML') + '">' + UI_ICONS.download + '</button>';
+            html += '<button class="sn-artifact-icon-btn" onclick="downloadSingleFile(\'' + jsTable + '\', \'' + jsSysId + '\', \'' + jsDisplayName + '\', \'' + jsInst + '\')" title="' + t('Download XML') + '">' + UI_ICONS.download + '</button>';
             // Open in browser for UI pages
             if (file.table === 'sys_ui_page') {
-                html += '<button class="sn-artifact-icon-btn" onclick="openUIPageInBrowser(\'' + jsDisplayName + '\')" title="' + t('Open in Browser') + '">' + UI_ICONS.globe + '</button>';
-                html += '<button class="sn-artifact-icon-btn" onclick="screenshotUIPage(\'' + jsDisplayName + '\')" title="' + t('Screenshot') + '">' + UI_ICONS.camera + '</button>';
+                html += '<button class="sn-artifact-icon-btn" onclick="openUIPageInBrowser(\'' + jsDisplayName + '\', \'' + jsInst + '\')" title="' + t('Open in Browser') + '">' + UI_ICONS.globe + '</button>';
+                html += '<button class="sn-artifact-icon-btn" onclick="screenshotUIPage(\'' + jsDisplayName + '\', \'' + jsInst + '\')" title="' + t('Screenshot') + '">' + UI_ICONS.camera + '</button>';
             }
             // Revert button (or delete for new files)
             if (isNew) {
-                html += '<button class="sn-artifact-icon-btn danger" onclick="deleteNewRecordFromSidebar(\'' + jsTable + '\', \'' + jsSysId + '\', \'' + jsDisplayName + '\')" title="' + t('Delete') + '">' + UI_ICONS.trash + '</button>';
+                html += '<button class="sn-artifact-icon-btn danger" onclick="deleteNewRecordFromSidebar(\'' + jsTable + '\', \'' + jsSysId + '\', \'' + jsDisplayName + '\', \'' + jsInst + '\')" title="' + t('Delete') + '">' + UI_ICONS.trash + '</button>';
             } else if (firstBeforeVersion) {
-                html += '<button class="sn-artifact-icon-btn" onclick="revertFileToBeforeChat(\'' + firstBeforeVersion + '\', \'' + jsTable + '\', \'' + jsSysId + '\', \'' + jsDisplayName + '\')" title="' + t('Revert') + '">' + UI_ICONS.undo + '</button>';
+                html += '<button class="sn-artifact-icon-btn" onclick="revertFileToBeforeChat(\'' + firstBeforeVersion + '\', \'' + jsTable + '\', \'' + jsSysId + '\', \'' + jsDisplayName + '\', \'' + jsInst + '\')" title="' + t('Revert') + '">' + UI_ICONS.undo + '</button>';
             }
             html += '</div>';
             html += '</div>';
@@ -1224,28 +1262,30 @@ function renderVersionSidebar() {
 }
 
 // Redo changes that were previously reverted
-async function redoFileChanges(versionSysId, table, sysId, displayName) {
+async function redoFileChanges(versionSysId, table, sysId, displayName, instanceUrl) {
     if (!await showConfirmModal(t('Redo Changes'), t('Redo changes to "{name}"? This will restore the AI-made changes.', { name: escapeHtml(displayName) }))) return;
     
     try {
         showSpinner(t('Restoring {name}...', { name: displayName }));
         
-        var xml = await getVersionXml(versionSysId);
+        var _tgt = await resolveRecordTarget(instanceUrl);
+        if (!_tgt) { hideSpinner(); refuseRecordTarget(instanceUrl); return; }
+        var xml = await getVersionXml(versionSysId, _tgt);
         if (!xml) {
             hideSpinner();
             showSnackbar(t('Could not get version data'), 'error');
             return;
         }
 
-        var result = await uploadXml(xml, table, sysId);
+        var result = await uploadXml(xml, table, sysId, _tgt);
         hideSpinner();
 
         if (result.success) {
             // Un-invalidate the original changes and drop the REVERT entry —
             // across the active chat AND its sub-agent chats (the entries may
             // be owned by a sub chat, see getVersionHistorySources).
-            setRecordEntriesInvalidated(table, sysId, false);
-            removeRevertEntriesForRecord(table, sysId);
+            setRecordEntriesInvalidated(table, sysId, false, instanceUrl);
+            removeRevertEntriesForRecord(table, sysId, instanceUrl);
 
             saveVersionHistory();
             renderVersionSidebar();
@@ -1278,25 +1318,27 @@ async function redoAllChanges() {
     for (var i = 0; i < revertedFiles.length; i++) {
         var file = revertedFiles[i];
         try {
-            var latestAfterVersion = getLatestAfterVersion(file.table, file.sysId);
+            var _ftgt = await resolveRecordTarget(file.instanceUrl);
+            if (!_ftgt) { errors.push(file.displayName + ': ' + recordTargetRefusalMessage(file.instanceUrl)); continue; }
+            var latestAfterVersion = getLatestAfterVersion(file.table, file.sysId, file.instanceUrl);
             if (!latestAfterVersion) {
                 errors.push(t('{name}: No version to restore', { name: file.displayName }));
                 continue;
             }
             
-            var xml = await getVersionXml(latestAfterVersion);
+            var xml = await getVersionXml(latestAfterVersion, _ftgt);
             if (!xml) {
                 errors.push(t('{name}: Could not get version data', { name: file.displayName }));
                 continue;
             }
             
-            var result = await uploadXml(xml, file.table, file.sysId);
+            var result = await uploadXml(xml, file.table, file.sysId, _ftgt);
             if (result.success) {
                 successCount++;
                 // Un-invalidate entries + drop REVERT markers for this file —
                 // across the active chat and its sub-agent chats.
-                setRecordEntriesInvalidated(file.table, file.sysId, false);
-                removeRevertEntriesForRecord(file.table, file.sysId);
+                setRecordEntriesInvalidated(file.table, file.sysId, false, file.instanceUrl);
+                removeRevertEntriesForRecord(file.table, file.sysId, file.instanceUrl);
             } else {
                 errors.push(file.displayName + ': ' + result.error);
             }
@@ -1318,27 +1360,29 @@ async function redoAllChanges() {
 }
 
 // Revert a single file to its state before this chat
-async function revertFileToBeforeChat(versionSysId, table, sysId, displayName) {
+async function revertFileToBeforeChat(versionSysId, table, sysId, displayName, instanceUrl) {
     if (!await showConfirmModal(t('Undo All Changes'), t('Undo all changes to "{name}"? This will restore the file to how it was before this chat session.', { name: escapeHtml(displayName) }))) return;
     
     try {
         showSpinner(t('Reverting {name}...', { name: displayName }));
         
-        var xml = await getVersionXml(versionSysId);
+        var _tgt = await resolveRecordTarget(instanceUrl);
+        if (!_tgt) { hideSpinner(); refuseRecordTarget(instanceUrl); return; }
+        var xml = await getVersionXml(versionSysId, _tgt);
         if (!xml) {
             hideSpinner();
             showSnackbar(t('Could not get version data'), 'error');
             return;
         }
         
-        var result = await uploadXml(xml, table, sysId);
+        var result = await uploadXml(xml, table, sysId, _tgt);
         hideSpinner();
         
         if (result.success) {
             // Mark all entries for this file as invalidated — across the
             // active chat and its sub-agent chats (the owning chat may be a
             // sub chat whose artifact rolled up into this sidebar).
-            setRecordEntriesInvalidated(table, sysId, true);
+            setRecordEntriesInvalidated(table, sysId, true, instanceUrl);
             
             // Add revert entry
             addVersionHistoryEntry({
@@ -1347,6 +1391,7 @@ async function revertFileToBeforeChat(versionSysId, table, sysId, displayName) {
                 timestamp: Date.now(),
                 table: table,
                 sysId: sysId,
+                instanceUrl: recordStoredInstanceUrl(instanceUrl),
                 displayName: displayName,
                 action: 'REVERT',
                 messageIndex: -1,
@@ -1376,48 +1421,50 @@ async function revertAllChanges() {
     
     var successCount = 0;
     var failCount = 0;
+    var refusedNames = [];
     
     showSpinner(t('Reverting all changes...'));
     
     for (var i = 0; i < changedFiles.length; i++) {
         var file = changedFiles[i];
         var isNew = file.changes.some(function(c) { return c.action === 'POST'; });
-        var firstBeforeVersion = getFirstVersionForRecord(file.table, file.sysId);
+        var firstBeforeVersion = getFirstVersionForRecord(file.table, file.sysId, file.instanceUrl);
         
         try {
+            var _ftgt = await resolveRecordTarget(file.instanceUrl);
+            if (!_ftgt) { failCount++; refusedNames.push(file.displayName + ': ' + recordTargetRefusalMessage(file.instanceUrl)); continue; }
             if (isNew) {
                 // New files need to be deleted, not reverted
-                var recordScope = await getRecordScope(file.table, file.sysId);
+                var recordScope = await getRecordScope(file.table, file.sysId, _ftgt.active ? null : _ftgt);
                 var deleteUrl = '/api/now/table/' + file.table + '/' + file.sysId;
                 if (recordScope) {
                     deleteUrl += '?sysparm_record_scope=' + encodeURIComponent(recordScope);
                 }
                 
-                var res = await fetch(deleteUrl, {
+                var res = await recordFetch(_ftgt, deleteUrl, {
                     method: 'DELETE',
                     headers: {
-                        'X-UserToken': window.sessionToken,
                         'Accept': 'application/json'
                     }
                 });
                 
                 if (res.ok || res.status === 204) {
-                    setRecordEntriesInvalidated(file.table, file.sysId, true);
+                    setRecordEntriesInvalidated(file.table, file.sysId, true, file.instanceUrl);
                     successCount++;
                 } else {
                     failCount++;
                 }
             } else if (firstBeforeVersion) {
                 // Existing files get reverted to before version
-                var xml = await getVersionXml(firstBeforeVersion);
+                var xml = await getVersionXml(firstBeforeVersion, _ftgt);
                 if (!xml) {
                     failCount++;
                     continue;
                 }
                 
-                var result = await uploadXml(xml, file.table, file.sysId);
+                var result = await uploadXml(xml, file.table, file.sysId, _ftgt);
                 if (result.success) {
-                    setRecordEntriesInvalidated(file.table, file.sysId, true);
+                    setRecordEntriesInvalidated(file.table, file.sysId, true, file.instanceUrl);
                     successCount++;
                 } else {
                     failCount++;
@@ -1449,6 +1496,7 @@ async function revertAllChanges() {
     if (failCount === 0) {
         showSnackbar(tn(successCount, 'Successfully reverted {count} file', 'Successfully reverted all {count} files'), 'success');
     } else {
-        showSnackbar(tn(successCount, 'Reverted {count} file, {failed} failed', 'Reverted {count} files, {failed} failed', { failed: i18nFormatNumber(failCount) }), 'warning');
+        showSnackbar(tn(successCount, 'Reverted {count} file, {failed} failed', 'Reverted {count} files, {failed} failed', { failed: i18nFormatNumber(failCount) })
+            + (refusedNames.length ? '\n\n' + refusedNames.join('\n') : ''), 'warning');
     }
 }

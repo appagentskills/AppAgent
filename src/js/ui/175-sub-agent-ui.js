@@ -347,6 +347,15 @@ function _subIsQueued(rec) {
         && typeof SubAgents.isQueued === 'function' && SubAgents.isQueued(rec.agent_id));
 }
 
+// PAUSE-SUBS: a 'running' record stood down by a user Pause (its parent
+// chat's Pause stamps rec.paused_by_parent_chat; a direct pause sets the
+// sub chat's pausedChats flag). Context is kept; Resume re-queues it.
+function _subIsPaused(rec) {
+    if (!rec || rec.state !== 'running') return false;
+    if (rec.paused_by_parent_chat) return true;
+    return !!(rec.chat_id && typeof pausedChats !== 'undefined' && pausedChats && pausedChats[rec.chat_id] === true);
+}
+
 // Display word for a registry state (logic and change keys keep rec.state English).
 var SUB_STATE_LABELS = { running: N_('running'), sleeping: N_('sleeping'), stopped: N_('stopped'), errored: N_('errored') };
 function _subStateLabel(state) {
@@ -356,6 +365,7 @@ function _subStateLabel(state) {
 
 function _subActivityInfo(rec) {
     if (!rec || rec.state !== 'running') return null;
+    if (_subIsPaused(rec)) return null;
     // Queued: no loop has run yet — no activity / stuck verdict to show.
     if (_subIsQueued(rec)) return null;
     // Stuck-worker signal: the SAME pure verdict agent_status reports (core/097
@@ -399,8 +409,9 @@ function _patchWorkerCardActivity(card, rec) {
     var iconEl = card.querySelector('.worker-card-icon');
     if (!iconEl) return;
     var act = _subActivityInfo(rec);
-    var queued = !act && _subIsQueued(rec);
-    var key = act ? (act.phase + ':' + act.label) : (queued ? 'queued' : '');
+    var pausedSub = !act && _subIsPaused(rec);
+    var queued = !act && !pausedSub && _subIsQueued(rec);
+    var key = act ? (act.phase + ':' + act.label) : (pausedSub ? 'paused' : (queued ? 'queued' : ''));
     if (iconEl.getAttribute('data-activity-key') !== key) {
         iconEl.setAttribute('data-activity-key', key);
         iconEl.innerHTML = act ? act.icon : ((typeof UI_ICONS !== 'undefined' && UI_ICONS.bot) ? UI_ICONS.bot : '');
@@ -408,7 +419,7 @@ function _patchWorkerCardActivity(card, rec) {
         iconEl.classList.toggle('worker-activity-tool', !!act && act.phase === 'tool');
         var stEl = card.querySelector('[data-worker-state]');
         if (stEl) {
-            var txt = act ? act.label : (queued ? t('queued') : _subStateLabel(rec.state));
+            var txt = act ? act.label : (pausedSub ? t('Paused') : (queued ? t('queued') : _subStateLabel(rec.state)));
             if (stEl.textContent !== txt) stEl.textContent = txt;
             stEl.title = act ? act.label : '';
         }
@@ -1411,9 +1422,49 @@ function revealSubAgentChat(idOrChatId) {
     // chat id directly via data-sub-chat-id).
     if (!chatId) chatId = idOrChatId;
     var chat = (typeof chats !== 'undefined') ? chats[chatId] : null;
-    // Stale-sub guard: the chat record may have been deleted (manual cleanup,
-    // version drift, etc.). Bail out cleanly instead of crashing selectChat.
-    if (!chat) return;
+    // ROOT CAUSE (intermittent "Open chat" no-op): sub chats are created in the
+    // SW; the page mirror only learns of one via an agent-event delta (whose
+    // first sight triggers an async 'pull-chat') or the IDB boot load. The
+    // registry snapshot (and so the worker card) arrives independently, so a
+    // pool-queued sub, a just-spawned sub, or one whose pull is still in flight
+    // has a card but NO chats[chatId] here — the old `if (!chat) return;`
+    // silently swallowed the click. Pull the row from the SW and retry once it
+    // lands; tell the user if it never does (deleted / tombstoned).
+    if (!chat || chat._deleted) {
+        // Double-click guard: one poll per chat id at a time.
+        if (_subRevealPending[chatId]) return;
+        _subRevealPending[chatId] = true;
+        // Remember where the user was at click time — if they navigate
+        // elsewhere while we wait, the delayed reveal must not yank them.
+        var originChatId = (typeof currentChatId !== 'undefined') ? currentChatId : null;
+        _revealSubChatWhenMirrored(chatId, 0, originChatId);
+        return;
+    }
+    _selectRevealedSubChat(chatId, chat);
+}
+
+var SUB_REVEAL_PULL_TIMEOUT_MS = 4000;
+var SUB_REVEAL_PULL_POLL_MS = 150;
+var _subRevealPending = Object.create(null);
+function _revealSubChatWhenMirrored(chatId, waitedMs, originChatId) {
+    var nowChatId = (typeof currentChatId !== 'undefined') ? currentChatId : null;
+    if (nowChatId !== originChatId) { delete _subRevealPending[chatId]; return; }
+    var chat = (typeof chats !== 'undefined') ? chats[chatId] : null;
+    if (chat && !chat._deleted) { delete _subRevealPending[chatId]; _selectRevealedSubChat(chatId, chat); return; }
+    if (waitedMs === 0 && typeof _requestChatPull === 'function') {
+        try { _requestChatPull(chatId); } catch (_) { /* fall through to timeout */ }
+    }
+    if (waitedMs >= SUB_REVEAL_PULL_TIMEOUT_MS || typeof _requestChatPull !== 'function') {
+        delete _subRevealPending[chatId];
+        if (typeof showSnackbar === 'function') {
+            try { showSnackbar(t("This sub-agent's chat isn't available right now."), 'warning', 4000); } catch (_) {}
+        }
+        return;
+    }
+    setTimeout(function() { _revealSubChatWhenMirrored(chatId, waitedMs + SUB_REVEAL_PULL_POLL_MS, originChatId); }, SUB_REVEAL_PULL_POLL_MS);
+}
+
+function _selectRevealedSubChat(chatId, chat) {
     if (chat.isBackground && !chat._revealed) {
         chat._revealed = true;
         if (typeof saveChatsToStorage === 'function') saveChatsToStorage();
@@ -2104,7 +2155,7 @@ function _updateSelfCardMetrics() {
 
 // Whitelist worker state for class-name interpolation (defense-in-depth,
 // same rationale as SUB_REPORT_STATUSES).
-var WORKER_CARD_STATES = { running: 1, queued: 1, sleeping: 1, stopped: 1, errored: 1 };
+var WORKER_CARD_STATES = { running: 1, queued: 1, paused: 1, sleeping: 1, stopped: 1, errored: 1 };
 
 // Context-length ring for a chat (sub-agent OR a normal top-level chat). Mirrors
 // the main chat's .context-circle. Shared by worker cards (sidebar Workers
@@ -2160,9 +2211,10 @@ function _workerCardHtml(r, opts) {
     var selfCard = !!(opts && opts.selfCard);
     var label = r.name || r.agent_id;
     // B1: pool-queued subs are 'running' records with no loop yet — own look.
-    var queued = _subIsQueued(r);
-    var stateClass = queued ? 'queued' : (WORKER_CARD_STATES[r.state] ? r.state : 'unknown');
-    var stateLabel = queued ? t('queued') : _subStateLabel(r.state);
+    var pausedSub = _subIsPaused(r);
+    var queued = !pausedSub && _subIsQueued(r);
+    var stateClass = pausedSub ? 'paused' : (queued ? 'queued' : (WORKER_CARD_STATES[r.state] ? r.state : 'unknown'));
+    var stateLabel = pausedSub ? t('Paused') : (queued ? t('queued') : _subStateLabel(r.state));
     // Phase 5: legacy records may lack `depth` — default to 1 (direct child of
     // root). Cap the rendered depth at 3 to match the CSS rule ladder.
     var depth = (typeof r.depth === 'number' && r.depth > 0) ? r.depth : 1;
@@ -2211,8 +2263,8 @@ function _workerCardHtml(r, opts) {
     return '<div class="worker-card-wrap' + (selfCard ? ' worker-card-wrap-self' : '') + '" data-depth="' + renderDepth + '"' + (selfCard ? ' style="margin-top:var(--space-3,6px)"' : '') + '>' +
         '<' + wkTag + ' class="worker-card worker-' + stateClass + (wkExpandedNow ? ' worker-card-expanded' : '') + (selfCard ? ' worker-card-self' : '') + '" ' +
         wkToggleAttrs +
-        'title="' + escapeHtml(label) + ' \u2014 ' + escapeHtml(queued ? t('queued (waiting for a free pool slot)') : _subStateLabel(r.state)) + (act ? ' \u2014 ' + escapeHtml(act.label) : '') + ' \u2014 ' + escapeHtml(tn(used, '{count} tool call', '{count} tool calls')) + ' \u2014 ' + escapeHtml(tokTip) + ' \u2014 ' + escapeHtml(t('depth {depth}', { depth: depth })) + '">' +
-        '<span class="worker-card-icon' + (act ? ' worker-activity-' + act.phase : '') + '" data-activity-key="' + escapeHtml(act ? (act.phase + ':' + act.label) : (queued ? 'queued' : '')) + '" aria-hidden="true">' + cardIcon + '</span>' +
+        'title="' + escapeHtml(label) + ' \u2014 ' + escapeHtml(pausedSub ? t('Paused') : (queued ? t('queued (waiting for a free pool slot)') : _subStateLabel(r.state))) + (act ? ' \u2014 ' + escapeHtml(act.label) : '') + ' \u2014 ' + escapeHtml(tn(used, '{count} tool call', '{count} tool calls')) + ' \u2014 ' + escapeHtml(tokTip) + ' \u2014 ' + escapeHtml(t('depth {depth}', { depth: depth })) + '">' +
+        '<span class="worker-card-icon' + (act ? ' worker-activity-' + act.phase : '') + '" data-activity-key="' + escapeHtml(act ? (act.phase + ':' + act.label) : (pausedSub ? 'paused' : (queued ? 'queued' : ''))) + '" aria-hidden="true">' + cardIcon + '</span>' +
         '<span class="worker-card-main">' +
             '<span class="worker-card-row">' +
                 '<span class="worker-state-dot worker-dot-' + stateClass + '"></span>' +
@@ -2432,7 +2484,7 @@ function renderWorkersStrip() {
                     || (r.root_chat_id || r.parent_chat_id) === currentChatId;
             })
             // B1: queued flag so a dequeue (state stays 'running') repaints.
-            .map(function(r) { return r.agent_id + ':' + r.state + (_subIsQueued(r) ? '~q' : '') + ':' + (r.depth || 1); });
+            .map(function(r) { return r.agent_id + ':' + r.state + (_subIsQueued(r) ? '~q' : '') + (_subIsPaused(r) ? '~p' : '') + ':' + (r.depth || 1); });
         rows.sort();
         return currentChatId + '|' + rows.join('|');
     }
@@ -2494,6 +2546,10 @@ function renderWorkersStrip() {
                 updateSidebarWorkerMetrics();
             }
         } catch (_) {}
+        // PAUSE-SUBS: the chat toolbar's Pause/Resume derive reads the live
+        // sub set (app/020 _chatHasLiveSubAgents) — re-derive on every
+        // registry change (idempotent class/label writes).
+        try { if (typeof syncChatControlsUI === 'function' && typeof currentChatId !== 'undefined' && currentChatId) syncChatControlsUI(currentChatId); } catch (_) {}
         // Re-render messages only when a sub_report was actually appended
         // to the active chat — not on every registry tick. Key includes
         // chat id so chat-switches between chats with equal sub_report

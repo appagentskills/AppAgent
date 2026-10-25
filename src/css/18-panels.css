@@ -96,6 +96,8 @@
 .history-header { display: flex; align-items: center; gap: var(--space-6); padding: var(--space-6) var(--space-8); background: var(--bg-white); border-bottom: 1px solid var(--secondary-border); flex-shrink: 0; height: 48px; box-sizing: border-box; position: sticky; top: 0; z-index: 10; }
 .history-title { font-size: var(--text-xl); font-weight: var(--font-semibold); color: var(--text-primary); flex: 1; }
 .history-search-bar { display: flex; align-items: center; justify-content: center; padding: var(--space-8) var(--space-9); background: var(--bg-white); border-bottom: 1px solid var(--secondary-border); }
+.history-search-inner-toggle { display: inline-flex; align-items: center; gap: var(--space-2); font-size: var(--text-small, 12px); color: var(--text-secondary); white-space: nowrap; cursor: pointer; user-select: none; }
+.history-search-inner-toggle input { margin: 0; cursor: pointer; }
 .history-search-lg { max-width: 600px; width: 100%; padding: var(--space-5) var(--space-8); border-radius: var(--radius-xl); }
 .history-stats { padding: var(--space-6) var(--space-9); font-size: var(--text-body); color: var(--text-muted); background: var(--bg-white); border-bottom: 1px solid var(--secondary-border); }
 .history-list { padding: var(--space-8); width: 100%; box-sizing: border-box; display: flex; flex-direction: column; gap: var(--space-6); }

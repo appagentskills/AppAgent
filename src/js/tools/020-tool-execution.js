@@ -252,6 +252,32 @@ async function _liExtensionTabInfo() {
     return out;
 }
 
+// list_instances helper: every OTHER open tab (regular websites, not this
+// extension's pages and not the ServiceNow tabs already listed under
+// instances[].activeTabs) so browser tools can target any site by tab id.
+// restricted:true marks browser-internal pages (chrome://, Web Store, other
+// extensions) that Chrome does not let extensions script or capture — they can
+// only be navigated away from or closed. Never throws.
+async function _liOtherTabInfo(excludeIds) {
+    var out = [];
+    try {
+        if (typeof chrome === 'undefined' || !chrome || !chrome.tabs || typeof chrome.tabs.query !== 'function') return out;
+        var base = (chrome.runtime && typeof chrome.runtime.getURL === 'function') ? chrome.runtime.getURL('') : '';
+        var skip = {};
+        (excludeIds || []).forEach(function(id) { skip[id] = true; });
+        var all = (await chrome.tabs.query({})) || [];
+        all.forEach(function(t) {
+            if (!t || t.id == null || skip[t.id]) return;
+            var u = String(t.url || t.pendingUrl || '');
+            if (base && u.indexOf(base) === 0) return;
+            var row = { id: t.id, title: t.title || '', url: u, active: !!t.active, windowId: t.windowId };
+            if (typeof _isBrowserInternalUrl === 'function' && _isBrowserInternalUrl(u)) row.restricted = true;
+            out.push(row);
+        });
+    } catch (e) { /* unknown → empty */ }
+    return out;
+}
+
 // Execute set_chat_title tool
 // SW context: currentChatId is always null (page-only global). Threading the
 // chatId through options lets the agent loop tell us which chat to title;
@@ -830,6 +856,11 @@ function trackRecordMutation(evt) {
         displayName: evt.displayName,
         action: evt.action,
         statusMessage: evt.statusMessage || null,
+        // ALWAYS the normalized origin — the target instance, else the
+        // instance active NOW — so actions keep hitting the right instance
+        // after the user switches the active one. recordInstanceKey (core/150)
+        // still maps an active origin to '' for grouping.
+        instanceUrl: recordStoredInstanceUrl(evt.instanceUrl),
         // NOTE: not `messageIndex || -1` — index 0 is a legitimate value.
         messageIndex: (typeof evt.messageIndex === 'number' && evt.messageIndex >= 0) ? evt.messageIndex : -1,
         beforeVersion: evt.beforeVersion || null,
@@ -917,14 +948,12 @@ async function executeDiffEdit(args, messageIndex, options) {
         // instance — an `instance` arg naming the active instance must still
         // be version-tracked (the tool schema makes `instance` required).
         var _diffCrossInstance = !!_diffInstanceUrl && !_isActiveInstanceUrl(_diffInstanceUrl);
+        // Cross-instance edits are tracked too (helpers pointed at the target).
+        var _diffRecTarget = _diffCrossInstance ? { instanceUrl: _diffInstanceUrl, token: _diffApiToken } : null;
 
-        // Capture version before the change (skip for cross-instance)
-        var versionBefore = null;
-        var beforeVersion = null;
-        if (!_diffCrossInstance) {
-            versionBefore = await getRecordVersion(args.table, args.sys_id);
-            beforeVersion = versionBefore ? versionBefore.sys_id : null;
-        }
+        // Capture version before the change
+        var versionBefore = await getRecordVersion(args.table, args.sys_id, _diffRecTarget);
+        var beforeVersion = versionBefore ? versionBefore.sys_id : null;
 
         // Always fetch the full content from the server to ensure we have the complete field
         var getUrl = '/api/now/table/' + args.table + '/' + args.sys_id + '?sysparm_fields=' + args.field;
@@ -1006,13 +1035,15 @@ async function executeDiffEdit(args, messageIndex, options) {
             return { success: false, error: 'Failed to update record: ' + (errData.error?.message || 'HTTP ' + putRes.status) };
         }
 
-        // Capture version after the change and track it (skip for cross-instance)
-        if (!_diffCrossInstance) {
+        // Capture version after the change and track it. Cross-instance edits
+        // used to be skipped here, so they never reached the sidebar.
+        {
             await new Promise(function(r) { setTimeout(r, 200); });
-            var versionAfter = await getRecordVersion(args.table, args.sys_id);
+            var versionAfter = await getRecordVersion(args.table, args.sys_id, _diffRecTarget);
             var afterVersion = versionAfter ? versionAfter.sys_id : null;
-            var displayName = await getRecordDisplayValue(args.table, args.sys_id);
+            var displayName = await getRecordDisplayValue(args.table, args.sys_id, _diffRecTarget);
             trackRecordMutation({
+                instanceUrl: _diffCrossInstance ? _diffInstanceUrl : undefined,
                 chatId: (options && options.chatId) || activeStreamingChatId || currentChatId,
                 table: args.table,
                 sysId: args.sys_id,
@@ -2172,8 +2203,17 @@ async function _executeToolInner(name, args, messageIndex, options) {
         // pill was correct. args.refresh is kept for backward compatibility
         // but a fresh probe is now always implied. On probe failure, fall
         // back to the last-known registry rather than erroring out.
+        // Bounded (15s): a stuck probe must not hang the tool — fall back to the
+        // last-known registry and say so (the probe may still land later).
+        var _liProbeWarning = null;
         if (Platform.refreshInstances) {
-            try { await Platform.refreshInstances(); } catch (e) { /* keep last-known Platform.instances */ }
+            var _liTO = {};
+            var _liR = await new Promise(function(res) {
+                var _t = setTimeout(function() { res(_liTO); }, 15000);
+                var _p; try { _p = Promise.resolve(Platform.refreshInstances()); } catch (e) { _p = Promise.resolve(null); }
+                _p.then(function(v) { clearTimeout(_t); res(v); }, function() { clearTimeout(_t); res(null); });
+            });
+            if (_liR === _liTO) _liProbeWarning = 'Live instance probe timed out after 15s; showing the last-known registry (a tab may be frozen or still loading).';
         }
         // Per-instance "disabled for agent" flags (toggled from the header
         // instance picker \u2014 setInstanceDisabled in platform-bridge.js, stored
@@ -2212,10 +2252,14 @@ async function _executeToolInner(name, args, messageIndex, options) {
         // actions REQUIRE an explicit tab_id; the own tab may be screenshotted /
         // read but never navigated.
         var _liExt = await _liExtensionTabInfo();
+        var _liSnTabIds = [];
+        Platform.instances.forEach(function(inst) { (inst.tabs || []).forEach(function(t) { if (t && t.id != null) _liSnTabIds.push(t.id); }); });
+        var _liOther = await _liOtherTabInfo(_liSnTabIds);
         return {
             success: true,
             selfTabId: _liExt.selfTabId,
             extensionTabs: _liExt.extensionTabs,
+            otherTabs: _liOther, // any other website tab — valid tab_id targets for iframe_tool / take_screenshot (restricted:true = browser-internal, navigate/close only)
             instances: Platform.instances.filter(function(inst) { return !_liDisabledMap[_liNorm(inst.url)]; }).map(function(inst) {
                 var _fr = _liFresh[inst.url];
                 if (_fr) return {
@@ -2238,7 +2282,8 @@ async function _executeToolInner(name, args, messageIndex, options) {
                 };
             }),
             disabledInstances: _liDisabled, // present but NOT targetable by the agent
-            activeInstance: Platform.instanceUrl ? Platform.instanceUrl.replace(/^https?:\/\//, '').split('.')[0] : ''
+            activeInstance: Platform.instanceUrl ? Platform.instanceUrl.replace(/^https?:\/\//, '').split('.')[0] : '',
+            warning: _liProbeWarning || undefined
         };
     } else if (name === 'servicenow_api' && !(/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(args.table))) {
         return { success: false, error: 'Invalid table name: must be alphanumeric/underscores only' };
@@ -2320,10 +2365,11 @@ async function _executeToolInner(name, args, messageIndex, options) {
             try { data = JSON.parse(_attachRespText); } catch(e) { data = { error: { message: 'Non-JSON response (HTTP ' + res.status + ')' } }; }
             // Track the upload in the chat's version history / Artifacts list
             // (skip only GENUINE cross-instance uploads).
-            if (res.ok && !(_attachInstanceUrl && !_isActiveInstanceUrl(_attachInstanceUrl))) {
+            if (res.ok) {
                 var _attachSysId = data && data.result && data.result.sys_id;
                 if (_attachSysId) {
                     trackRecordMutation({
+                        instanceUrl: (_attachInstanceUrl && !_isActiveInstanceUrl(_attachInstanceUrl)) ? _attachInstanceUrl : undefined,
                         chatId: (options && options.chatId) || activeStreamingChatId || currentChatId,
                         table: 'sys_attachment',
                         sysId: _attachSysId,
@@ -2369,9 +2415,9 @@ async function _executeToolInner(name, args, messageIndex, options) {
             // attachment disappears. Best-effort — never blocks the delete.
             var _atCrossInstance = !!_atInstanceUrl && !_isActiveInstanceUrl(_atInstanceUrl);
             var _atDeleteName = null;
-            if (args.method === 'DELETE' && !_atCrossInstance) {
+            if (args.method === 'DELETE') {
                 try {
-                    var _atMetaRes = await _toolFetch('/api/now/attachment/' + args.sys_id, {
+                    var _atMetaRes = await _toolFetch((_atCrossInstance ? _atInstanceUrl : '') + '/api/now/attachment/' + args.sys_id, {
                         headers: { 'Accept': 'application/json', 'X-UserToken': _atToken || Platform.getSessionToken() || '' }
                     }, options && options._sfCtx, 30000);
                     if (_atMetaRes.ok) {
@@ -2423,8 +2469,9 @@ async function _executeToolInner(name, args, messageIndex, options) {
             }
             // Track attachment deletion in the chat's version history /
             // Artifacts list (skip only GENUINE cross-instance deletes).
-            if (atRes.ok && args.method === 'DELETE' && !_atCrossInstance) {
+            if (atRes.ok && args.method === 'DELETE') {
                 trackRecordMutation({
+                    instanceUrl: _atCrossInstance ? _atInstanceUrl : undefined,
                     chatId: (options && options.chatId) || activeStreamingChatId || currentChatId,
                     table: 'sys_attachment',
                     sysId: args.sys_id,
@@ -2501,8 +2548,10 @@ async function _executeToolInner(name, args, messageIndex, options) {
         try {
             var beforeVersion = null;
             var isModifyingRequest = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(args.method);
-            if (isModifyingRequest && args.sys_id && !_apiCrossInstance) {
-                var versionBefore = await getRecordVersion(args.table, args.sys_id);
+            // Cross-instance writes are tracked too — helpers hit the target.
+            var _apiRecTarget = _apiCrossInstance ? { instanceUrl: _targetInstanceUrl, token: _targetToken } : null;
+            if (isModifyingRequest && args.sys_id) {
+                var versionBefore = await getRecordVersion(args.table, args.sys_id, _apiRecTarget);
                 beforeVersion = versionBefore ? versionBefore.sys_id : null;
             }
 
@@ -2524,14 +2573,17 @@ async function _executeToolInner(name, args, messageIndex, options) {
             }
 
             // Version history tracking (skip for GENUINE cross-instance requests)
-            if (res.ok && isModifyingRequest && !_apiCrossInstance) {
-                var recordSysId = args.sys_id || (data.result && data.result.sys_id);
+            if (res.ok && isModifyingRequest) {
+                var _apiRes0 = data && data.result;
+                if (Array.isArray(_apiRes0)) _apiRes0 = _apiRes0[0];
+                var recordSysId = args.sys_id || (_apiRes0 && (_apiRes0.sys_id && _apiRes0.sys_id.value ? _apiRes0.sys_id.value : _apiRes0.sys_id));
                 if (recordSysId) {
                     await new Promise(function(r) { setTimeout(r, 200); });
-                    var versionAfter = await getRecordVersion(args.table, recordSysId);
+                    var versionAfter = await getRecordVersion(args.table, recordSysId, _apiRecTarget);
                     var afterVersion = versionAfter ? versionAfter.sys_id : null;
-                    var displayName = await getRecordDisplayValue(args.table, recordSysId);
+                    var displayName = await getRecordDisplayValue(args.table, recordSysId, _apiRecTarget);
                     trackRecordMutation({
+                        instanceUrl: _apiCrossInstance ? _targetInstanceUrl : undefined,
                         chatId: (options && options.chatId) || activeStreamingChatId || currentChatId,
                         table: args.table,
                         sysId: recordSysId,
@@ -2710,6 +2762,9 @@ async function _executeToolInner(name, args, messageIndex, options) {
     } else if (name === 'pin_widget') {
         // Page-only (headless: false) — dashboardWidgets + dashboard renderers are page globals.
         return await executePinWidget(args);
+    } else if (name === 'split_view') {
+        // Page-only (headless: false) — the split pane lives in the panel DOM (core/082-split-view.js).
+        return await executeSplitView(args, options);
     } else if (name === 'take_screenshot') {
         return await executeTakeScreenshot(args, options);
     } else if (name === 'screenshot_by_id') {
@@ -2737,6 +2792,13 @@ async function _executeToolInner(name, args, messageIndex, options) {
         // routing as js_eval (HEADLESS_TOOLS.run_tests = true).
         if (typeof executeRunTests !== 'function') return _runTestsImplMissing('run_tests');
         return await executeRunTests(args, messageIndex, options);
+    } else if (name === 'chat_history') {
+        // Impl: executeChatHistory in tools/165-chat-history.js (WORKER_SHARED_FILES,
+        // headless). Read-only: allowlisted stores (chats, chat_payloads) and
+        // 'readonly' transactions only. Approval ('ask' by default) already ran
+        // in _executeToolInner via requestProgrammaticToolApproval.
+        if (typeof executeChatHistory !== 'function') return { success: false, error: 'chat_history is not available in this build — click Reload to rebuild.' };
+        return await executeChatHistory(args);
     } else if (name === 'local_folder') {
         // Impl: executeLocalFolder in tools/170-local-folders.js (WORKER_SHARED_FILES).
         // Headless except action 'request' (isHeadlessTool routes it to the panel).
@@ -2745,6 +2807,17 @@ async function _executeToolInner(name, args, messageIndex, options) {
     } else if (name === 'web_fetch') {
         try {
             var _wfSaveFile = args.save_file;
+            // --- In-tab (page-context) fetch: args.tab_id -----------------
+            // Runs the request AS the page in that tab (wfFetchInTab below).
+            // Checked first: no GitHub token / binary body is ever built for it.
+            // The GitHub URL match is used ONLY to suppress the block hint (as
+            // on the normal path); it never attaches a token here, and the
+            // approval gates (ui/150, worker/120) do not apply the GitHub 'auto' downgrade to tab_id calls.
+            if (args.tab_id != null && args.tab_id !== '') {
+                var _wfTabGh = null;
+                try { _wfTabGh = await getGitHubApiAuthForUrl(args.url); } catch (_wfTabGhErr) { _wfTabGh = null; }
+                return await wfFetchInTab(args, (typeof chrome !== 'undefined' && chrome && chrome.scripting) ? chrome.scripting : null, _wfTabGh);
+            }
             // Fetch directly from the SW. The Origin header is stripped by the
             // declarativeNetRequest rule scoped to initiatorDomains: [extension id],
             // so calling fetch() from this context behaves the same as the old
@@ -2816,62 +2889,16 @@ async function _executeToolInner(name, args, messageIndex, options) {
                 _wfResult.file_name = _wfName;
                 _wfResult.file_size = _wfBlob ? _wfBlob.size : 0;
             } else {
-                // --- HTML text extraction ------------------------------------
-                // For HTML responses, surface page_title, meta_description and
-                // extracted_text (script/style-stripped visible text) BEFORE the
-                // raw body. Without this, a large server-rendered page gets
-                // cached/sliced as raw HTML and the slice often lands in inline
-                // JS/CSS, so the agent misreads a real content page as an empty
-                // "SPA shell". Extraction is regex-based (this code also runs in
-                // the service worker, which has no DOMParser) and best-effort —
-                // the raw body is ALWAYS returned unchanged.
-                if (typeof _wfBody === 'string' && _wfBody &&
-                    (/text\/html|application\/xhtml/i.test(_wfCT) || /^\s*(<!DOCTYPE\s+html|<html[\s>])/i.test(_wfBody))) {
-                    try {
-                        // Entity decode — &amp; LAST so '&amp;lt;' decodes to '&lt;'
-                        // (one level), not all the way to '<'.
-                        var _wfDecode = function(s) {
-                            return String(s)
-                                .replace(/&nbsp;/gi, ' ').replace(/&lt;/gi, '<').replace(/&gt;/gi, '>')
-                                .replace(/&quot;/gi, '"').replace(/&#0*39;/g, "'").replace(/&amp;/gi, '&');
-                        };
-                        var _wfTitleM = _wfBody.match(/<title[^>]*>([\s\S]*?)<\/title\s*>/i);
-                        if (_wfTitleM) _wfResult.page_title = _wfDecode(_wfTitleM[1]).replace(/\s+/g, ' ').trim();
-                        var _wfDescTag = _wfBody.match(/<meta\b[^>]*\bname\s*=\s*["']description["'][^>]*>/i);
-                        if (_wfDescTag) {
-                            var _wfDescC = _wfDescTag[0].match(/\bcontent\s*=\s*("([^"]*)"|'([^']*)')/i);
-                            if (_wfDescC) _wfResult.meta_description = _wfDecode(_wfDescC[2] !== undefined ? _wfDescC[2] : _wfDescC[3]).replace(/\s+/g, ' ').trim();
-                        }
-                        // Strip non-content elements FIRST (comments, script, style,
-                        // noscript, template, svg, head), then tags, then decode the
-                        // few entities that matter, then collapse whitespace.
-                        var _wfTxt = _wfBody
-                            .replace(/<!--[\s\S]*?-->/g, ' ')
-                            .replace(/<script\b[\s\S]*?<\/script\s*>/gi, ' ')
-                            .replace(/<style\b[\s\S]*?<\/style\s*>/gi, ' ')
-                            .replace(/<noscript\b[\s\S]*?<\/noscript\s*>/gi, ' ')
-                            .replace(/<template\b[\s\S]*?<\/template\s*>/gi, ' ')
-                            .replace(/<svg\b[\s\S]*?<\/svg\s*>/gi, ' ')
-                            .replace(/<head\b[\s\S]*?<\/head\s*>/i, ' ');
-                        _wfTxt = _wfTxt
-                            .replace(/<\/(p|div|li|tr|h[1-6]|section|article|table|ul|ol|blockquote|pre|header|footer|nav|aside)\s*>/gi, '\n')
-                            .replace(/<br\s*\/?\s*>/gi, '\n')
-                            .replace(/<[^>]+>/g, ' ');
-                        _wfTxt = _wfDecode(_wfTxt)
-                            .replace(/[ \t\r]+/g, ' ')
-                            .replace(/ ?\n ?/g, '\n')
-                            .replace(/\n{3,}/g, '\n\n')
-                            .trim();
-                        var _WF_TEXT_CAP = 60000;
-                        if (_wfTxt.length > _WF_TEXT_CAP) {
-                            _wfTxt = _wfTxt.slice(0, _WF_TEXT_CAP) + '\n... [extracted_text truncated, ' + (_wfTxt.length - _WF_TEXT_CAP) + ' more chars — full raw HTML in body]';
-                        }
-                        if (_wfTxt) _wfResult.extracted_text = _wfTxt;
-                    } catch (_wfExErr) { /* best-effort — raw body below is untouched */ }
-                }
-                // --------------------------------------------------------------
-                _wfResult.body = _wfBody;
+                // HTML extraction (page_title / meta_description / extracted_text,
+                // capped) + raw body — shared with the in-tab path (wfApplyTextBody).
+                var _wfIsHtml = wfApplyTextBody(_wfResult, _wfBody, _wfCT);
             }
+            // Block hint: 401/403/429/503/999 by status, or a 2xx page that looks
+            // like a verification challenge (wfResultHint). Skipped for the GitHub
+            // host family: there 401/403/429 = auth/permissions/rate limit.
+            var _wfHint = wfResultHint(_wfResult, _wfSaveFile ? null : _wfBody, !!_wfIsHtml, _wfAuth || null,
+                { retryAfter: (_wfRes.headers && typeof _wfRes.headers.get === 'function') ? _wfRes.headers.get('retry-after') : null });
+            if (_wfHint) _wfResult.hint = _wfHint;
             // --- GitHub REST PR registration ------------------------------
             // A PR opened (POST .../pulls -> 201) or merged (PUT
             // .../pulls/:n/merge -> 200) through the configured REST base
@@ -2911,6 +2938,278 @@ async function _executeToolInner(name, args, messageIndex, options) {
     }
     return { success: false, error: 'Unknown tool "' + name + '". If it is listed in the tool catalog (system prompt), call get_tool_schema with its exact name to fetch its schema; otherwise check the catalog / your declared tools for the closest available tool.' };
 }
+
+// =============================================
+// web_fetch: in-tab (page-context) fetch — args.tab_id
+// =============================================
+// Bot protection on many sites rejects the extension's own fetch: it leaves as
+// sec-fetch-site:none + sec-fetch-mode:cors, no Referer, no sec-ch-ua client
+// hints — a shape no real page can produce. Running the SAME fetch() inside a
+// tab the user has open on that site makes it a genuine page request: the
+// page's origin + Referer, same-origin/same-site fetch metadata, client hints
+// and the user's cookies. ISOLATED (content-script) world by default so page
+// JS cannot wrap or observe our fetch(); tab_world:'MAIN' opts into the
+// page's own (possibly patched) fetch. Text bodies only: a non-text response
+// is refused with a pointer to web_fetch save_file (no tab_id).
+// The result goes through the SAME HTML extraction / extracted_text cap
+// (wfApplyTextBody) and block hint (wfResultHint, in-tab wording) as the
+// normal path. Everything the in-tab path needs lives between the markers
+// below (test/web-fetch-in-tab.test.js evaluates that slice on its own).
+// Markers: WF_IN_TAB_BEGIN / WF_IN_TAB_END.
+// WF_IN_TAB_BEGIN
+
+// Text-like Content-Types web_fetch may return as `body` (empty = unknown,
+// treated as text). Anything else (images, PDFs, archives, octet-stream...)
+// is binary. The SOURCE string is also passed into the injected page func,
+// which must stay self-contained.
+var WF_TEXT_CT_SRC = '^\\s*(text/|image/svg\\+xml|message/|application/([\\w.+-]*\\+)?(json|xml|javascript|ecmascript|x-javascript|x-www-form-urlencoded|csv|yaml|x-yaml|toml|graphql|ndjson|x-ndjson|problem\\+json)\\b)';
+function wfIsTextContentType(ct) {
+    if (ct == null || !String(ct).trim()) return true;
+    return new RegExp(WF_TEXT_CT_SRC, 'i').test(String(ct));
+}
+
+// Cap for extracted_text (the raw body is returned unchanged, as before).
+var WF_EXTRACTED_TEXT_CAP = 60000;
+
+// HTML text extraction shared by the normal and in-tab paths. Sets
+// result.page_title / meta_description / extracted_text (script/style-
+// stripped visible text, capped at WF_EXTRACTED_TEXT_CAP) for HTML
+// responses, and ALWAYS sets result.body = body unchanged. Without this, a
+// large server-rendered page gets cached/sliced as raw HTML and the slice
+// often lands in inline JS/CSS, so the agent misreads a real content page as
+// an empty "SPA shell". Regex-based (this code also runs in the service
+// worker, which has no DOMParser) and best-effort. Returns true for HTML.
+function wfApplyTextBody(result, body, ct) {
+    var isHtml = typeof body === 'string' && !!body &&
+        (/text\/html|application\/xhtml/i.test(ct || '') || /^\s*(<!DOCTYPE\s+html|<html[\s>])/i.test(body));
+    if (isHtml) {
+        try {
+            // Entity decode — &amp; LAST so '&amp;lt;' decodes to '&lt;'
+            // (one level), not all the way to '<'.
+            var decode = function(s) {
+                return String(s)
+                    .replace(/&nbsp;/gi, ' ').replace(/&lt;/gi, '<').replace(/&gt;/gi, '>')
+                    .replace(/&quot;/gi, '"').replace(/&#0*39;/g, "'").replace(/&amp;/gi, '&');
+            };
+            var titleM = body.match(/<title[^>]*>([\s\S]*?)<\/title\s*>/i);
+            if (titleM) result.page_title = decode(titleM[1]).replace(/\s+/g, ' ').trim();
+            var descTag = body.match(/<meta\b[^>]*\bname\s*=\s*["']description["'][^>]*>/i);
+            if (descTag) {
+                var descC = descTag[0].match(/\bcontent\s*=\s*("([^"]*)"|'([^']*)')/i);
+                if (descC) result.meta_description = decode(descC[2] !== undefined ? descC[2] : descC[3]).replace(/\s+/g, ' ').trim();
+            }
+            // Strip non-content elements FIRST (comments, script, style,
+            // noscript, template, svg, head), then tags, then decode the few
+            // entities that matter, then collapse whitespace.
+            var txt = body
+                .replace(/<!--[\s\S]*?-->/g, ' ')
+                .replace(/<script\b[\s\S]*?<\/script\s*>/gi, ' ')
+                .replace(/<style\b[\s\S]*?<\/style\s*>/gi, ' ')
+                .replace(/<noscript\b[\s\S]*?<\/noscript\s*>/gi, ' ')
+                .replace(/<template\b[\s\S]*?<\/template\s*>/gi, ' ')
+                .replace(/<svg\b[\s\S]*?<\/svg\s*>/gi, ' ')
+                .replace(/<head\b[\s\S]*?<\/head\s*>/i, ' ');
+            txt = txt
+                .replace(/<\/(p|div|li|tr|h[1-6]|section|article|table|ul|ol|blockquote|pre|header|footer|nav|aside)\s*>/gi, '\n')
+                .replace(/<br\s*\/?\s*>/gi, '\n')
+                .replace(/<[^>]+>/g, ' ');
+            txt = decode(txt)
+                .replace(/[ \t\r]+/g, ' ')
+                .replace(/ ?\n ?/g, '\n')
+                .replace(/\n{3,}/g, '\n\n')
+                .trim();
+            if (txt.length > WF_EXTRACTED_TEXT_CAP) {
+                txt = txt.slice(0, WF_EXTRACTED_TEXT_CAP) + '\n... [extracted_text truncated, ' + (txt.length - WF_EXTRACTED_TEXT_CAP) + ' more chars — full raw HTML in body]';
+            }
+            if (txt) result.extracted_text = txt;
+        } catch (e) { /* best-effort — raw body below is untouched */ }
+    }
+    result.body = body;
+    return isHtml;
+}
+
+// 2xx challenge-page heuristic (vendor-neutral, conservative). A page counts
+// as a verification / bot-protection interstitial only when ALL hold:
+//   - it is HTML and the raw body is small (< 150 KB),
+//   - its visible text is short (< 1500 chars, so real articles that merely
+//     mention "robot" never match),
+//   - a generic interstitial phrase matches (no vendor names):
+//       STRONG phrases (unambiguous verification wording) count anywhere in
+//       the <title>, visible text or <noscript> text;
+//       WEAK phrases ("just a moment", "are you a robot", "access denied",
+//       "please wait", ...) also appear on app loaders / quizzes, so they
+//       count only in the <title>, or when the body/noscript carries a
+//       second distinct phrase.
+var WF_CHALLENGE_STRONG_RE = /(verify (that )?you are (a )?human|verify (that )?you are not a (ro)?bot|(i'?m|i am) not a robot|confirm (that )?you are (a )?human|checking (if the site connection is secure|your browser)|enable javascript and cookies to continue|please enable (javascript|js) and cookies|pardon our interruption|human verification|unusual traffic|complete the security check|press (and|&) hold to confirm)/i;
+var WF_CHALLENGE_WEAK_RE = /(just a moment\b|are you a (ro)?bot\b|are you (a )?human\b|access denied|please wait\b|attention required|request unsuccessful)/gi;
+var WF_CHALLENGE_ACCESS_RE = /(access denied|request unsuccessful)/i;
+var WF_CHALLENGE_MAX_BODY = 150000;
+var WF_CHALLENGE_MAX_TEXT = 1500;
+function wfWeakPhrases(s) {
+    var out = [];
+    (String(s || '').match(WF_CHALLENGE_WEAK_RE) || []).forEach(function(p) {
+        p = p.toLowerCase().replace(/\s+/g, ' ');
+        if (out.indexOf(p) < 0) out.push(p);
+    });
+    return out;
+}
+// Returns null, or {access: bool} (access = an "access denied"-style page).
+function wfChallengeSignal(result, body, isHtml) {
+    if (!isHtml || !result || typeof body !== 'string' || !body || body.length > WF_CHALLENGE_MAX_BODY) return null;
+    var visible = typeof result.extracted_text === 'string' ? result.extracted_text : '';
+    if (visible.length > WF_CHALLENGE_MAX_TEXT) return null;
+    var noscript = '';
+    var re = /<noscript\b[^>]*>([\s\S]*?)<\/noscript\s*>/gi, m;
+    while ((m = re.exec(body)) && noscript.length < 2000) noscript += ' ' + m[1].replace(/<[^>]+>/g, ' ');
+    var title = typeof result.page_title === 'string' ? result.page_title : '';
+    var all = title + '\n' + visible + '\n' + noscript;
+    var hit = WF_CHALLENGE_STRONG_RE.test(all);
+    if (!hit && wfWeakPhrases(title).length) hit = true;
+    if (!hit && wfWeakPhrases(visible + '\n' + noscript).length >= 2) hit = true;
+    if (!hit) return null;
+    return { access: !WF_CHALLENGE_STRONG_RE.test(all) && WF_CHALLENGE_ACCESS_RE.test(all) };
+}
+
+// web_fetch result hint. 403 / 503 / 999 MAY mean bot protection rather than
+// an unreachable site (503 may also be maintenance/outage; 999 is a
+// non-standard bot wall); 429 is a rate limit first (wait, back off); 401
+// most likely means not logged in (cookies are already sent). opts:
+//   inTab      — the request already ran inside a tab (don't suggest tab_id
+//                again; suggest reading the page / asking the user instead),
+//   retryAfter — Retry-After header value for 429/503,
+//   challenge  — a 2xx page flagged by wfChallengeSignal,
+//   access     — that page is "access denied"-style (hint adds "or access block"),
+//   title      — its page_title (quoted in the challenge hint).
+// ghAuth = getGitHubApiAuthForUrl(url) result: any GitHub match gets no hint.
+function webFetchBlockHint(status, ghAuth, opts) {
+    opts = opts || {};
+    if (ghAuth) return null;
+    var inTab = !!opts.inTab;
+    var ra = opts.retryAfter != null && String(opts.retryAfter).trim() ? String(opts.retryAfter).trim().slice(0, 40) : '';
+    var noTab = ' No iframe_tool (e.g. a sub-agent without the browser profile)? Report this to your parent / ask the user instead of concluding the site is blocked.';
+    var captcha = ' Never solve CAPTCHAs; if one appears, ask the user to solve it.';
+    var next = inTab
+        ? ' This request already ran inside the user\'s tab, so repeating the same fetch will not help: open the page in that tab with iframe_tool navigate and read it with get_visible_text/get_dom; if it shows a challenge, ask the user to complete it in that tab, then retry.'
+        : ' Retry with tab_id (an open tab of that site: list_instances otherTabs; or open one with iframe_tool navigate {tab_id:"new", url, wait:true} and close it afterwards), or read the page with iframe_tool get_dom/get_visible_text.';
+    if (status === 401) {
+        if (inTab) return 'HTTP 401 most likely means not logged in / auth required (the request already ran in the tab with the user\'s cookies). Ask the user to log in to the site in that tab, then retry.' + noTab;
+        return 'HTTP 401 most likely means not logged in / auth required (web_fetch already sends the browser\'s cookies). Ask the user to log in to the site, or retry with tab_id on a tab where they are logged in.' + noTab;
+    }
+    var lead;
+    if (status === 403) {
+        lead = 'HTTP 403 may mean bot protection, not that the site is unreachable.';
+    } else if (status === 429) {
+        lead = 'HTTP 429 means rate limited (too many requests): wait before retrying and back off' + (ra ? ' (Retry-After: ' + ra + ')' : ' (honor Retry-After if the site sends it)') + '; do not retry in a tight loop. If it persists, it may be bot protection.';
+    } else if (status === 503) {
+        lead = 'HTTP 503 may be bot protection, or the site may be down for maintenance / an outage (then wait and retry later' + (ra ? ', Retry-After: ' + ra : '') + ').';
+    } else if (status === 999) {
+        lead = 'HTTP 999 is a non-standard bot-wall response: the site is refusing automated requests, not unreachable.';
+    } else if (opts.challenge) {
+        var t = opts.title ? String(opts.title).replace(/\s+/g, ' ').trim().slice(0, 80) : '';
+        lead = 'HTTP ' + status + ' but the page looks like a verification / bot-protection challenge' + (opts.access ? ' or access block' : '') + (t ? ' (title: "' + t + '")' : '') + ', not the real content.';
+    } else {
+        return null;
+    }
+    return lead + next + noTab + captcha;
+}
+
+// Hint for a finished web_fetch result (normal or in-tab): status-based first,
+// then the 2xx challenge heuristic (also flags result.challenge_suspected).
+function wfResultHint(result, body, isHtml, ghAuth, opts) {
+    if (!result || ghAuth) return null;
+    opts = opts || {};
+    var h = webFetchBlockHint(result.status, null, opts);
+    if (h) return h;
+    var sig = result.status >= 200 && result.status < 300 ? wfChallengeSignal(result, body, isHtml) : null;
+    if (sig) {
+        result.challenge_suspected = true;
+        return webFetchBlockHint(result.status, null, Object.assign({}, opts, { challenge: true, access: sig.access, title: result.page_title }));
+    }
+    return null;
+}
+
+function wfInTabValidate(args) {
+    var tabId = args.tab_id;
+    if (typeof tabId === 'string' && /^\d+$/.test(tabId)) tabId = parseInt(tabId, 10);
+    if (typeof tabId !== 'number' || !isFinite(tabId) || tabId < 0 || Math.floor(tabId) !== tabId) {
+        return { error: 'tab_id must be a numeric Chrome tab id (list_instances otherTabs[].id or a tab_id returned by iframe_tool).' };
+    }
+    if (args.save_file || args.form || args.body_file_id || args.body_source || args.body_base64) {
+        return { error: 'tab_id (in-tab fetch) supports text bodies only — drop save_file/form/body_file_id/body_source/body_base64 (for binary downloads use web_fetch without tab_id, with save_file:true).' };
+    }
+    if (args.tab_world != null && args.tab_world !== 'ISOLATED' && args.tab_world !== 'MAIN') {
+        return { error: "tab_world must be 'ISOLATED' (default) or 'MAIN'." };
+    }
+    var u;
+    try { u = new URL(args.url); } catch (e) { return { error: 'tab_id fetch needs an absolute http(s) url.' }; }
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return { error: 'tab_id fetch needs an absolute http(s) url.' };
+    var method = String(args.method || 'GET').toUpperCase();
+    var init = { method: method, headers: Object.assign({}, args.headers || {}) };
+    if (args.body != null && method !== 'GET' && method !== 'HEAD') init.body = String(args.body);
+    var t = Number(args.timeout_ms);
+    return { tabId: tabId, world: args.tab_world === 'MAIN' ? 'MAIN' : 'ISOLATED', url: u.href, init: init, timeoutMs: t > 0 ? Math.min(t, 120000) : 30000 };
+}
+// Injected into the tab by executeScript — must stay self-contained.
+// textCtSrc = WF_TEXT_CT_SRC: a non-text response body is NOT read (binary:true).
+async function wfInTabFetchFunc(url, init, timeoutMs, textCtSrc) {
+    var ctl = (typeof AbortController === 'function') ? new AbortController() : null;
+    var timer = ctl ? setTimeout(function() { ctl.abort(); }, timeoutMs) : null;
+    var origin = '';
+    try { origin = location.origin; } catch (e) {}
+    try {
+        var opts = { method: init.method, headers: init.headers, credentials: 'include' };
+        if (init.body != null) opts.body = init.body;
+        if (ctl) opts.signal = ctl.signal;
+        var r = await fetch(url, opts);
+        var ct = r.headers.get('content-type') || '';
+        var ra = r.headers.get('retry-after') || '';
+        if (textCtSrc && ct.trim() && !(new RegExp(textCtSrc, 'i')).test(ct)) {
+            try { if (r.body && typeof r.body.cancel === 'function') r.body.cancel(); } catch (e2) {}
+            return { ok: true, binary: true, status: r.status, final_url: r.url, content_type: ct, retry_after: ra, page_origin: origin };
+        }
+        var text = await r.text();
+        return { ok: true, status: r.status, final_url: r.url, content_type: ct, retry_after: ra, body: text, page_origin: origin };
+    } catch (e) {
+        return { ok: false, error: String((e && e.message) || e), timed_out: !!(e && e.name === 'AbortError'), page_origin: origin };
+    } finally {
+        if (timer) clearTimeout(timer);
+    }
+}
+// ghAuth: getGitHubApiAuthForUrl(url) match (hint suppression only; no token).
+async function wfFetchInTab(args, scripting, ghAuth) {
+    var v = wfInTabValidate(args || {});
+    if (v.error) return { success: false, error: v.error };
+    if (!scripting || typeof scripting.executeScript !== 'function') return { success: false, error: 'tab_id fetch needs chrome.scripting (extension context).' };
+    var res;
+    try {
+        res = await scripting.executeScript({ target: { tabId: v.tabId }, world: v.world, func: wfInTabFetchFunc, args: [v.url, v.init, v.timeoutMs, WF_TEXT_CT_SRC] });
+    } catch (e) {
+        return { success: false, error: 'Could not run fetch in tab ' + v.tabId + ': ' + ((e && e.message) || e) };
+    }
+    var r = res && res[0] && res[0].result;
+    if (!r) return { success: false, error: 'In-tab fetch returned no result (tab ' + v.tabId + ' is navigating or not scriptable).' };
+    var crossOrigin = false;
+    try { crossOrigin = !!r.page_origin && new URL(v.url).origin !== r.page_origin; } catch (e) {}
+    if (!r.ok) {
+        var out = { success: false, error: 'In-tab fetch failed: ' + r.error, context: 'tab', tab_id: v.tabId, page_origin: r.page_origin };
+        if (r.timed_out) out.timed_out = true;
+        if (crossOrigin) out.hint = 'URL is cross-origin to the tab (' + r.page_origin + '), so the site\'s CORS policy applies. Use a tab on the URL\'s own origin, or an API host the site itself calls.';
+        return out;
+    }
+    // Binary response (flagged in the page, re-checked here in case the page
+    // func ran without the content-type source): never return garbled text.
+    if (r.binary || !wfIsTextContentType(r.content_type)) {
+        return { success: false, binary: true, status: r.status, content_type: r.content_type, final_url: r.final_url, context: 'tab', tab_id: v.tabId, page_origin: r.page_origin,
+            error: 'Response is binary (' + (r.content_type || 'unknown type') + '); tab_id (in-tab fetch) returns text bodies only.',
+            hint: 'Download it with web_fetch WITHOUT tab_id and with save_file:true (returns a file_id).' };
+    }
+    var result = { success: true, status: r.status, content_type: r.content_type, final_url: r.final_url, context: 'tab', tab_id: v.tabId, world: v.world, page_origin: r.page_origin, cross_origin: crossOrigin };
+    var isHtml = wfApplyTextBody(result, r.body, r.content_type);
+    var hint = wfResultHint(result, r.body, isHtml, ghAuth || null, { inTab: true, retryAfter: r.retry_after });
+    if (hint) result.hint = hint;
+    return result;
+}
+// WF_IN_TAB_END
 
 // =============================================
 // GitHub URL matching (shared)

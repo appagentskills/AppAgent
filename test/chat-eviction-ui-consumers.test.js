@@ -24,7 +24,7 @@ async function _env(chats, rows) {
     var body = 'var _skelScanMemo = {}, _skelScanWant = {}, _skelScanQueue = [], _skelScanBusy = false, _skelScanRerenders = [], _skelScanTimer = null;\n'
         + 'var _wsPrChatIdx = null, _wsPrChatIdxAt = 0;\n'
         + 'var _wsfMutatingActions = { write: 1, edit: 1, delete: 1, copy: 1, discard: 1 };\n'
-        + 'var _SKEL_SEARCH_KEEP = 3, _skelSearchQs = [], MAX_MATCHES_PER_CHAT = 50;\n'
+        + 'var _SKEL_SEARCH_KEEP = 3, _skelSearchQs = [], MAX_MATCHES_PER_CHAT = 50, searchIncludeInner = false;\n'
         + 'function escapeHtml(s) { return String(s); }\n'
         + 'function _reconcileWsPrSection() { calls.prSection++; }\n'
         + 'function renderVersionSidebar() { calls.sidebar++; }\n'
@@ -33,7 +33,7 @@ async function _env(chats, rows) {
         + _cutFns(u120, ['_isSkeletonChat', '_skelScanSig', '_skelClone', 'skeletonScanValue', '_skelScanPump']) + '\n'
         + _cutFns(u040, ['_wsPrChatLookup', '_wsPushedPrUrlsLive', '_wsPrChatIdxRerender']) + '\n'
         + _cutFns(u115, ['_wsfScanChat', '_wsfScanPacked', '_wsfSkelRerender', '_wsfScanChatLive', 'getWsEditedFilesForChat']) + '\n'
-        + _cutFns(u180, ['chatMatchesSearch', '_isSkelSearchChat', '_skelSearchRerender', '_skelSearchValue', '_pruneSkelSearchSlots', 'findAllSearchMatches']) + '\n'
+        + _cutFns(u180, ['_searchInner', '_searchText', 'chatMatchesSearch', '_isSkelSearchChat', '_skelSearchRerender', '_skelSearchValue', '_pruneSkelSearchSlots', 'findAllSearchMatches']) + '\n'
         + 'return { lookup: _wsPrChatLookup, wsf: _wsfScanChat, files: getWsEditedFilesForChat, match: chatMatchesSearch, snips: findAllSearchMatches,'
         + ' resetIdx: function() { _wsPrChatIdx = null; _wsPrChatIdxAt = 0; },'
         + ' busy: function() { return _skelScanBusy; } };';

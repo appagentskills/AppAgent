@@ -80,6 +80,7 @@ function expandDashboardWidget(widgetId) {
         // in this header's controls; it only shows when there is history to pick.
         (WidgetStore.versions(widgetId).length > 1 ? '<button class="widget-modal-btn widget-history-btn" onclick="showWidgetHistory(\'' + widgetId + '\')" title="' + escapeHtml(tn(WidgetStore.versions(widgetId).length, 'History ({count} version)', 'History ({count} versions)')) + '">' + UI_ICONS.history + '</button>' : '') +
         '<button class="widget-modal-btn" onclick="screenshotWidget(\'' + widgetId + '\')" title="' + escapeHtml(t('Screenshot')) + '">' + UI_ICONS.camera + '</button>' +
+        '<button class="widget-modal-btn widget-export-btn" onclick="exportWidgetHtmlDownload(\'' + widgetId + '\')" title="' + escapeHtml(t('Export HTML')) + '" aria-label="' + escapeHtml(t('Export HTML')) + '">' + UI_ICONS.download + '</button>' +
         '<button class="widget-modal-btn" onclick="openWidgetLink(\'' + widgetId + '\')" title="' + escapeHtml(t('Open in new tab')) + '" aria-label="' + escapeHtml(t('Open in new tab')) + '">' + UI_ICONS.externalLink + '</button>' +
         '<button class="widget-modal-btn widget-edit-btn" data-widget-id="' + widgetId + '" onclick="editWidgetWithAgent(\'' + widgetId + '\', event)" title="' + escapeHtml(t('Edit')) + '">' + UI_ICONS.edit + '</button>' +
         // Dashboard twin of the chat toolbar's manual code editor
@@ -831,12 +832,17 @@ function writeWidgetHtml(iframe, html, widgetId, options) {
         if (e.source !== iframe.contentWindow) return;
         if (e.data && e.data.type === 'widgetSandboxReady') {
             _wwhCancel();
+            // Split-pane live reload (core/082-split-view.js) hands over the
+            // captured UI state once; the sandbox restores it after the write.
+            var _restore = iframe.__restoreWidgetState || null;
+            iframe.__restoreWidgetState = null;
             // Resolve the theme at POST time (not at call time) so a flip during
             // the handshake can't ship a stale value.
             iframe.contentWindow.postMessage({
                 type: 'loadWidget',
                 instance_id: _liveWidget ? _liveWidget.instance_id : null,
                 html: _html,
+                restoreState: _restore,
                 theme: document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'light'
             }, '*');
         }
@@ -846,11 +852,19 @@ function writeWidgetHtml(iframe, html, widgetId, options) {
     // Chain into the iframe's cleanup hook (dashboard/fullscreen paths call it
     // on removal). Callers that overwrite __widgetCleanup later still get the
     // timeout fallback below; the local sandbox page loads in milliseconds.
-    var _prevCleanup = iframe.__widgetCleanup;
-    iframe.__widgetCleanup = function() {
-        _wwhCancel();
+    // NO GROWTH on re-writes of the SAME iframe (split-pane live reloads): the
+    // caller's original hook is kept in iframe.__baseCleanup and the wrapper is
+    // rebuilt from it instead of wrapping the previous wrapper. The wrapper
+    // closes over only iframe + base (the current write's cancel is read from
+    // iframe.__wwhCancel), so no old _html is retained. If something wrapped
+    // our hook after the last write (bindWidgetVersionResize), that chain
+    // becomes the new base.
+    if (!iframe.__wwhCleanupFn || iframe.__widgetCleanup !== iframe.__wwhCleanupFn) iframe.__baseCleanup = iframe.__widgetCleanup || null;
+    var _baseCleanup = iframe.__baseCleanup;
+    iframe.__wwhCleanupFn = iframe.__widgetCleanup = function() {
+        if (typeof iframe.__wwhCancel === 'function') { try { iframe.__wwhCancel(); } catch (e) {} }
         unregisterWidgetInstance(iframe);
-        if (typeof _prevCleanup === 'function') _prevCleanup();
+        if (typeof _baseCleanup === 'function') _baseCleanup();
     };
     _wwhTimer = setTimeout(function() {
         _wwhTimer = null;
@@ -955,6 +969,15 @@ window.addEventListener('message', async function(event) {
         // ancestor (e.g. a preview/fullscreen container) — never fabricated.
         var _srcInstance = widgetInstanceForIframe(_srcIframe);
         var _srcWidgetId = _srcInstance ? _srcInstance.widget_id : _widgetIdForIframe(_srcIframe);
+        // Export record & replay (tools/082-widget-export.js): read-only calls
+        // are recorded with their result; the hidden export pre-render may
+        // only make read-only calls.
+        var _wexId = (typeof widgetExportRecordingId === 'function') ? widgetExportRecordingId(_srcIframe, _srcWidgetId) : null;
+        if (typeof widgetExportIsOffscreenIframe === 'function' && widgetExportIsOffscreenIframe(_srcIframe) && !widgetExportIsRecordable(name, args)) {
+            try { event.source.postMessage({ type: 'widgetToolResult', id: id, error: 'Not available during HTML export pre-render: ' + name }, '*'); } catch (_e) {}
+            return;
+        }
+        if (_wexId) widgetExportNoteCall(_wexId, true);
 
         try {
             // executeTool checks permissions via requestProgrammaticToolApproval
@@ -985,6 +1008,8 @@ window.addEventListener('message', async function(event) {
                 delete result._screenshotMessage;
             }
 
+            if (_wexId) widgetExportRecordCall(_wexId, name, args, result);
+
             if (result && result.success === false && result.error) {
                 event.source.postMessage({ type: 'widgetToolResult', id: id, error: result.error }, '*');
             } else {
@@ -1002,6 +1027,7 @@ window.addEventListener('message', async function(event) {
                 console.warn('[widget] tool call ' + name + ' failed and reply could not be delivered:', _wtcErr);
             }
         }
+        if (_wexId) widgetExportNoteCall(_wexId, false);
     }
 });
 

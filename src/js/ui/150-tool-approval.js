@@ -82,7 +82,10 @@ async function requestProgrammaticToolApproval(toolName, args, options) {
     // only — an explicit user 'disabled'/'allow'/'auto' override is left
     // untouched (none of those equal 'ask'). isConfiguredGitHubApiUrl lives in
     // tools/020-tool-execution.js (same page bundle; hoisted function decl).
+    // NOT for tab_id (in-tab) calls: those run as the user inside a page and
+    // keep the normal web_fetch approval.
     if (toolName === 'web_fetch' && permission === 'ask' && args && args.url
+        && !(args.tab_id != null && args.tab_id !== '')
         && typeof isConfiguredGitHubApiUrl === 'function'
         && (await isConfiguredGitHubApiUrl(args.url))) {
         permission = 'auto';

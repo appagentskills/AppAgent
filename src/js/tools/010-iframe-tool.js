@@ -76,7 +76,7 @@ var IFRAME_TAB_ACTIONS = ['navigate', 'get_visible_text', 'get_dom', 'click', 'f
     'scroll', 'get_console_logs', 'get_network_requests', 'dispatch_event', 'select_option',
     'get_properties', 'set_style', 'get_page_info', 'resize'];
 
-var IFRAME_TAB_REQUIRED_HINT = 'Get ids from list_instances (instances[].activeTabs[].id; selfTabId / extensionTabs for the agent\'s own tab) '
+var IFRAME_TAB_REQUIRED_HINT = 'Get ids from list_instances (instances[].activeTabs[].id for ServiceNow tabs; otherTabs[].id for any other website tab; selfTabId / extensionTabs for the agent\'s own tab) '
     + 'or reuse the tab_id returned by a previous browser action / take_screenshot.';
 
 // True for any page of THIS extension (app.html in a tab, offscreen, etc.).
@@ -86,6 +86,86 @@ function _isExtensionOwnUrl(u) {
         var _base = (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.getURL) ? chrome.runtime.getURL('') : '';
         return !!_base && u.indexOf(_base) === 0;
     } catch (e) { return false; }
+}
+
+// Browser-internal pages Chrome itself never lets extensions script or capture:
+// chrome://, edge://, devtools://, view-source:, about: (except about:blank /
+// about:srcdoc), OTHER extensions' pages, and the Chrome Web Store. Any regular
+// website (http/https/file) is a valid target; this extension's own pages are
+// handled separately (_isExtensionOwnUrl).
+function _isBrowserInternalUrl(u) {
+    if (!u || typeof u !== 'string') return false;
+    var s = u.trim().toLowerCase();
+    if (_isExtensionOwnUrl(u)) return false;
+    if (/^(chrome|chrome-untrusted|chrome-search|chrome-extension|edge|brave|opera|vivaldi|devtools|view-source|moz-extension|extension):/.test(s)) return true;
+    if (/^about:/.test(s)) return !/^about:(blank|srcdoc)(?:[?#]|$)/.test(s);
+    if (/^https?:\/\/chromewebstore\.google\.com(?:[\/?#:]|$)/.test(s)) return true;
+    if (/^https?:\/\/chrome\.google\.com\/webstore(?:[\/?#]|$)/.test(s)) return true;
+    return false;
+}
+
+// Resolve navigate's OPTIONAL `instance` arg. `instance` only provides the base
+// for RELATIVE urls ("/incident_list.do"); an absolute url (any website, e.g. a
+// tab_id:"new" on https://shop.example.com) never needs it, so an `instance`
+// that matches no ServiceNow instance is ignored with a warning instead of
+// failing the call. Short names from list_instances ("dev12345") resolve via
+// Platform.instances; on a miss the page-side registry may simply be stale
+// (list_instances refreshes the SW copy, not the panel's), so refresh once and
+// retry before giving up. Returns {url} | {url:null, warning} | {error}.
+// Hard caps for navigate (ms): every await on this path is bounded so a stuck
+// registry probe (refreshInstances re-probes every open SN tab + the instance
+// REST API) or a tab whose content script never answers can never hang the
+// tool. refresh = instance-registry refresh on a short-name miss; ready = the
+// post-load content-script ping window; hardExtra = slack over `wait` before the
+// whole load wait is abandoned with loaded:false.
+var _navTimeouts = { refresh: 5000, ready: 3000, hardExtra: 5000 };
+function _navWithTimeout(p, ms, fallback) {
+    return new Promise(function(resolve) {
+        var done = false;
+        var t = setTimeout(function() { if (!done) { done = true; resolve(fallback); } }, ms);
+        function fin(v) { if (!done) { done = true; clearTimeout(t); resolve(v); } }
+        try { Promise.resolve(p).then(fin, function() { fin(fallback); }); } catch (e) { fin(fallback); }
+    });
+}
+// Cheap, probe-free short-name lookups: the active instance, then the origins
+// in the persisted per-origin token cache (chrome.storage instanceTokens, kept
+// by the SW's tab-ready / heartbeat). Returns a URL or null.
+async function _navCachedShortName(instance) {
+    function sn(u) { return String(u || '').replace(/^https?:\/\//, '').split(/[.\/]/)[0]; }
+    if (Platform.instanceUrl && sn(Platform.instanceUrl) === instance) return String(Platform.instanceUrl).replace(/\/+$/, '');
+    if (typeof chrome === 'undefined' || !chrome || !chrome.storage || !chrome.storage.local || typeof chrome.storage.local.get !== 'function') return null;
+    var map = await _navWithTimeout(new Promise(function(r) {
+        try { chrome.storage.local.get('instanceTokens', function(d) { r((d && d.instanceTokens) || {}); }); } catch (e) { r({}); }
+    }), 1000, {});
+    var origins = Object.keys(map || {});
+    for (var i = 0; i < origins.length; i++) if (sn(origins[i]) === instance) return origins[i].replace(/\/+$/, '');
+    return null;
+}
+
+async function _resolveNavInstance(instance, url) {
+    if (!instance || typeof Platform === 'undefined' || !Platform || typeof Platform.resolveInstanceUrl !== 'function') return { url: null };
+    var isRelative = typeof url === 'string' && url.charAt(0) === '/';
+    var resolved = null, refreshTimedOut = false;
+    try { resolved = Platform.resolveInstanceUrl(instance); } catch (e) { resolved = null; }
+    if (!resolved && isRelative) {
+        try { resolved = await _navCachedShortName(instance); } catch (e) { resolved = null; }
+    }
+    if (!resolved && isRelative && typeof Platform.refreshInstances === 'function') {
+        // Bounded: on timeout keep the last-known registry (the refresh may still
+        // land later and update it for the next call).
+        var TO = {};
+        var rr = await _navWithTimeout((function() { try { return Platform.refreshInstances(); } catch (e) { return null; } })(), _navTimeouts.refresh, TO);
+        refreshTimedOut = (rr === TO);
+        try { resolved = Platform.resolveInstanceUrl(instance); } catch (e) { resolved = null; }
+    }
+    if (resolved) return { url: resolved };
+    if (isRelative) {
+        var known = (Platform.instances || []).map(function(i) { return i && i.shortName; }).filter(Boolean);
+        return { error: 'Unknown instance "' + instance + '" for relative url ' + url + '. Pass a known instance short name'
+            + (known.length ? ' (' + known.join(', ') + ')' : '') + ', a hostname, or an absolute url (any website works with an absolute url; instance is optional). See list_instances.'
+            + (refreshTimedOut ? ' (The instance registry refresh timed out after ' + _navTimeouts.refresh + 'ms; a hostname such as ' + instance + '.service-now.com skips it.)' : '') };
+    }
+    return { url: null, warning: 'Ignored instance "' + instance + '": it is not a known ServiceNow instance, and instance is only used to resolve relative urls (an absolute url works on any website without it).' };
 }
 
 // Validate an explicit browser-action target. Returns {tabId} (a number, or 'new'
@@ -113,6 +193,14 @@ async function resolveBrowserTabTarget(rawTabId, action, opts) {
         try { tab = await chrome.tabs.get(tid); }
         catch (e) { tab = null; }
         if (!tab) return { error: 'tab_id ' + tid + ' is not an open tab (it may have been closed). ' + IFRAME_TAB_REQUIRED_HINT };
+    }
+    // Any regular website tab is targetable (not just ServiceNow / extension tabs).
+    // Browser-internal pages are refused for read/interact/screenshot actions
+    // because Chrome blocks scripting/capture there; navigate AWAY from one
+    // (e.g. chrome://newtab) and close stay allowed.
+    if (tab && action !== 'navigate' && action !== 'close' && _isBrowserInternalUrl(tab.url || tab.pendingUrl)) {
+        return { error: 'tab_id ' + tid + ' shows a browser-internal page (' + String(tab.url || tab.pendingUrl).slice(0, 80) + ') that Chrome does not let extensions read, click or capture. '
+            + 'Navigate it to a regular website first, or pick another tab_id. ' + IFRAME_TAB_REQUIRED_HINT };
     }
     if (action === 'navigate' && tab && _isExtensionOwnUrl(tab.url || tab.pendingUrl)) {
         return { error: 'Refusing to navigate tab ' + tid + ': it is the extension\'s own tab (navigating it would unload the agent UI). '
@@ -156,6 +244,9 @@ async function executeIframeTool(args, options) {
     if (_needsTab) {
         var _tgt = await resolveBrowserTabTarget(args.tab_id, args.action);
         if (_tgt.error) return { success: false, error: _tgt.error };
+        if (args.action === 'navigate' && typeof args.url === 'string' && _isBrowserInternalUrl(args.url)) {
+            return { success: false, error: 'Refusing to navigate to ' + args.url.slice(0, 80) + ': browser-internal pages (chrome://, other extensions, Chrome Web Store, ...) cannot be driven by the agent. Any regular http(s) website is allowed.' };
+        }
         _ifTabId = _tgt.tabId;
     } else if (args && !args.widget_id && args.action === 'close' && args.tab_id != null && args.tab_id !== '') {
         // close with an explicit tab_id closes THAT Chrome tab (never silently ignored).
@@ -235,14 +326,11 @@ async function _executeIframeToolImpl(args, _ifChatId, options, _ifTabId) {
                 if (action === 'navigate') {
                     if (!args.url) return { success: false, error: 'URL is required for navigate action' };
 
-                    // Resolve instance targeting
-                    var _navInstanceUrl = null;
-                    if (args.instance && Platform.resolveInstanceUrl) {
-                        _navInstanceUrl = Platform.resolveInstanceUrl(args.instance);
-                        if (!_navInstanceUrl) {
-                            return { success: false, error: 'Unknown instance "' + args.instance + '". Use list_instances to see available instances.' };
-                        }
-                    }
+                    // Resolve optional instance targeting (only matters for relative urls)
+                    var _navInst = await _resolveNavInstance(args.instance, args.url);
+                    if (_navInst.error) return { success: false, error: _navInst.error };
+                    var _navInstanceUrl = _navInst.url || null;
+                    var _navInstanceWarning = _navInst.warning || null;
 
                     // Full-tab mode: navigate exactly the tab the caller named (tab_id),
                     // or open a new background tab for tab_id:"new" (app stays alive).
@@ -280,19 +368,25 @@ async function _executeIframeToolImpl(args, _ifChatId, options, _ifTabId) {
                         }
                         // If wait requested, wait for the tab to finish loading then inject scripts
                         // Otherwise ask background to inject when page loads (non-blocking)
+                        var _loadReason = null;
                         if (_waitMs > 0) {
-                            await new Promise(function(resolve) {
+                            var _cleanupNav = null;
+                            _loadReason = await _navWithTimeout(new Promise(function(resolve) {
                                 var _resolved = false;
                                 var _loadingSeen = false;
-                                function _finish(reason) {
-                                    if (_resolved) return;
-                                    _resolved = true;
+                                function _detach() {
                                     chrome.tabs.onUpdated.removeListener(_navListener);
                                     chrome.tabs.onUpdated.removeListener(_earlyListener);
                                     chrome.tabs.onRemoved.removeListener(_navOnRemoved);
                                     clearTimeout(_navTimeout);
                                     clearTimeout(_sameUrlCheck);
-                                    if (reason === 'removed') { resolve(); return; }
+                                }
+                                _cleanupNav = function() { _resolved = true; _detach(); };
+                                function _finish(reason) {
+                                    if (_resolved) return;
+                                    _resolved = true;
+                                    _detach();
+                                    if (reason === 'removed') { resolve(reason); return; }
                                     chrome.runtime.sendMessage({ type: 'setup-tab-injection', tabId: _targetTab.id });
                                     // Readiness handshake: after re-arming injection, poll the
                                     // content script with a cheap action until it responds
@@ -300,18 +394,20 @@ async function _executeIframeToolImpl(args, _ifChatId, options, _ifTabId) {
                                     // the "message port closed" race where the very next read
                                     // action hits a tab whose content script isn't ready yet.
                                     // Fully defensive: never throws, always resolves.
-                                    var _readyDeadline = Date.now() + 3000;
+                                    var _readyDeadline = Date.now() + _navTimeouts.ready;
                                     (async function _pollReady() {
                                         while (Date.now() < _readyDeadline) {
                                             try {
-                                                var _ping = await Platform.sendBrowserAction('get_page_info', {}, _targetTab.id);
-                                                if (_ping && !_ping.error) { resolve(); return; }
+                                                // Each ping is bounded by the remaining window: a
+                                                // content script that never answers can't stall it.
+                                                var _ping = await _navWithTimeout(Platform.sendBrowserAction('get_page_info', {}, _targetTab.id), Math.max(50, _readyDeadline - Date.now()), null);
+                                                if (_ping && !_ping.error) { resolve(reason); return; }
                                             } catch (e) { /* not ready yet */ }
                                             await new Promise(function(r){ setTimeout(r, 150); });
                                         }
                                         // Cap reached: fall through with a brief SPA settle.
                                         var settle = (reason === 'complete') ? 1000 : 0;
-                                        setTimeout(resolve, settle);
+                                        setTimeout(function() { resolve(reason); }, settle);
                                     })();
                                 }
                                 var _navTimeout = setTimeout(function() { _finish('timeout'); }, _waitMs);
@@ -339,7 +435,8 @@ async function _executeIframeToolImpl(args, _ifChatId, options, _ifTabId) {
                                         }
                                     });
                                 }, 1500);
-                            });
+                            }), _waitMs + _navTimeouts.ready + _navTimeouts.hardExtra, 'hard-timeout');
+                            if (_loadReason === 'hard-timeout' && _cleanupNav) _cleanupNav();
                         } else {
                             if (_earlyListener) chrome.tabs.onUpdated.removeListener(_earlyListener);
                             chrome.runtime.sendMessage({ type: 'setup-tab-injection', tabId: _targetTab.id });
@@ -348,7 +445,15 @@ async function _executeIframeToolImpl(args, _ifChatId, options, _ifTabId) {
                         var _navMsg = _reuseTab
                             ? 'Navigated the existing tab (id ' + _targetTab.id + ') to ' + fullTabNavUrl + ' \u2014 same tab reused in place, not brought to the foreground'
                             : 'Opened ' + fullTabNavUrl + ' in a new background tab (id ' + _targetTab.id + ')';
-                        return { success: true, message: _navMsg, tab_id: _targetTab.id, opened_new_tab: !_reuseTab };
+                        var _navRes = { success: true, message: _navMsg, tab_id: _targetTab.id, opened_new_tab: !_reuseTab };
+                        var _navWarnings = [];
+                        if (_navInstanceWarning) _navWarnings.push(_navInstanceWarning);
+                        if (_waitMs > 0) {
+                            _navRes.loaded = (_loadReason === 'complete' || _loadReason === 'already-complete');
+                            if (!_navRes.loaded) _navWarnings.push('The page did not report loaded within the wait (' + (_loadReason || 'unknown') + ', ' + _waitMs + 'ms); the tab (id ' + _targetTab.id + ') is open \u2014 retry a read action or take a screenshot to check it.');
+                        }
+                        if (_navWarnings.length) _navRes.warning = _navWarnings.join(' ');
+                        return _navRes;
                     }
 
                     // For sidepanel mode with instance targeting, resolve URL before sending

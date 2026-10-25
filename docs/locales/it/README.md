@@ -102,7 +102,7 @@ AppAgent è un'estensione di Chrome con un ciclo agentico integrato. Descrivi co
 ## Configurazione
 
 1. **Installa**: installa l'estensione AppAgent dal Chrome Web Store (oppure caricala come estensione non pacchettizzata per lo sviluppo)
-2. **Ottieni una chiave API**: registrati su [OpenRouter](https://openrouter.ai), usa direttamente Anthropic/OpenAI oppure collega il tuo abbonamento Claude Code (Enterprise o Personal)
+2. **Ottieni una chiave API**: registrati su [OpenRouter](https://openrouter.ai) o [Hugging Face](https://huggingface.co/docs/inference-providers), usa direttamente Anthropic/OpenAI oppure collega il tuo abbonamento Claude Code (Enterprise o Personal)
 3. **Configura**: apri l'estensione e aggiungi la tua chiave API (oppure accedi con Claude) in Impostazioni → Provider API
 4. **Inizia a creare**: apri la tua istanza ServiceNow in una scheda (viene rilevata automaticamente) e inizia a chattare
 

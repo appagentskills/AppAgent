@@ -1,8 +1,29 @@
-// Search chats by title and content (including tool calls and results)
-// Uses indexOf for fast matching - returns true on first match (early exit)
-function chatMatchesSearch(chat, query, onLate) {
+// Search scope. Default: title + what the user typed + the model's
+// user-visible text (user/assistant `content`). "Include inner model text"
+// (history page checkbox, #history-search-inner) adds tool calls (name +
+// arguments) and tool results — those matched almost everything and made
+// results misleading. Persisted in appStorage ('searchIncludeInner'),
+// restored in init() (core/120-init.js) — no storage access at load time.
+// Shared by the history page and the sidebar search.
+var searchIncludeInner = false;
+function _searchInner(opts) {
+    return (opts && typeof opts.includeInner === 'boolean') ? opts.includeInner : !!searchIncludeInner;
+}
+// Non-string content (block arrays, objects) must never throw out of a scan.
+function _searchText(v) {
+    if (v == null) return '';
+    if (typeof v === 'string') return v;
+    if (Array.isArray(v)) return v.map(function(b) { return (b && typeof b.text === 'string') ? b.text : (typeof b === 'string' ? b : ''); }).join('\n');
+    if (typeof v.text === 'string') return v.text;
+    return '';
+}
+
+// Search chats by title and visible content (inner tool calls/results only
+// when includeInner). indexOf, early exit on first match.
+function chatMatchesSearch(chat, query, onLate, opts) {
     if (!query || query.length < 2) return true; // Require at least 2 chars
     var q = query.toLowerCase();
+    var inner = _searchInner(opts);
     // Check title first (fast check)
     if (chat.title && chat.title.toLowerCase().indexOf(q) !== -1) return true;
     // C2-ui SKEL-SCAN: an evicted skeleton is matched against its stored row
@@ -10,21 +31,23 @@ function chatMatchesSearch(chat, query, onLate) {
     // that lands it reports no match and the list re-renders once (onLate,
     // default: the sidebar chat list).
     if (_isSkelSearchChat(chat)) {
-        var _sv = _skelSearchValue(chat, query, onLate);
+        var _sv = _skelSearchValue(chat, query, onLate, inner);
         return !!(_sv && _sv.hit);
     }
     // Check all messages for complete results
     if (chat.messages) {
         for (var i = 0; i < chat.messages.length; i++) {
             var msg = chat.messages[i];
-            // Check message content
-            if (msg.content && msg.content.toLowerCase().indexOf(q) !== -1) return true;
-            // Check tool calls
+            if (!msg) continue;
+            // Visible text: what the user typed and what the model told the user.
+            if ((msg.role === 'user' || msg.role === 'assistant') && _searchText(msg.content).toLowerCase().indexOf(q) !== -1) return true;
+            if (!inner) continue;
+            // Inner: tool calls and tool results.
             if (msg.tool_calls) {
                 for (var j = 0; j < msg.tool_calls.length; j++) {
                     var tc = msg.tool_calls[j];
                     if (tc.function && tc.function.name && tc.function.name.toLowerCase().indexOf(q) !== -1) return true;
-                    if (tc.function && tc.function.arguments && tc.function.arguments.toLowerCase().indexOf(q) !== -1) return true;
+                    if (tc.function && tc.function.arguments && String(tc.function.arguments).toLowerCase().indexOf(q) !== -1) return true;
                 }
             }
             // Check tool results
@@ -41,7 +64,7 @@ function chatMatchesSearch(chat, query, onLate) {
 // {hit, snips}, so a match and its snippets land from a single row read.
 // Slots are kept for the last few queries only, so typing does not grow
 // the memo.
-var _SKEL_SEARCH_KEEP = 3;
+var _SKEL_SEARCH_KEEP = 6;
 var _skelSearchQs = [];
 function _isSkelSearchChat(chat) {
     return !!chat && !Array.isArray(chat.messages) && !!chat._messagesEvicted && typeof skeletonScanValue === 'function';
@@ -49,14 +72,17 @@ function _isSkelSearchChat(chat) {
 function _skelSearchRerender() {
     if (typeof renderChatList === 'function') renderChatList();
 }
-function _skelSearchValue(chat, query, onLate) {
-    var q = query.toLowerCase();
+function _skelSearchValue(chat, query, onLate, inner) {
+    // Slot key carries the scope so toggling the checkbox never reuses the
+    // other scope's memoized answer.
+    var q = (inner ? 'i:' : 'v:') + query.toLowerCase();
     if (_skelSearchQs.indexOf(q) === -1) {
         _skelSearchQs.push(q);
         if (_skelSearchQs.length > _SKEL_SEARCH_KEEP) _pruneSkelSearchSlots(_skelSearchQs.shift());
     }
+    var o = { includeInner: !!inner };
     return skeletonScanValue('search:' + q, chat.id, chat, function(c) {
-        return { hit: chatMatchesSearch(c, query), snips: findAllSearchMatches(c, query) };
+        return { hit: chatMatchesSearch(c, query, null, o), snips: findAllSearchMatches(c, query, o) };
     }, null, typeof onLate === 'function' ? onLate : _skelSearchRerender);
 }
 function _pruneSkelSearchSlots(oldQ) {
@@ -351,12 +377,13 @@ function _renderChatListNow() {
 
 // Find ALL search matches in a chat with metadata for navigation
 var MAX_MATCHES_PER_CHAT = 50; // Limit displayed matches per chat
-function findAllSearchMatches(chat, query) {
+function findAllSearchMatches(chat, query, opts, onLate) {
     if (!query || query.length < 2) return []; // Require at least 2 chars
     var q = query.toLowerCase();
+    var inner = _searchInner(opts);
     // C2-ui SKEL-SCAN: snippets of an evicted skeleton come from its stored row.
     if (_isSkelSearchChat(chat)) {
-        var _sv = _skelSearchValue(chat, query);
+        var _sv = _skelSearchValue(chat, query, onLate, inner);
         return (_sv && Array.isArray(_sv.snips)) ? _sv.snips : [];
     }
     var snippetLength = 40; // chars before and after match
@@ -380,10 +407,12 @@ function findAllSearchMatches(chat, query) {
     if (chat.messages) {
         for (var i = 0; i < chat.messages.length; i++) {
             var msg = chat.messages[i];
+            if (!msg) continue;
+            var msgText = _searchText(msg.content);
             
             // Check message content (user/assistant messages)
-            if (msg.content && (msg.role === 'user' || msg.role === 'assistant')) {
-                var contentLower = msg.content.toLowerCase();
+            if (msgText && (msg.role === 'user' || msg.role === 'assistant')) {
+                var contentLower = msgText.toLowerCase();
                 var searchPos = 0;
                 var idx;
                 var occurrenceInContent = 0;
@@ -394,20 +423,22 @@ function findAllSearchMatches(chat, query) {
                         msgIndex: i,
                         role: msg.role,
                         occurrenceIndex: occurrenceInContent,
-                        snippet: createSnippet(msg.content, idx, query.length)
+                        snippet: createSnippet(msgText, idx, query.length)
                     });
                     occurrenceInContent++;
                     searchPos = idx + 1;
                 }
             }
             if (matches.length >= MAX_MATCHES_PER_CHAT) break;
+            if (!inner) continue; // tool calls/results only with "Include inner model text"
             
             // Check tool calls
             if (msg.tool_calls && matches.length < MAX_MATCHES_PER_CHAT) {
                 for (var j = 0; j < msg.tool_calls.length && matches.length < MAX_MATCHES_PER_CHAT; j++) {
                     var tc = msg.tool_calls[j];
                     if (tc.function && tc.function.arguments) {
-                        var argsLower = tc.function.arguments.toLowerCase();
+                        var argsStr = String(tc.function.arguments);
+                        var argsLower = argsStr.toLowerCase();
                         var argSearchPos = 0;
                         var argIdx;
                         var occurrenceInToolCall = 0;
@@ -419,7 +450,7 @@ function findAllSearchMatches(chat, query) {
                                 toolCallIndex: j,
                                 toolName: tc.function.name,
                                 occurrenceIndex: occurrenceInToolCall,
-                                snippet: createSnippet(tc.function.arguments, argIdx, query.length)
+                                snippet: createSnippet(argsStr, argIdx, query.length)
                             });
                             occurrenceInToolCall++;
                             argSearchPos = argIdx + 1;
@@ -455,7 +486,7 @@ function findAllSearchMatches(chat, query) {
 }
 
 // Navigate to a search match
-function navigateToSearchMatch(chatId, match) {
+function navigateToSearchMatch(chatId, match, query) {
     // Select the chat first
     if (currentChatId !== chatId) {
         selectChat(chatId);
@@ -466,7 +497,10 @@ function navigateToSearchMatch(chatId, match) {
     if (typeof ensureMessageInWindow === 'function' && match) ensureMessageInWindow(match.msgIndex);
     
     // First enable highlighting
-    window.currentSearchHighlight = chatSearchQuery;
+    // The history page renders rows with a temporary chatSearchQuery and
+    // restores it afterwards, so a click from there must pass its own query
+    // (else the highlight was '' and nothing was highlighted or scrolled to).
+    window.currentSearchHighlight = query || chatSearchQuery;
     renderMessages();
     
     // Helper to get the nth highlight element
@@ -578,8 +612,8 @@ function renderChatItem(c) {
     // and the sidebar reverts to the normal renderer below.
     var displayContent;
     if (chatSearchQuery) {
-        var matches = findAllSearchMatches(c, chatSearchQuery);
-        searchMatchesCache[c.id] = matches; // Cache for click handling
+        var matches = findAllSearchMatches(c, chatSearchQuery, null, _chatItemSearchOnLate);
+        searchMatchesCache[c.id] = { matches: matches, query: chatSearchQuery }; // Cache for click handling
         // A chat admitted by its title alone has 0 message hits: label it
         // "(title match)" instead of a misleading "(0 matches)".
         var titleHit = !matches.length && !!c.title && c.title.toLowerCase().indexOf(chatSearchQuery.toLowerCase()) !== -1;
@@ -702,10 +736,15 @@ function chatItemKeydown(e, row, id) {
 
 // Handle click on search snippet
 function handleSearchSnippetClick(chatId, matchIndex) {
-    var matches = searchMatchesCache[chatId];
+    var entry = searchMatchesCache[chatId];
+    var matches = entry && entry.matches;
     if (!matches || !matches[matchIndex]) return;
-    navigateToSearchMatch(chatId, matches[matchIndex]);
+    navigateToSearchMatch(chatId, matches[matchIndex], entry.query);
 }
+
+// Re-render hook for late skeleton snippets; the history page sets it while
+// it renders rows so the history list (not only the sidebar) refreshes.
+var _chatItemSearchOnLate = null;
 
 // ATTRIBUTE-safe wrapper around escapeHtml. escapeHtml covers & < > " ' but
 // NOT newlines, and a raw \n inside an attribute VALUE survives into the

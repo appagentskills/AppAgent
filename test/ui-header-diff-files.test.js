@@ -209,7 +209,7 @@ describe('ui diff viewer › openDiffViewer / navigateDiffChange', function() {
             getLatestRecordXml: o.getLatestRecordXml || function() { return Promise.resolve(o.latestXml || null); },
             showSnackbar: U.recorder(), showSpinner: U.recorder(), hideSpinner: U.recorder() };
         Object.assign(g, o.globals || {}); // per-test extra stubs (prettyPrintXml, URL, Blob)
-        var m = await loadLenient(ICONS.concat([ESC, 'src/js/ui/100-diff-viewer.js']), g);
+        var m = await loadLenient(ICONS.concat([ESC, 'src/js/core/150-record-helpers.js', 'src/js/ui/100-diff-viewer.js']), g);
         var dom = await U.mountDom({ html: '', css: ALL_CSS });
         return { m: m, g: g, dom: dom };
     }
@@ -235,7 +235,7 @@ describe('ui diff viewer › openDiffViewer / navigateDiffChange', function() {
         assert.strictEqual(opts[1].textContent, 'Before <b>', 'labels escaped');
         assert.strictEqual(sel.value, 'v1', 'first chat version preselected');
         assert.deepStrictEqual(Array.prototype.map.call(sel.querySelectorAll('optgroup'), function(g) { return g.label; }), ['This Chat', 'Earlier History']);
-        assert.deepStrictEqual(s.g.getHistoricalVersions.calls[0], ['sys_script', 'abc', ['v1', 'v2']]);
+        assert.deepStrictEqual(s.g.getHistoricalVersions.calls[0], ['sys_script', 'abc', ['v1', 'v2'], undefined]); // trailing instanceUrl: undefined = active instance (openDiffViewer normalises a missing one to undefined)
         assert.strictEqual(ov.querySelector('.diff-stat.add').textContent, '+2');
         assert.strictEqual(ov.querySelector('.diff-stat.remove').textContent, '-2');
         assert.strictEqual(ov.querySelectorAll('[data-hunk-start]').length, 2);
@@ -402,7 +402,7 @@ describe('ui diff viewer › openDiffViewer / navigateDiffChange', function() {
         proto.click = function() { downloads.push(this.download); }; // record instead of saving a file
         try {
             var dl = s.m.downloadFromDiffViewer();
-            assert.deepStrictEqual(getLatest.calls, [['sys_script', 'abc']]);
+            assert.deepStrictEqual(getLatest.calls, [['sys_script', 'abc', undefined]]); // trailing instanceUrl: undefined = active instance
             s.m.closeDiffViewer();
             assert.strictEqual(document.getElementById('diff-viewer-overlay'), null);
             assert.strictEqual(s.m.__scope.currentDiffFile, null);
@@ -840,7 +840,7 @@ describe('version history › combined XML export', function() {
     async function exportEngine(incidentOk) {
         var t = { blob: null, snack: U.recorder() };
         function resp(ok, body) { return { ok: ok, status: ok ? 200 : 404, json: async function() { return body; }, text: async function() { return String(body); } }; }
-        t.m = await loadLenient(ICONS.concat([ESC, 'src/js/ui/090-version-history.js']), {
+        t.m = await loadLenient(ICONS.concat([ESC, 'src/js/core/150-record-helpers.js', 'src/js/ui/090-version-history.js']), {
             window: winStub(),
             fetch: async function(url) {
                 if (url.indexOf('/api/now/table/sys_update_version/' + VER) === 0) return resp(true, { result: { payload: '<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include"><sys_script_include action="INSERT_OR_UPDATE"><name>ZZ Include</name></sys_script_include></record_update>' } });

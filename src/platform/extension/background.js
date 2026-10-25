@@ -28,7 +28,7 @@ let loginTabId = null;
 // Probe a tab for ServiceNow by checking window.g_ck in the page's JS context
 async function probeTab(tabId) {
     try {
-        var results = await chrome.scripting.executeScript({
+        var results = await snWithTimeout(chrome.scripting.executeScript({
             target: { tabId: tabId },
             world: 'MAIN',
             func: function() {
@@ -38,7 +38,7 @@ async function probeTab(tabId) {
                     origin: window.location.origin
                 };
             }
-        });
+        }), snTimeoutMs('tab'), null);
         return results && results[0] && results[0].result || null;
     } catch(e) {
         return null; // Can't inject (chrome://, edge cases)
@@ -1252,14 +1252,44 @@ async function getSnTabList() {
 // (used by the agent loop). Extracted so we have a single source of truth and
 // the SW doesn't have to sendMessage to itself.
 
+// Bound a probe promise: resolve `fallback` after ms (or on rejection). A tab
+// that is frozen / blocked by a dialog / never reaches document_idle makes
+// chrome.scripting.executeScript wait forever, and a hibernating instance can
+// stall fetch for minutes — either used to hang snGetInstancesDetailed and so
+// list_instances, the picker and iframe_tool's instance resolution.
+// self.__snTimeouts {tab, fetch} overrides the defaults (tests).
+function snTimeoutMs(kind) {
+    var o = (typeof self !== 'undefined' && self && self.__snTimeouts) || {};
+    return o[kind] || ({ tab: 2500, fetch: 6000 })[kind] || 5000;
+}
+function snWithTimeout(p, ms, fallback) {
+    return new Promise(function(resolve) {
+        var done = false;
+        var t = setTimeout(function() { if (!done) { done = true; resolve(fallback); } }, ms);
+        Promise.resolve(p).then(function(v) { if (!done) { done = true; clearTimeout(t); resolve(v); } },
+            function() { if (!done) { done = true; clearTimeout(t); resolve(fallback); } });
+    });
+}
+// fetch with a hard deadline: aborts the request and rejects with a timeout error.
+function snFetchWithTimeout(url, opts) {
+    var ac = (typeof AbortController === 'function') ? new AbortController() : null;
+    var TO = {};
+    var o = Object.assign({}, opts || {});
+    if (ac) o.signal = ac.signal;
+    return snWithTimeout(fetch(url, o), snTimeoutMs('fetch'), TO).then(function(r) {
+        if (r === TO) { try { if (ac) ac.abort(); } catch (e) {} throw new Error('timeout'); }
+        return r;
+    });
+}
+
 // Probe one tab for { token, userName } from its MAIN world. Returns null on failure.
 async function snProbeTabTokenUser(tabId) {
     try {
-        var results = await chrome.scripting.executeScript({
+        var results = await snWithTimeout(chrome.scripting.executeScript({
             target: { tabId: tabId },
             world: 'MAIN',
             func: function() { return { token: window.g_ck || '', userName: (window.NOW && window.NOW.user_name) || '' }; }
-        });
+        }), snTimeoutMs('tab'), null);
         return (results && results[0] && results[0].result) || null;
     } catch (e) {
         return null;
@@ -1276,7 +1306,7 @@ async function snFetchUserName(instanceUrl, token) {
         // credentials:'include' — see snFetchUserRoles: keeps the cross-origin GET
         // authenticated for tab-less instances via the still-valid session cookie
         // when the cached X-UserToken is stale.
-        var apiRes = await fetch(instanceUrl + '/api/now/table/sys_user?sysparm_query=sys_id=javascript:gs.getUserID()&sysparm_fields=user_name,name&sysparm_limit=1', {
+        var apiRes = await snFetchWithTimeout(instanceUrl + '/api/now/table/sys_user?sysparm_query=sys_id=javascript:gs.getUserID()&sysparm_fields=user_name,name&sysparm_limit=1', {
             method: 'GET',
             credentials: 'include',
             headers: { 'X-UserToken': token, 'Accept': 'application/json' }
@@ -1299,7 +1329,7 @@ async function snFetchUserRoles(instanceUrl, token) {
         // still authenticates for tab-less instances whose cached g_ck (X-UserToken)
         // has gone stale — the cookie stays valid as long as the heartbeat's
         // touch-session keeps returning non-401. Mirrors heartbeatAllInstances.
-        var rolesRes = await fetch(instanceUrl + '/api/now/table/sys_user_has_role?sysparm_query=user=javascript:gs.getUserID()^inherited=false&sysparm_fields=role.name&sysparm_limit=500', {
+        var rolesRes = await snFetchWithTimeout(instanceUrl + '/api/now/table/sys_user_has_role?sysparm_query=user=javascript:gs.getUserID()^inherited=false&sysparm_fields=role.name&sysparm_limit=500', {
             method: 'GET',
             credentials: 'include',
             headers: { 'X-UserToken': token, 'Accept': 'application/json' }
@@ -1849,7 +1879,7 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
         (async function() {
             var tabId = message.targetTabId;
             try { await chrome.tabs.get(tabId); } catch(e) {
-                sendResponse({ error: 'tab_id ' + tabId + ' is not an open tab (it may have been closed). Get a current id from list_instances (instances[].activeTabs[].id) or use navigate with tab_id:"new".' });
+                sendResponse({ error: 'tab_id ' + tabId + ' is not an open tab (it may have been closed). Get a current id from list_instances (instances[].activeTabs[].id or otherTabs[].id) or use navigate with tab_id:"new".' });
                 return;
             }
             chrome.tabs.sendMessage(tabId, message, function(response) {
@@ -1914,9 +1944,11 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
 
     // List all instances WITH tokens and user info (for multi-instance support)
     if (message.type === 'list-sn-instances-detailed') {
+        // .catch: a rejected probe used to leave the panel's callback (and so
+        // Platform.refreshInstances) pending forever.
         snGetInstancesDetailed().then(function(instances) {
             sendResponse({ instances: instances });
-        });
+        }).catch(function(e) { sendResponse({ instances: null, error: String(e && e.message || e) }); });
         return true;
     }
 
@@ -2211,7 +2243,7 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
 // --- Navigation handlers ---
 
 var BROWSER_ACTION_TAB_REQUIRED_ERROR = 'tab_id is required for browser actions (no fallback to the active tab). '
-    + 'Get ids from list_instances (instances[].activeTabs[].id; selfTabId / extensionTabs for the agent\'s own tab), '
+    + 'Get ids from list_instances (instances[].activeTabs[].id for ServiceNow tabs; otherTabs[].id for any other website tab; selfTabId / extensionTabs for the agent\'s own tab), '
     + 'reuse the tabId returned by a previous browser action, or use navigate with tab_id:"new" to open a new tab.';
 var OWN_TAB_NAVIGATE_ERROR = 'Refusing to navigate the extension\'s own tab (it would unload the agent UI). '
     + 'Pick another tab_id from list_instances, or use navigate with tab_id:"new". Screenshots and reads of the own tab are allowed.';
@@ -2449,7 +2481,7 @@ async function handleScreenshot(targetTabId, sendResponse) {
                     });
                 }
             } catch(e) {
-                sendResponse({ error: 'tab_id ' + targetTabId + ' is not an open tab (it may have been closed). Get a current id from list_instances (instances[].activeTabs[].id, selfTabId for the agent\'s own tab).' });
+                sendResponse({ error: 'tab_id ' + targetTabId + ' is not an open tab (it may have been closed). Get a current id from list_instances (instances[].activeTabs[].id, otherTabs[].id, selfTabId for the agent\'s own tab).' });
                 return;
             }
         }
@@ -7345,6 +7377,14 @@ function _cacheHeartbeatTick() {
             // it refreshes the cache itself (and will re-stamp on dispatch).
             if (typeof currentStreamAbortControllers !== 'undefined'
                 && currentStreamAbortControllers[chatId]) continue;
+            // Hugging Face: no prompt cache to keep warm — a heartbeat would
+            // re-send (and re-bill) the full prompt every 4 minutes. Drop it.
+            var hbProv = (typeof getProviderById === 'function') ? getProviderById(entry.provider) : null;
+            if (hbProv && !hbProv.isClaudeOAuth && !hbProv.isChatGPTOAuth
+                && typeof isHuggingFaceEndpoint === 'function' && isHuggingFaceEndpoint(hbProv.endpoint)) {
+                delete reg[chatId];
+                continue;
+            }
             if (typeof self.sendCacheHeartbeat === 'function') {
                 self.sendCacheHeartbeat(chatId);
             }

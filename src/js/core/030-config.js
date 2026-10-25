@@ -355,7 +355,8 @@ function chatGPTSupportsExtendedEffort(model) {
 // request path keeps reading provider.endpoint / provider.apiKey. Restored
 // after PR #824 removed the section (endpoints were inlined into providers).
 var DEFAULT_LLM_ENDPOINTS = [
-    { id: 'openrouter', name: 'OpenRouter', url: 'https://openrouter.ai/api/v1/chat/completions', apiKey: '' }
+    { id: 'openrouter', name: 'OpenRouter', url: 'https://openrouter.ai/api/v1/chat/completions', apiKey: '' },
+    { id: 'huggingface', name: 'Hugging Face', url: 'https://router.huggingface.co/v1/chat/completions', apiKey: '' }
 ];
 var llmEndpoints = [];
 
@@ -363,6 +364,345 @@ function getLlmEndpointById(id) {
     if (!id) return null;
     return llmEndpoints.find(function(ep) { return ep.id === id; }) || null;
 }
+
+// ─── Hugging Face Inference Providers (router.huggingface.co) ───
+// OpenAI-compatible router: POST /v1/chat/completions (SSE + tools, Bearer
+// hf_… token) and a public GET /v1/models catalog listing every inference
+// provider per model with live pricing (USD per 1M tokens), context length
+// and tool support. Shared by the page and SW bundles (030-config.js is in
+// both), so the request adapter, cost math and UI labels use one source.
+var HF_ROUTER_BASE = 'https://router.huggingface.co/v1';
+var HF_ROUTER_CHAT_URL = HF_ROUTER_BASE + '/chat/completions';
+var HF_MODELS_URL = HF_ROUTER_BASE + '/models';
+var HF_BILLING_URL = 'https://huggingface.co/settings/billing';
+// Router policy suffixes (model:policy); anything else is a provider name.
+var HF_ROUTING_POLICIES = ['fastest', 'cheapest', 'preferred'];
+var HF_CATALOG_TTL_MS = 10 * 60 * 1000;
+// Failures are negatively cached for HF_CATALOG_FAIL_TTL_MS so a down or
+// hanging /v1/models never costs every turn a fresh attempt; a hung fetch is
+// aborted after HF_CATALOG_FETCH_TIMEOUT_MS so the shared promise settles.
+var HF_CATALOG_FAIL_TTL_MS = 60 * 1000;
+var HF_CATALOG_FETCH_TIMEOUT_MS = 8000;
+var _hfCatalogCache = { at: 0, models: null, promise: null, failedAt: 0 };
+
+// {name} placeholder fill for the English fallback when t()/tn() are absent
+// (bare test harnesses evaluate this block alone).
+function _hfFill(s, params) {
+    return String(s).replace(/\{([A-Za-z0-9_]+)\}/g, function(w, k) {
+        return params && params[k] !== undefined && params[k] !== null ? String(params[k]) : w;
+    });
+}
+function _hfT(key, params) { return typeof t === 'function' ? t(key, params) : _hfFill(key, params); }
+// Display keys translated via _hfT, registered for the i18n extractor.
+var _HF_I18N_KEYS = typeof N_ === 'function' ? [
+    N_('{input} in / {output} out per 1M'), N_('from {input} in / {output} out per 1M'),
+    N_('pricing n/a'), N_('{size} ctx'), N_('tools ✓'), N_('no tools'),
+    N_('Router policy: highest throughput (default)'), N_('Router policy: lowest price'),
+    N_('Router policy: lowest price (now {provider})'), N_('Router policy: your preferred-provider order (HF settings)')
+] : [];
+
+function isHuggingFaceEndpoint(url) {
+    if (!url || typeof url !== 'string') return false;
+    var host = '';
+    try { host = new URL(url).hostname.toLowerCase(); } catch (e) { return false; }
+    return host === 'huggingface.co' || /\.huggingface\.co$/.test(host) || host === 'hf.co' || /\.hf\.co$/.test(host);
+}
+
+// 'org/model:provider' → { base:'org/model', provider:'provider' }.
+function splitHuggingFaceModel(model) {
+    var s = String(model || '');
+    var i = s.lastIndexOf(':');
+    if (i <= 0 || i === s.length - 1 || s.indexOf('/', i) !== -1) return { base: s, provider: '' };
+    return { base: s.slice(0, i), provider: s.slice(i + 1) };
+}
+
+// Append the provider / routing policy as the model suffix unless the model
+// id already carries one (an explicit suffix in the Model ID wins).
+function huggingFaceModelWithProvider(model, providerName) {
+    var p = String(providerName || '').trim();
+    if (!model || !p || splitHuggingFaceModel(model).provider) return model;
+    return model + ':' + p;
+}
+
+// Map the OpenRouter-shaped body built by callOpenRouterStreaming onto the
+// plain OpenAI chat-completions shape the HF router accepts. Returns a new
+// object; the input body is not mutated.
+// `catalog` (optional, parsed /v1/models — pass the cached copy, never block
+// on a fetch) enables provider-name validation and tool-aware routing.
+function adaptRequestBodyForHuggingFace(body, provider, catalog) {
+    var out = Object.assign({}, body || {});
+    // OpenRouter-only fields.
+    delete out.usage;
+    delete out.transforms;
+    delete out.provider;
+    delete out.plugins;
+    if (out.stream) out.stream_options = { include_usage: true };
+    var hasCatalog = Array.isArray(catalog) && catalog.length > 0;
+    var entry = hasCatalog ? findHuggingFaceModel(catalog, out.model) : null;
+    var explicit = sanitizeHuggingFaceProviderName(provider && provider.provider, hasCatalog ? catalog : null);
+    var split = splitHuggingFaceModel(out.model);
+    var effective = (split.provider || explicit).toLowerCase();
+    // Tool parity: 'fastest' / no provider lets the router pick a provider
+    // without tool support while the request carries tools → pin the fastest
+    // live tool-capable provider from the catalog instead. No catalog / no
+    // candidate → unchanged (router default).
+    var toolPick = (Array.isArray(out.tools) && out.tools.length && entry && (!effective || effective === 'fastest'))
+        ? pickHuggingFaceToolProvider(entry) : null;
+    out.model = toolPick ? split.base + ':' + toolPick.provider : huggingFaceModelWithProvider(out.model, explicit);
+    // reasoning:{effort} → reasoning_effort (OpenAI-compatible). Budget-style
+    // max_tokens and enabled:false have no router equivalent: dropped, so
+    // the model default applies.
+    var r = out.reasoning;
+    delete out.reasoning;
+    if (r && typeof r.effort === 'string' && r.effort) {
+        var eff = r.effort.toLowerCase();
+        if (eff === 'xhigh' || eff === 'max') eff = 'high';
+        out.reasoning_effort = eff;
+    }
+    if (Array.isArray(out.messages)) {
+        out.messages = out.messages.map(function(m) {
+            if (!m || typeof m !== 'object') return m;
+            var c = m;
+            if (c.reasoning_details !== undefined) { c = Object.assign({}, c); delete c.reasoning_details; }
+            // OpenRouter's file-parser plugin is dropped above, and plain
+            // OpenAI-compatible providers reject type:'file' parts — since they
+            // stay in history, every later turn would fail. Replace each with
+            // a text placeholder; an emptied content array becomes ''.
+            if (Array.isArray(c.content) && c.content.some(function(p) { return p && p.type === 'file'; })) {
+                c = Object.assign({}, c, { content: c.content.map(function(p) {
+                    if (!p || p.type !== 'file') return p;
+                    var f = p.file || {};
+                    var name = String(f.filename || f.name || p.filename || 'document.pdf');
+                    return { type: 'text', text: '[PDF attachment "' + name + '" not supported on Hugging Face]' };
+                }) });
+            }
+            if (Array.isArray(c.content) && c.content.length === 0) c = Object.assign({}, c, { content: '' });
+            if (Array.isArray(c.content) && c.content.some(function(p) { return p && p.cache_control; })) {
+                c = Object.assign({}, c, { content: c.content.map(function(p) {
+                    if (!p || !p.cache_control) return p;
+                    var q = Object.assign({}, p); delete q.cache_control; return q;
+                }) });
+            }
+            return c;
+        });
+    }
+    if (Array.isArray(out.tools)) {
+        out.tools = out.tools.map(function(t) {
+            if (!t || !t.cache_control) return t;
+            var u = Object.assign({}, t); delete u.cache_control; return u;
+        });
+    }
+    return out;
+}
+
+// Provider field → HF suffix. Only slash-free names ('novita/bf16' and other
+// OpenRouter leftovers are not HF suffixes); with a catalog, names that are
+// neither a routing policy nor a known HF provider are dropped ('anthropic').
+function sanitizeHuggingFaceProviderName(name, catalog) {
+    var p = String(name || '').trim();
+    if (!p || !/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(p)) return '';
+    var low = p.toLowerCase();
+    if (HF_ROUTING_POLICIES.indexOf(low) !== -1) return low;
+    if (Array.isArray(catalog) && catalog.length) {
+        var known = catalog.some(function(m) {
+            return (m.providers || []).some(function(x) { return String(x.provider).toLowerCase() === low; });
+        });
+        if (!known) return '';
+    }
+    return p;
+}
+
+// Fastest live provider with supports_tools: highest throughput, else lowest
+// first-token latency, else the first tool-capable live one. null if none.
+function pickHuggingFaceToolProvider(entry) {
+    var cands = ((entry && entry.providers) || []).filter(function(p) {
+        return p.supports_tools === true && p.status !== 'error' && p.status !== 'offline';
+    });
+    if (!cands.length) return null;
+    var byTp = _hfPickProvider(cands, 'fastest');
+    if (byTp) return byTp;
+    var best = null;
+    cands.forEach(function(p) {
+        if (p.first_token_latency_ms === null) return;
+        if (!best || p.first_token_latency_ms < best.first_token_latency_ms) best = p;
+    });
+    return best || cands[0];
+}
+
+function _hfNum(v) {
+    var n = typeof v === 'string' ? parseFloat(v) : v;
+    return (typeof n === 'number' && isFinite(n) && n >= 0) ? n : null;
+}
+
+// Normalize the /v1/models payload. Tolerates missing pricing/context_length
+// (many providers omit them) and unknown fields.
+function parseHuggingFaceModelCatalog(json) {
+    var list = (json && Array.isArray(json.data)) ? json.data : (Array.isArray(json) ? json : []);
+    return list.filter(function(m) { return m && typeof m.id === 'string' && m.id; }).map(function(m) {
+        var providers = (Array.isArray(m.providers) ? m.providers : []).filter(function(p) {
+            return p && typeof p.provider === 'string' && p.provider;
+        }).map(function(p) {
+            var pr = p.pricing || {};
+            return {
+                provider: p.provider,
+                status: p.status || '',
+                context_length: _hfNum(p.context_length),
+                input: _hfNum(pr.input),
+                output: _hfNum(pr.output),
+                supports_tools: p.supports_tools === true ? true : (p.supports_tools === false ? false : null),
+                supports_structured_output: p.supports_structured_output === true,
+                first_token_latency_ms: _hfNum(p.first_token_latency_ms),
+                throughput: _hfNum(p.throughput)
+            };
+        });
+        var live = providers.filter(function(p) { return p.status !== 'error' && p.status !== 'offline'; });
+        var ctx = providers.reduce(function(a, p) { return p.context_length && p.context_length > a ? p.context_length : a; }, 0);
+        return {
+            id: m.id,
+            providers: providers,
+            cheapest: _hfPickProvider(live.length ? live : providers, 'cheapest'),
+            fastest: _hfPickProvider(live.length ? live : providers, 'fastest'),
+            context_length: ctx || null,
+            supports_tools: providers.some(function(p) { return p.supports_tools === true; })
+        };
+    });
+}
+
+function _hfPickProvider(providers, policy) {
+    var best = null;
+    (providers || []).forEach(function(p) {
+        if (policy === 'cheapest') {
+            if (p.input === null || p.output === null) return;
+            var c = p.input + p.output;
+            if (!best || c < best.input + best.output) best = p;
+        } else if (policy === 'fastest') {
+            if (p.throughput === null) return;
+            if (!best || p.throughput > best.throughput) best = p;
+        }
+    });
+    return best;
+}
+
+function findHuggingFaceModel(catalog, model) {
+    if (!Array.isArray(catalog) || !model) return null;
+    var base = splitHuggingFaceModel(model).base.toLowerCase();
+    return catalog.find(function(m) { return m.id.toLowerCase() === base; }) || null;
+}
+
+// Pricing for the provider that served (or will serve) the request.
+// routedProvider (x-inference-provider response header) wins; otherwise the
+// model suffix / provider field when it names a provider explicitly. Routing
+// policies (fastest/cheapest/preferred) or none without a routed provider →
+// null: we never substitute our own guess of which provider served it.
+function resolveHuggingFacePricing(catalog, model, providerName, routedProvider) {
+    var entry = findHuggingFaceModel(catalog, model);
+    if (!entry) return null;
+    var name = String(routedProvider || splitHuggingFaceModel(model).provider || providerName || '').trim().toLowerCase();
+    if (!name) return null;
+    if (HF_ROUTING_POLICIES.indexOf(name) !== -1) return null;
+    var p = entry.providers.find(function(x) { return x.provider.toLowerCase() === name; }) || null;
+    if (!p || p.input === null || p.output === null) return null;
+    return { provider: p.provider, input: p.input, output: p.output };
+}
+
+// USD cost from usage + per-1M pricing; undefined when not computable.
+// Known gap: cached prompt tokens (usage.prompt_tokens_details.cached_tokens)
+// are billed at full input price — the catalog exposes no cached-input rate,
+// so any provider-side cache discount is ignored (cost may be overstated).
+function computeHuggingFaceCost(usage, pricing) {
+    if (!usage || !pricing) return undefined;
+    var pin = _hfNum(usage.prompt_tokens !== undefined ? usage.prompt_tokens : usage.input_tokens);
+    var pout = _hfNum(usage.completion_tokens !== undefined ? usage.completion_tokens : usage.output_tokens);
+    if (pin === null && pout === null) return undefined;
+    return ((pin || 0) * pricing.input + (pout || 0) * pricing.output) / 1e6;
+}
+
+function formatHfPricePerM(n) {
+    if (n === null || n === undefined) return '?';
+    return '$' + String(Number(n.toFixed(n < 0.1 ? 3 : 2)));
+}
+
+function _hfCtxLabel(n) {
+    if (!n) return '';
+    return _hfT('{size} ctx', { size: n >= 1000000 ? (Math.round(n / 100000) / 10) + 'M' : Math.round(n / 1000) + 'K' });
+}
+
+// Datalist label for one provider of a model.
+function huggingFaceProviderLabel(p) {
+    var parts = [];
+    if (p.input !== null || p.output !== null) parts.push(_hfT('{input} in / {output} out per 1M', { input: formatHfPricePerM(p.input), output: formatHfPricePerM(p.output) }));
+    else parts.push(_hfT('pricing n/a'));
+    var ctx = _hfCtxLabel(p.context_length);
+    if (ctx) parts.push(ctx);
+    if (p.supports_tools === true) parts.push(_hfT('tools ✓'));
+    else if (p.supports_tools === false) parts.push(_hfT('no tools'));
+    if (p.status && p.status !== 'live') parts.push(p.status);
+    return parts.join(' · ');
+}
+
+// Datalist label for a model: cheapest price, max context, tool support.
+function huggingFaceModelLabel(m) {
+    var parts = [];
+    if (m.cheapest) parts.push(_hfT('from {input} in / {output} out per 1M', { input: formatHfPricePerM(m.cheapest.input), output: formatHfPricePerM(m.cheapest.output) }));
+    var ctx = _hfCtxLabel(m.context_length);
+    if (ctx) parts.push(ctx);
+    if (m.supports_tools) parts.push(_hfT('tools ✓'));
+    var n = m.providers.length;
+    parts.push(typeof tn === 'function' ? tn(n, '{count} provider', '{count} providers') : (n + (n === 1 ? ' provider' : ' providers')));
+    return parts.join(' · ');
+}
+
+// Provider-field suggestions for a model: routing policies + each provider.
+function huggingFaceProviderOptions(entry) {
+    var opts = [
+        { value: 'fastest', label: _hfT('Router policy: highest throughput (default)') },
+        { value: 'cheapest', label: entry && entry.cheapest ? _hfT('Router policy: lowest price (now {provider})', { provider: entry.cheapest.provider }) : _hfT('Router policy: lowest price') },
+        { value: 'preferred', label: _hfT('Router policy: your preferred-provider order (HF settings)') }
+    ];
+    ((entry && entry.providers) || []).forEach(function(p) {
+        opts.push({ value: p.provider, label: huggingFaceProviderLabel(p) });
+    });
+    return opts;
+}
+
+// Synchronous read of the cached catalog (null when none yet) — the request
+// path uses this and never awaits the network.
+function getCachedHuggingFaceModelCatalog() {
+    return (_hfCatalogCache.models && _hfCatalogCache.models.length) ? _hfCatalogCache.models : null;
+}
+
+// Cached catalog fetch (public endpoint, no auth). Resolves [] (or the stale
+// copy) on failure; failures are negatively cached for HF_CATALOG_FAIL_TTL_MS.
+function fetchHuggingFaceModelCatalog(force) {
+    var now = Date.now();
+    if (!force && _hfCatalogCache.models && now - _hfCatalogCache.at < HF_CATALOG_TTL_MS) return Promise.resolve(_hfCatalogCache.models);
+    if (_hfCatalogCache.promise) return _hfCatalogCache.promise;
+    if (!force && _hfCatalogCache.failedAt && now - _hfCatalogCache.failedAt < HF_CATALOG_FAIL_TTL_MS) return Promise.resolve(_hfCatalogCache.models || []);
+    if (typeof fetch !== 'function') return Promise.resolve(_hfCatalogCache.models || []);
+    var ctrl = (typeof AbortController === 'function') ? new AbortController() : null;
+    var timer = ctrl ? setTimeout(function() { try { ctrl.abort(); } catch (eA) {} }, HF_CATALOG_FETCH_TIMEOUT_MS) : null;
+    _hfCatalogCache.promise = Promise.resolve().then(function() {
+        return ctrl ? fetch(HF_MODELS_URL, { signal: ctrl.signal }) : fetch(HF_MODELS_URL);
+    }).then(function(r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+    }).then(function(j) {
+        _hfCatalogCache.models = parseHuggingFaceModelCatalog(j);
+        _hfCatalogCache.at = Date.now();
+        _hfCatalogCache.failedAt = 0;
+        return _hfCatalogCache.models;
+    }).catch(function(e) {
+        console.warn('[HF] model catalog fetch failed:', e && e.message);
+        _hfCatalogCache.failedAt = Date.now();
+        return _hfCatalogCache.models || [];
+    }).then(function(models) {
+        if (timer) clearTimeout(timer);
+        _hfCatalogCache.promise = null;
+        return models;
+    });
+    return _hfCatalogCache.promise;
+}
+// ─── end Hugging Face Inference Providers ───
 
 var apiProviders = [];
 
@@ -831,7 +1171,11 @@ function isChatPaused(chatId) { return chatId ? pausedChats[chatId] === true : f
 //   • TS fields: monotonic timestamps — newest-wins merges.
 //   • Flag fields: last-dispatch-wins values arbitrated by the SW.
 var CHAT_META_TS_FIELDS = ['lastResponseAt', 'lastActivityAt', 'lastViewedAt', 'updatedAt', 'titleUpdatedAt'];
-var CHAT_META_FLAG_FIELDS = ['_jobsHidden', 'pinned', '_lastApiError', 'pausedByUser'];
+// pausedSubsOnly (PAUSE-SUBS): rider of pausedByUser — true when the user
+// paused an IDLE chat only to stand down its running sub-agents, so Resume
+// re-queues those subs WITHOUT starting a run of the chat itself (app/020
+// togglePause). Always cleared on unpause by setChatPausedPersistent.
+var CHAT_META_FLAG_FIELDS = ['_jobsHidden', 'pinned', '_lastApiError', 'pausedByUser', 'pausedSubsOnly'];
 // FLUX-P1 (pause-state single-writer lane): USER-pause facade. pausedByUser
 // is a CHAT_META_FLAG_FIELDS entry (last-dispatch-wins, SW-arbitrated,
 // persisted + rebroadcast by the chat-meta lane) — this helper is the ONLY
@@ -853,16 +1197,22 @@ var CHAT_META_FLAG_FIELDS = ['_jobsHidden', 'pinned', '_lastApiError', 'pausedBy
 // do NOT use this helper — they are per-realm run-control signals on the
 // live pausedChats map only, never persisted (amber paused rows and
 // survives-reload pause are user-pause semantics only).
-function setChatPausedPersistent(chatId, isPaused) {
+// opts.subsOnly (PAUSE-SUBS, pause only): stamp chat.pausedSubsOnly with the
+// pause. Any unpause clears a set pausedSubsOnly in the same dispatch.
+function setChatPausedPersistent(chatId, isPaused, opts) {
     if (!chatId) return;
     var v = isPaused === true;
     try {
         var c = (typeof chats !== 'undefined' && chats) ? chats[chatId] : null;
-        if ((pausedChats[chatId] === true) === v
+        var fields = { pausedByUser: v };
+        if (v && opts && typeof opts.subsOnly === 'boolean') fields.pausedSubsOnly = opts.subsOnly;
+        else if (!v && c && c.pausedSubsOnly === true) fields.pausedSubsOnly = false;
+        var soDirty = fields.pausedSubsOnly !== undefined && (!c || (c.pausedSubsOnly === true) !== fields.pausedSubsOnly);
+        if (!soDirty && (pausedChats[chatId] === true) === v
             && (typeof pausedChatIds === 'undefined' || (pausedChatIds[chatId] === true) === v)
             && (!c || (c.pausedByUser === true) === v)) return;
-        if (typeof dispatchChatMeta === 'function') { dispatchChatMeta(chatId, { pausedByUser: v }); return; }
-        if (typeof _swHandleChatMetaUpdate === 'function') { _swHandleChatMetaUpdate(chatId, { pausedByUser: v }); return; }
+        if (typeof dispatchChatMeta === 'function') { dispatchChatMeta(chatId, fields); return; }
+        if (typeof _swHandleChatMetaUpdate === 'function') { _swHandleChatMetaUpdate(chatId, fields); return; }
         // Defensive dead arm: no lane in this realm (never expected — the page
         // bundle has dispatchChatMeta, the SW bundle has _swHandleChatMetaUpdate).
         // Keep the loop gate correct rather than silently dropping the pause.

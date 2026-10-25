@@ -559,6 +559,9 @@
 .worker-card.worker-errored .worker-state { color: var(--danger, #cf222e); }
 .worker-card.worker-queued { border-style: dashed; border-color: var(--text-muted, #8a93a6); }
 .worker-card.worker-queued .worker-state { color: var(--text-muted, #8a93a6); font-style: italic; }
+/* PAUSE-SUBS: a 'running' sub stood down by its parent chat's Pause. */
+.worker-dot-paused { background: var(--warning, #e0a400); }
+.worker-card.worker-paused .worker-state { color: var(--warning, #e0a400); }
 .worker-card-wrap[data-depth="2"] { margin-inline-start: 10px; }
 .worker-card-wrap[data-depth="3"] { margin-inline-start: 20px; }
 .worker-card-icon {

@@ -102,7 +102,7 @@ AppAgent est une extension Chrome dotée d'une boucle d'agent intégrée. Vous d
 ## Installation
 
 1. **Installer** — Installez l'extension AppAgent depuis le Chrome Web Store (ou chargez-la non empaquetée pour le développement)
-2. **Obtenir une clé d'API** — Inscrivez-vous sur [OpenRouter](https://openrouter.ai), utilisez directement Anthropic/OpenAI, ou connectez votre abonnement Claude Code (Enterprise ou Personal)
+2. **Obtenir une clé d'API** — Inscrivez-vous sur [OpenRouter](https://openrouter.ai) ou [Hugging Face](https://huggingface.co/docs/inference-providers), utilisez directement Anthropic/OpenAI, ou connectez votre abonnement Claude Code (Enterprise ou Personal)
 3. **Configurer** — Ouvrez l'extension et ajoutez votre clé d'API (ou connectez-vous avec Claude) dans Paramètres → Fournisseurs d'API
 4. **Commencer** — Ouvrez votre instance ServiceNow dans un onglet (elle est détectée automatiquement) et lancez la conversation
 

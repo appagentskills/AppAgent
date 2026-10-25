@@ -1,0 +1,49 @@
+/* Split widget view — <aside id="split-widget-pane"> beside #main-area inside
+   .main-wrapper (core/082-split-view.js). Side by side on wide screens,
+   stacked vertically (chat on top, widget below) when narrow / side panel. */
+.split-widget-pane { flex: 1 1 50%; min-width: 320px; display: flex; flex-direction: column; border-inline-start: 1px solid var(--secondary-border); background: var(--bg-white); overflow: hidden; }
+.split-widget-pane[hidden] { display: none; }
+body.split-view-active .main-wrapper > .main { flex: 1 1 50%; }
+/* Header = the shared fullscreen header (.widget-fullscreen-header, buildWidgetViewHeaderHtml); compact it for the pane. */
+.split-widget-header.widget-fullscreen-header { gap: var(--space-4); padding: var(--space-4) var(--space-6); flex-shrink: 0; flex-wrap: wrap; }
+.split-widget-header .widget-title { flex: 1; min-width: 80px; font-size: var(--text-body); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.split-widget-header .widget-modal-controls { flex-wrap: wrap; justify-content: flex-end; }
+.widget-split-btn.is-active { color: var(--primary); background: var(--primary-lighter); }
+.split-widget-header .widget-icon { width: 20px; height: 20px; color: var(--primary); display: flex; align-items: center; justify-content: center; }
+.split-widget-header .widget-icon svg { width: 18px; height: 18px; }
+.split-widget-content { flex: 1; overflow: auto; min-height: 0; }
+.split-widget-empty { padding: var(--space-9); color: var(--text-secondary); text-align: center; }
+
+/* B: agent progress card under the pane header */
+.split-widget-progress { flex-shrink: 0; border-bottom: 1px solid var(--secondary-border); background: var(--bg-light); font-size: var(--text-caption); color: var(--text-secondary); }
+.split-progress-summary { display: flex; align-items: center; gap: var(--space-3); padding: var(--space-2) var(--space-6); cursor: pointer; list-style: none; }
+.split-progress-summary::-webkit-details-marker { display: none; }
+.split-progress-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-primary, inherit); }
+.split-progress-count { font-variant-numeric: tabular-nums; }
+.split-progress-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--primary); flex-shrink: 0; }
+.split-widget-progress[data-state="running"] .split-progress-dot { animation: split-progress-pulse 1.4s ease-in-out infinite; }
+.split-widget-progress[data-state="waiting"] .split-progress-dot { background: var(--text-secondary); }
+.split-widget-progress[data-state="stuck"] .split-progress-dot { background: var(--warning); }
+.split-widget-progress[data-state="done"] .split-progress-dot { background: var(--success); }
+.split-widget-progress[data-state="error"] .split-progress-dot { background: var(--danger); }
+.split-progress-tasks { margin: 0; padding: 0 var(--space-6) var(--space-2) calc(var(--space-6) + var(--space-4)); list-style: none; }
+.split-progress-task { padding: 1px 0; }
+.split-progress-task::before { content: '○'; display: inline-block; width: 1.2em; }
+.split-progress-task[data-status="running"]::before { content: '◐'; color: var(--primary); }
+.split-progress-task[data-status="done"] { text-decoration: line-through; opacity: .7; }
+.split-progress-task[data-status="done"]::before { content: '✓'; color: var(--success); }
+.split-progress-task[data-status="error"]::before { content: '✕'; color: var(--danger); }
+.split-progress-output { padding: 0 var(--space-6) var(--space-3); white-space: pre-wrap; }
+@keyframes split-progress-pulse { 50% { opacity: .35; } }
+@media (prefers-reduced-motion: reduce) { .split-widget-progress[data-state="running"] .split-progress-dot { animation: none; } }
+
+/* A: held live-update pill ("New update — Show") */
+.split-widget-update-pill { align-self: center; display: inline-flex; align-items: center; gap: var(--space-3); margin: var(--space-2) auto 0; padding: var(--space-1) var(--space-2) var(--space-1) var(--space-4); border-radius: 999px; background: var(--primary-lighter); color: var(--primary); font-size: var(--text-caption); flex-shrink: 0; }
+
+@media (max-width: 900px) {
+    body.split-view-active .main-wrapper { flex-direction: column; }
+    body.split-view-active .main-wrapper > .main { flex: 1 1 50%; min-height: 0; }
+    .split-widget-pane { min-width: 0; flex: 1 1 50%; min-height: 0; border-inline-start: none; border-top: 1px solid var(--secondary-border); }
+}
+body.sidepanel-mode.split-view-active .main-wrapper { flex-direction: column; }
+body.sidepanel-mode .split-widget-pane { min-width: 0; min-height: 0; border-inline-start: none; border-top: 1px solid var(--secondary-border); }

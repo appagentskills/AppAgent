@@ -10,6 +10,8 @@
 .widget-controls { display: flex; gap: var(--space-2); }
 .widget-ctrl-btn { width: 28px; height: 28px; border: none; background: var(--bg-white); border-radius: var(--radius-md); cursor: pointer; display: flex; align-items: center; justify-content: center; color: var(--text-muted); transition: all var(--transition-fast); }
 .widget-ctrl-btn:hover { background: var(--primary-lighter); color: var(--primary); }
+/* Export HTML (tools/082-widget-export.js) - busy state while the exporter embeds assets. */
+.widget-export-btn[aria-busy="true"] { opacity: 0.5; pointer-events: none; }
 .widget-ctrl-btn svg { width: 14px; height: 14px; }
 .widget-ctrl-btn.widget-dashboard-btn.on-dashboard { background: var(--primary); color: var(--text-inverse); }
 .widget-ctrl-btn.widget-dashboard-btn.on-dashboard:hover { background: var(--primary-hover); }

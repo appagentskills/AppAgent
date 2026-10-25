@@ -1,6 +1,55 @@
 // HTML WIDGET TOOL - Display interactive widgets inline
 // =============================================
 
+// html_widget action=patch: replace the innerHTML of every [data-slot=name]
+// in the stored HTML. Fragments go through <template> (keeps <style>/<script>
+// in place); full documents through DOMParser. Unknown slot names fail closed.
+function widgetSlotNames(html) {
+    var names = [], re = /data-slot\s*=\s*["']([^"']+)["']/g, m;
+    while ((m = re.exec(String(html || '')))) if (names.indexOf(m[1]) === -1) names.push(m[1]);
+    return names;
+}
+function widgetApplySlotsToHtml(html, slots) {
+    var full = /<!doctype|<html[\s>]/i.test(html);
+    var root, serialize;
+    if (full) {
+        var doc = new DOMParser().parseFromString(html, 'text/html');
+        root = doc;
+        serialize = function() { return (/<!doctype/i.test(html) ? '<!DOCTYPE html>\n' : '') + doc.documentElement.outerHTML; };
+    } else {
+        var tpl = document.createElement('template');
+        tpl.innerHTML = html;
+        root = tpl.content;
+        serialize = function() { return tpl.innerHTML; };
+    }
+    // Order-independent (nested slots): resolve EVERY name against the BASE
+    // html first, then write only the outermost targets. An element nested
+    // inside another targeted slot is replaced by that outer slot's content,
+    // so it is skipped and its name reported in overridden_slots (never a
+    // false SLOT_NOT_FOUND, never a silent overwrite, whatever the key order).
+    var names = Object.keys(slots), missing = [], targets = [];
+    names.forEach(function(name) {
+        var els = root.querySelectorAll('[data-slot="' + String(name).replace(/["\\]/g, '\\$&') + '"]');
+        if (!els.length) { missing.push(name); return; }
+        for (var i = 0; i < els.length; i++) targets.push({ name: name, el: els[i] });
+    });
+    if (missing.length) return { success: false, code: 'SLOT_NOT_FOUND', error: 'No [data-slot] element for: ' + missing.join(', '), available_slots: widgetSlotNames(html) };
+    // Decide nesting on the untouched base tree BEFORE any write (a write
+    // detaches the outer slot's old descendants).
+    targets.forEach(function(t) { t.nested = targets.some(function(o) { return o.el !== t.el && o.el.contains(t.el); }); });
+    var appliedNames = {};
+    targets.forEach(function(t) {
+        if (t.nested) return;
+        t.el.innerHTML = String(slots[t.name] == null ? '' : slots[t.name]);
+        appliedNames[t.name] = true;
+    });
+    var applied = {}, overridden = [];
+    names.forEach(function(name) { if (appliedNames[name]) applied[name] = slots[name]; else overridden.push(name); });
+    var out = { success: true, html: serialize(), applied_slots: applied };
+    if (overridden.length) out.overridden_slots = overridden;
+    return out;
+}
+
 async function executeHtmlWidget(args, messageIndex, options) {
     options = options || {};
     var widgetChatId = options.chatId || activeStreamingChatId || currentChatId;
@@ -23,6 +72,39 @@ async function executeHtmlWidget(args, messageIndex, options) {
         var selected = WidgetStore.view(targetId, args.version);
         return selected ? { success: true, widget: selected, versions: WidgetStore.versions(targetId), latest_version: selected.latestVersion }
             : { success: false, code: 'WIDGET_NOT_FOUND', error: 'Widget/version not found: ' + targetId };
+    }
+    if (args.action === 'export') {
+        // Shared exporter: tools/082-widget-export.js (same path as the header button).
+        if (!targetId) return { success: false, error: 'widget_id is required' };
+        try {
+            var exp = await exportWidgetHtml(targetId, { version: args.version });
+            var expName = widgetExportSlug(exp.stats.title) + '.html';
+            var expFileId = await registerFileAsync({ blob: new Blob([exp.html], { type: 'text/html' }), name: expName, mime: 'text/html' });
+            return { success: true, file_id: expFileId, file_name: expName, size_bytes: exp.stats.size_bytes, mime: 'text/html', images_embedded: exp.stats.images_embedded, source: exp.stats.source, warnings: exp.warnings };
+        } catch (e) {
+            return { success: false, code: 'EXPORT_FAILED', error: e.message };
+        }
+    }
+    var livePatch = null;
+    if (args.action === 'patch') {
+        // Live patch: slot-level (or whole-html) edit of an EXISTING widget that
+        // commits a normal new version; the split pane applies slots in place.
+        if (!targetId) return { success: false, error: 'widget_id is required for patch' };
+        if (!Number.isInteger(args.expected_version)) return { success: false, code: 'VERSION_REQUIRED', error: 'patch requires expected_version (read the widget first).' };
+        var hasSlots = args.slots && typeof args.slots === 'object' && !Array.isArray(args.slots) && Object.keys(args.slots).length > 0;
+        if (!hasSlots && (typeof args.html !== 'string' || !args.html)) return { success: false, error: 'patch needs html or slots:{name: html}' };
+        await WidgetStore.read(targetId);
+        var base = WidgetStore.view(targetId, args.expected_version);
+        if (!base || typeof base.html !== 'string') return { success: false, code: 'WIDGET_NOT_FOUND', error: 'Widget/version not found: ' + targetId + ' v' + args.expected_version };
+        if (hasSlots) {
+            var patched = widgetApplySlotsToHtml(base.html, args.slots);
+            if (!patched.success) return Object.assign(patched, { widget_id: targetId });
+            args = Object.assign({}, args, { html: patched.html });
+            // Only the slots that actually landed (outer wins over nested):
+            // the pane's in-place apply then matches the stored html exactly.
+            livePatch = { slots: patched.applied_slots, baseContentVersion: base.contentVersion, overridden: patched.overridden_slots };
+        }
+        args = Object.assign({}, args, { action: 'save' });
     }
     if (args.action && args.action !== 'save') return { success: false, error: 'Unknown widget action' };
     if (!args.html || typeof args.html !== 'string') return { success: false, error: 'html content is required' };
@@ -76,12 +158,22 @@ async function executeHtmlWidget(args, messageIndex, options) {
     var operationId = await widgetOperationId(args, options);
     var widgetId = targetId || await widgetIdForOperation(operationId);
     var committed;
+    // Note the slot patch BEFORE commit: commit -> project() ->
+    // refreshWidgetVersionViews -> splitViewApplyUpdate runs synchronously
+    // inside commit, so the pane must already know the patch (keyed to the
+    // expected new version AND bound to the exact html this commit stores, so a
+    // concurrent writer's same-numbered version never gets our slots) to apply
+    // it in place instead of reloading.
+    var livePatchVersion = livePatch ? args.expected_version + 1 : null;
+    var settlePatch = function(ok) { if (livePatch && typeof splitViewSettleSlotPatch === 'function') splitViewSettleSlotPatch(widgetId, livePatchVersion, ok); };
+    if (livePatch && typeof splitViewNoteSlotPatch === 'function') splitViewNoteSlotPatch(widgetId, livePatch.baseContentVersion, livePatchVersion, livePatch.slots, html);
     try {
         committed = await WidgetStore.commit(widgetId, { title: title, html: html, height: height, width: width },
             targetId ? args.expected_version : 0, operationId,
             { createdAt: Date.now(), msgIndex: toolResultMsgIndex, chatId: widgetChatId });
-    } catch (e) { return { success: false, code: 'STORAGE_ERROR', error: e.message }; }
-    if (!committed.success) return committed;
+    } catch (e) { settlePatch(false); return { success: false, code: 'STORAGE_ERROR', error: e.message }; }
+    settlePatch(!!(committed && committed.success && !committed.deduplicated && committed.version === livePatchVersion));
+    if (!committed.success) return committed.code === 'VERSION_CONFLICT' ? widgetConflictRebasePayload(widgetId, committed) : committed;
     // The eviction sweep copies on evict: re-read the live chat after the await.
     chat = chats[widgetChatId] || chat;
     var widget = WidgetStore.view(widgetId);
@@ -91,6 +183,12 @@ async function executeHtmlWidget(args, messageIndex, options) {
         if (!chat.widgets.some(function(w) { return w.id === widgetId; })) chat.widgets.push(widget);
         chatWidgets[widgetChatId] = chat.widgets;
         delete chat.isTemporary;
+        // A NEW widget ALWAYS auto-opens in the split pane unless the chat
+        // family already shows a widget there (never replace it). A previous
+        // user close does not suppress this.
+        if (typeof openSplitViewForWidget === 'function' && !widgetSplitPaneBusy(widgetChatId)) {
+            try { openSplitViewForWidget(widgetId, widgetChatId, { openedBy: 'agent' }); } catch (e) {}
+        }
     }
     // PER-TURN RENDER: create AND edit render at THIS turn of the ISSUING chat
     // (cross-chat edits included), pinned to the committed version. A replayed
@@ -132,6 +230,8 @@ async function executeHtmlWidget(args, messageIndex, options) {
         version: committed.version,
         latest_version: committed.latest_version,
         deduplicated: !!committed.deduplicated,
+        // patch: nested slot names whose element was replaced by an outer slot.
+        overridden_slots: livePatch && livePatch.overridden || undefined,
         _debug_hint: 'To debug this widget, use iframe_tool with widget_id="' + widgetId + '". Actions: get_visible_text (extract text), get_dom (get HTML), click (click elements), fill (fill inputs). For visual analysis, use take_screenshot tool.',
         // SW-side wrapper reads this to persist chat.widgets on its own chat
         // object. Without it, the SW's chat snapshot wipes the page-side
@@ -140,6 +240,37 @@ async function executeHtmlWidget(args, messageIndex, options) {
         // SW mirrors this ref onto the ISSUING chat's widgetRenders.
         _widget_render: widgetRender ? Object.assign({ chatId: widgetChatId }, widgetRender) : undefined
     };
+}
+
+// VERSION_CONFLICT → rebase payload: the latest html (truncated above ~20KB),
+// its slot names and a retry hint, so a concurrent editor (e.g. a sub-agent
+// patching the same widget) can rebase without an extra read.
+var WIDGET_CONFLICT_HTML_MAX = 20000;
+function widgetConflictRebasePayload(widgetId, committed) {
+    var out = Object.assign({}, committed, { widget_id: widgetId });
+    var latest = null;
+    try { latest = WidgetStore.view(widgetId); } catch (e) {}
+    if (latest && typeof latest.html === 'string') {
+        out.latest_version = latest.latestVersion || latest.version || out.latest_version;
+        out.slots = typeof widgetSlotNames === 'function' ? widgetSlotNames(latest.html) : [];
+        if (latest.html.length > WIDGET_CONFLICT_HTML_MAX) {
+            out.html = latest.html.slice(0, WIDGET_CONFLICT_HTML_MAX);
+            out.html_truncated = true;
+            out.html_length = latest.html.length;
+        } else {
+            out.html = latest.html;
+        }
+    }
+    out.hint = 'Another editor saved v' + out.latest_version + ' first. Rebase your change onto this html (prefer patch+slots for your section'
+        + (out.html_truncated ? '; html is truncated, call html_widget action=read for the full text' : '')
+        + ') and retry with expected_version=' + out.latest_version + '.';
+    return out;
+}
+
+// True when the split pane of this chat family already shows a widget.
+function widgetSplitPaneBusy(chatId) {
+    var rec = typeof getSplitViewRecord === 'function' ? getSplitViewRecord(chatId) : null;
+    return !!(rec && !rec.closed && rec.widgetId);
 }
 
 // pin_widget tool — pin/move/unpin an EXISTING widget. dashboard: 'main' | 'home' | 'none'.
@@ -461,6 +592,47 @@ function bindWidgetVersionResize(iframe, widget, isFullscreen) {
     
 }
 
+// Header shared by the chat fullscreen overlay (openWidgetFullscreen) and the
+// split pane (renderSplitViewPane, core/082-split-view.js): icon, title, the
+// controls group (the version picker mounts there via widgetVersionSlot) and
+// the action buttons. surface: 'fullscreen' (default) | 'split'.
+function buildWidgetViewHeaderHtml(widget, surface) {
+    var split = surface === 'split';
+    var isOnDash = dashboardWidgets[widget.id] ? true : false;
+    var dashBtn = '<button class="widget-ctrl-btn widget-dashboard-btn' + (isOnDash ? ' on-dashboard' : '') + '" data-widget-id="' + widget.id + '" onclick="showWidgetPinMenu(\'' + widget.id + '\', event)" title="' + escapeHtml(isOnDash ? t('Pinned \u2014 click to change') : t('Pin to dashboard\u2026')) + '">' + (isOnDash ? UI_ICONS.pinFilled : UI_ICONS.pin) + '</button>';
+    return '<span class="widget-icon">' + UI_ICONS.widget + '</span>' +
+        '<span class="widget-title">' + escapeHtml(widget.title) + '</span>' +
+        '<div class="widget-modal-controls">' +
+            // data-widget-id is the hook toggleWidgetRunning's refresh loop matches
+            // on ('.widget-stop-btn[data-widget-id="..."]', :276). Without it this chat
+            // fullscreen twin was the only .widget-stop-btn in the app the loop could
+            // not find - the dashboard expand-modal twin (ui/070-dashboard-ui.js:97)
+            // has always carried it.
+            '<button class="widget-ctrl-btn widget-stop-btn" data-widget-id="' + widget.id + '" onclick="toggleWidgetRunning(\'' + widget.id + '\', event);' + (split ? 'refreshSplitViewPane()' : 'closeWidgetFullscreen()') + '" title="' + escapeHtml(isWidgetDeactivated(widget.id) ? t('Activate Widget') : t('Deactivate Widget')) + '">' + (isWidgetDeactivated(widget.id) ? UI_ICONS.play : UI_ICONS.stop) + '</button>' +
+            dashBtn +
+            '<button class="widget-ctrl-btn" onclick="printWidgetFullscreen(\'' + widget.id + '\')" title="' + escapeHtml(t('Print')) + '">' + UI_ICONS.printer + '</button>' +
+            '<button class="widget-ctrl-btn" onclick="screenshotWidget(\'' + widget.id + '\')" title="' + escapeHtml(t('Screenshot')) + '">' + UI_ICONS.camera + '</button>' +
+            '<button class="widget-ctrl-btn widget-export-btn" onclick="exportWidgetHtmlDownload(\'' + widget.id + '\')" title="' + escapeHtml(t('Export HTML')) + '" aria-label="' + escapeHtml(t('Export HTML')) + '">' + UI_ICONS.download + '</button>' +
+            '<button class="widget-ctrl-btn" onclick="openWidgetLink(\'' + widget.id + '\')" title="' + escapeHtml(t('Open in new tab')) + '" aria-label="' + escapeHtml(t('Open in new tab')) + '">' + UI_ICONS.externalLink + '</button>' +
+            '<button class="widget-ctrl-btn widget-edit-btn" onclick="editWidgetWithAgent(\'' + widget.id + '\', event)" title="' + escapeHtml(t('Edit')) + '">' + UI_ICONS.edit + '</button>' +
+            // Manual code editor (editWidgetCode -> saveWidgetCodeEdit), alongside the
+            // agent-edit button. closeWidgetFullscreen() FIRST is load-bearing, not
+            // cosmetic: the editor overlay is a .widget-modal-overlay at
+            // --z-widget-modal (10002) while this one sits at --z-fullscreen (10003)
+            // (css/00-tokens.css:174-175), so leaving it open would bury the editor
+            // behind this backdrop and desync the Escape order (core/120-init.js:209-211).
+            '<button class="widget-ctrl-btn widget-code-btn" onclick="closeWidgetFullscreen();editWidgetCode(\'' + widget.id + '\')" title="' + escapeHtml(t('Edit code')) + '">' + UI_ICONS.code + '</button>' +
+            // Surface swap: fullscreen offers Split view; the split pane offers
+            // Fullscreen instead, and its × closes the pane (closeSplitView).
+            (split
+                ? '<button class="widget-ctrl-btn widget-fullscreen-btn" onclick="openWidgetFullscreen(\'' + widget.id + '\', event)" title="' + escapeHtml(t('Fullscreen')) + '" aria-label="' + escapeHtml(t('Fullscreen')) + '">' + UI_ICONS.maximize + '</button>'
+                : (typeof splitViewButtonHtml === 'function' ? splitViewButtonHtml(widget.id) : '')) +
+            (split
+                ? '<button class="widget-close-btn split-widget-close" onclick="closeSplitView()" title="' + escapeHtml(t('Close split view')) + '" aria-label="' + escapeHtml(t('Close split view')) + '">' + UI_ICONS.close + '</button>'
+                : '<button class="widget-close-btn" onclick="closeWidgetFullscreen()" title="' + escapeHtml(t('Close')) + '" aria-label="' + escapeHtml(t('Close')) + '">' + UI_ICONS.close + '</button>') +
+        '</div>';
+}
+
 function openWidgetFullscreen(widgetId, event) {
     if (event) {
         event.stopPropagation();
@@ -481,34 +653,10 @@ function openWidgetFullscreen(widgetId, event) {
     var modal = document.createElement('div');
     modal.className = 'widget-fullscreen-modal';
     
-    // Header with all control icons
+    // Header with all control icons (shared builder, also used by the split pane)
     var header = document.createElement('div');
     header.className = 'widget-fullscreen-header';
-    var isOnDash = dashboardWidgets[widget.id] ? true : false;
-    var dashBtn = '<button class="widget-ctrl-btn widget-dashboard-btn' + (isOnDash ? ' on-dashboard' : '') + '" data-widget-id="' + widget.id + '" onclick="showWidgetPinMenu(\'' + widget.id + '\', event)" title="' + escapeHtml(isOnDash ? t('Pinned \u2014 click to change') : t('Pin to dashboard\u2026')) + '">' + (isOnDash ? UI_ICONS.pinFilled : UI_ICONS.pin) + '</button>';
-    header.innerHTML = '<span class="widget-icon">' + UI_ICONS.widget + '</span>' +
-        '<span class="widget-title">' + escapeHtml(widget.title) + '</span>' +
-        '<div class="widget-modal-controls">' +
-            // data-widget-id is the hook toggleWidgetRunning's refresh loop matches
-            // on ('.widget-stop-btn[data-widget-id="..."]', :276). Without it this chat
-            // fullscreen twin was the only .widget-stop-btn in the app the loop could
-            // not find - the dashboard expand-modal twin (ui/070-dashboard-ui.js:97)
-            // has always carried it.
-            '<button class="widget-ctrl-btn widget-stop-btn" data-widget-id="' + widget.id + '" onclick="toggleWidgetRunning(\'' + widget.id + '\', event);closeWidgetFullscreen()" title="' + escapeHtml(isWidgetDeactivated(widget.id) ? t('Activate Widget') : t('Deactivate Widget')) + '">' + (isWidgetDeactivated(widget.id) ? UI_ICONS.play : UI_ICONS.stop) + '</button>' +
-            dashBtn +
-            '<button class="widget-ctrl-btn" onclick="printWidgetFullscreen()" title="' + escapeHtml(t('Print')) + '">' + UI_ICONS.printer + '</button>' +
-            '<button class="widget-ctrl-btn" onclick="screenshotWidget(\'' + widget.id + '\')" title="' + escapeHtml(t('Screenshot')) + '">' + UI_ICONS.camera + '</button>' +
-            '<button class="widget-ctrl-btn" onclick="openWidgetLink(\'' + widget.id + '\')" title="' + escapeHtml(t('Open in new tab')) + '" aria-label="' + escapeHtml(t('Open in new tab')) + '">' + UI_ICONS.externalLink + '</button>' +
-            '<button class="widget-ctrl-btn widget-edit-btn" onclick="editWidgetWithAgent(\'' + widget.id + '\', event)" title="' + escapeHtml(t('Edit')) + '">' + UI_ICONS.edit + '</button>' +
-            // Manual code editor (editWidgetCode -> saveWidgetCodeEdit), alongside the
-            // agent-edit button. closeWidgetFullscreen() FIRST is load-bearing, not
-            // cosmetic: the editor overlay is a .widget-modal-overlay at
-            // --z-widget-modal (10002) while this one sits at --z-fullscreen (10003)
-            // (css/00-tokens.css:174-175), so leaving it open would bury the editor
-            // behind this backdrop and desync the Escape order (core/120-init.js:209-211).
-            '<button class="widget-ctrl-btn widget-code-btn" onclick="closeWidgetFullscreen();editWidgetCode(\'' + widget.id + '\')" title="' + escapeHtml(t('Edit code')) + '">' + UI_ICONS.code + '</button>' +
-            '<button class="widget-close-btn" onclick="closeWidgetFullscreen()" title="' + escapeHtml(t('Close')) + '" aria-label="' + escapeHtml(t('Close')) + '">' + UI_ICONS.close + '</button>' +
-        '</div>';
+    header.innerHTML = buildWidgetViewHeaderHtml(widget, 'fullscreen');
     
     // Content
     var content = document.createElement('div');
@@ -550,14 +698,15 @@ function openWidgetLink(widgetId) {
     chrome.tabs.create({ url: chrome.runtime.getURL('app.html') + '?widget=' + encodeURIComponent(widgetId) });
 }
 
-function printWidgetFullscreen() {
-    var widget = expandedWidgetId ? getWidgetById(expandedWidgetId) : null;
+function printWidgetFullscreen(widgetId) {
+    widgetId = widgetId || expandedWidgetId;
+    var widget = widgetId ? getWidgetById(widgetId) : null;
     if (!widget || !widget.html) return;
     // S0C2-02: print through the persistent app.html?widget= deep link (same API
     // as openWidgetLink). It renders in the real widget sandbox with the polyfill,
     // so widget JS/handlers run; an about:blank popup inherits the MV3 CSP and
     // only static markup printed. 120-init calls window.print() once rendered.
-    chrome.tabs.create({ url: chrome.runtime.getURL('app.html') + '?widget=' + encodeURIComponent(widget.id || expandedWidgetId) + '&print=1' });
+    chrome.tabs.create({ url: chrome.runtime.getURL('app.html') + '?widget=' + encodeURIComponent(widget.id || widgetId) + '&print=1' });
 }
 
 async function screenshotWidget(widgetId) {
@@ -712,6 +861,7 @@ function openWidgetModal(widgetId) {
         '<span class="widget-title">' + escapeHtml(widget.title) + '</span>' +
         '<div class="widget-modal-controls">' +
             '<button class="widget-ctrl-btn" onclick="screenshotWidget(\'' + widget.id + '\')" title="' + escapeHtml(t('Screenshot')) + '">' + UI_ICONS.camera + '</button>' +
+            '<button class="widget-ctrl-btn widget-export-btn" onclick="exportWidgetHtmlDownload(\'' + widget.id + '\')" title="' + escapeHtml(t('Export HTML')) + '" aria-label="' + escapeHtml(t('Export HTML')) + '">' + UI_ICONS.download + '</button>' +
             '<button class="widget-ctrl-btn" onclick="closeWidgetModal();openWidgetFullscreen(\'' + widget.id + '\')" title="' + escapeHtml(t('Fullscreen')) + '">' + UI_ICONS.maximize + '</button>' +
             '<button class="widget-close-btn" onclick="closeWidgetModal()" title="' + escapeHtml(t('Close')) + '" aria-label="' + escapeHtml(t('Close')) + '">' + UI_ICONS.close + '</button>' +
         '</div>';
@@ -927,9 +1077,11 @@ function getWidgetHtmlForMessage(msgIndex) {
                 '<span class="widget-icon">' + UI_ICONS.widget + '</span>' +
                 '<span class="widget-title">' + escapeHtml(widget.title) + '</span>' +
                 '<div class="widget-controls">' +
+                    (typeof splitViewButtonHtml === 'function' ? splitViewButtonHtml(widget.id) : '') +
                     '<button class="widget-ctrl-btn widget-fullscreen-btn" onclick="openWidgetFullscreen(\'' + widget.id + '\', event)" title="' + escapeHtml(t('Expand')) + '">' +
                         UI_ICONS.maximize +
                     '</button>' +
+                    '<button class="widget-ctrl-btn widget-export-btn" onclick="exportWidgetHtmlDownload(\'' + widget.id + '\')" title="' + escapeHtml(t('Export HTML')) + '" aria-label="' + escapeHtml(t('Export HTML')) + '">' + UI_ICONS.download + '</button>' +
                 '</div>' +
             '</div>' +
             '<div class="widget-content" id="widget-content-' + p.domKey + '"></div>' +

@@ -857,7 +857,11 @@ var _MODEL_ROW_I18N_KEYS = [N_('Proxy'), N_('Subscription'), N_('Select model {n
 function _modelRowMeta(p) {
     var ep = (p && p.endpoint ? p.endpoint : '').toLowerCase();
     var conn = '';
+    // Hostname match (not substring) for HF: huggingface.co / hf.co + subdomains.
+    var host = '';
+    try { host = new URL(ep).hostname; } catch (eUrl) { host = ''; }
     if (ep.indexOf('openrouter') >= 0) conn = 'OpenRouter';
+    else if (/(^|\.)(huggingface|hf)\.co$/.test(host)) conn = 'Hugging Face';
     else if (ep.indexOf('localhost') >= 0 || ep.indexOf('127.0.0.1') >= 0) conn = 'Proxy';
     else if (ep.indexOf('anthropic.com') >= 0) conn = 'Anthropic';
     return { conn: conn };

@@ -102,7 +102,7 @@ AppAgent הוא תוסף ל-Chrome עם לולאת סוכן מובנית. אתם
 ## התקנה והגדרה
 
 1. **התקנה** — התקינו את התוסף AppAgent מחנות האינטרנט של Chrome (או טענו אותו כתוסף לא ארוז לצורכי פיתוח)
-2. **השגת מפתח API** — הירשמו ב-[OpenRouter](https://openrouter.ai), השתמשו ישירות ב-Anthropic/OpenAI, או חברו את מנוי ה-Claude Code שלכם (Enterprise או Personal)
+2. **השגת מפתח API** — הירשמו ב-[OpenRouter](https://openrouter.ai) או [Hugging Face](https://huggingface.co/docs/inference-providers), השתמשו ישירות ב-Anthropic/OpenAI, או חברו את מנוי ה-Claude Code שלכם (Enterprise או Personal)
 3. **הגדרה** — פתחו את התוסף והוסיפו את מפתח ה-API שלכם (או התחברו עם Claude) בהגדרות ← ספקי API
 4. **התחילו לבנות** — פתחו את מופע ה-ServiceNow שלכם בלשונית (הוא מזוהה אוטומטית) והתחילו לשוחח
 

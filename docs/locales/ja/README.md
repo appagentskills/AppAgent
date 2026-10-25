@@ -102,7 +102,7 @@ AppAgent は、エージェントループを内蔵した Chrome 拡張機能で
 ## セットアップ
 
 1. **インストール** — Chrome ウェブストアから AppAgent 拡張機能をインストールします (開発用にはパッケージ化されていない拡張機能として読み込みます)
-2. **API キーを取得** — [OpenRouter](https://openrouter.ai) に登録するか、Anthropic/OpenAI を直接使うか、Claude Code のサブスクリプション (Enterprise または Personal) を接続します
+2. **API キーを取得** — [OpenRouter](https://openrouter.ai) または [Hugging Face](https://huggingface.co/docs/inference-providers) に登録するか、Anthropic/OpenAI を直接使うか、Claude Code のサブスクリプション (Enterprise または Personal) を接続します
 3. **設定** — 拡張機能を開き、設定 → API プロバイダー で API キーを追加します (または Claude でサインインします)
 4. **構築を開始** — ServiceNow インスタンスをタブで開き (自動的に検出されます)、チャットを始めます
 

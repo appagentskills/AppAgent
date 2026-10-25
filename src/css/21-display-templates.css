@@ -139,6 +139,14 @@ th.sorted .display-sort-arrow { opacity: 1; }
 .display-diff-del { background: var(--danger-lighter); }
 .display-diff-del .display-diff-content { color: var(--danger); }
 .display-diff-ctx .display-diff-content { color: var(--text-muted); }
+.display-diff-hunk { padding: var(--space-1) var(--space-6); color: var(--text-muted); background: var(--bg-light); font-size: var(--text-xs); }
+.display-diff-gap { background: var(--bg-light); border-block: 1px solid var(--border); }
+.display-diff-expand { display: block; width: 100%; padding: var(--space-1) var(--space-6); border: 0; background: none; color: var(--primary); font: inherit; font-size: var(--text-xs); text-align: start; cursor: pointer; }
+span.display-diff-expand { color: var(--text-muted); cursor: default; }
+button.display-diff-expand:hover { background: var(--primary-lighter); }
+.display-diff-expand:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
+.display-diff-fold[hidden] { display: none; }
+.display-diff-empty { padding: var(--space-6); color: var(--text-muted); font-family: var(--font-sans); }
 
 /* S0B4-02: standalone ?doc= tab */
 body.sdoc-standalone { max-width: 900px; margin: 40px auto; padding: 20px; line-height: 1.6; height: auto; overflow: auto; }

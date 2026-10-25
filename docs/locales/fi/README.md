@@ -102,7 +102,7 @@ AppAgent on Chrome-laajennus, jossa on sisäänrakennettu agenttisilmukka. Kuvai
 ## Käyttöönotto
 
 1. **Asenna** — Asenna AppAgent-laajennus Chrome Web Storesta (tai lataa se pakkaamattomana kehitystä varten)
-2. **Hanki API-avain** — Rekisteröidy [OpenRouteriin](https://openrouter.ai), käytä Anthropicia/OpenAI:ta suoraan tai yhdistä Claude Code -tilauksesi (Enterprise tai Personal)
+2. **Hanki API-avain** — Rekisteröidy [OpenRouteriin](https://openrouter.ai) tai [Hugging Face](https://huggingface.co/docs/inference-providers) -palveluun, käytä Anthropicia/OpenAI:ta suoraan tai yhdistä Claude Code -tilauksesi (Enterprise tai Personal)
 3. **Määritä** — Avaa laajennus ja lisää API-avaimesi (tai kirjaudu Claudella) kohdassa Asetukset → API-palveluntarjoajat
 4. **Aloita rakentaminen** — Avaa ServiceNow-instanssisi välilehdelle (se tunnistetaan automaattisesti) ja aloita keskustelu
 

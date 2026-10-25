@@ -21,6 +21,20 @@ The `html_widget` tool creates rich visual presentations inline in chat instead 
 - All users can choose Latest or history independently per mounted view. Latest follows saves; history selection never modifies saved content. Reopened views default to Latest.
 - Manual code saves and `iframe_tool edit_html` append versions too; edit_html requires `expected_version`. `widget_eval` remains runtime-only and never auto-saves.
 
+## Split-screen workshop mode
+
+A new widget opens automatically in the split view beside the chat, and the user watches it while you work. If a widget is already shown there, decide whether yours should `replace` it or iterate on it (same `widget_id`).
+
+- **Be fast. Ship a skeleton first.** Save a light layout (header, sections, empty table) in your first one or two tool calls, then improve it. Don't spend several minutes before anything appears.
+- **Use slots for upcoming work.** Put `<div data-slot="name">` placeholders where results will land. Each one gets a skeleton shimmer plus a label for the coming step (e.g. "Loading open P1s…"). Fill them later with `html_widget({action:"patch", widget_id, slots:{name:"<html>"}, expected_version})`. That updates only those regions, so the rest of the view and the user's state stay as they are. Sub-agents can fill different slots of the same widget together. Each one passes `expected_version`, and on `VERSION_CONFLICT` it re-reads, rebases its slot content and retries. Never overwrite blindly.
+- **Progress card.** Keep the widget's progress card current with `split_view({action:"progress", state, label, tasks, output})`. It uses the same shape and rules as `update_action_state`: the full `tasks` array every time and a terminal state with `output` when you finish.
+- **Preserve user state.** Give inputs and scroll containers stable `id`/`name` attributes so their values and scroll positions survive updates. Mark other custom state with `data-keep-state`. While the user is interacting, updates wait behind a "New update" pill instead of reflowing under them.
+- **Styling.** Use the extension design tokens (see below) unless the user asks for another look.
+- **No bare screenshots.** The split pane can't show a screenshot image on its own, so don't answer with just a screenshot. Build or update a widget instead, and embed screenshots inside it when needed (`executeTool('screenshot_by_id', {id})` → `img.src`).
+- **Static by default.** Widgets are not live. They must export as standalone HTML/PDF, with everything embedded at save time. Call `executeTool` inside a widget only when it's genuinely needed (e.g. fetching data on demand after a click).
+- **Check the pane.** `split_view({action:"status"})` tells you whether the split view is open and which widget it shows. `take_screenshot({target:"split_widget"})` captures the pane exactly as shown on screen (widget area; `include_header:true` adds the header, progress card and "New update" pill), so you can verify your render. It works only when AppAgent is in a full, front tab; from the side panel it returns "split pane not visible".
+- **Print.** Print/PDF expands the widget to its full content height (inner scroll areas are unclipped) and spans multiple pages. Don't rely on `height:100vh` or fixed positioning for content that must print.
+
 ## When to Use Widgets
 
 Use `html_widget` when showing:
@@ -113,6 +127,15 @@ const response = await executeTool('servicenow_api', {
 | `fields` | Limit fields returned | `fields: 'sys_id,number'` |
 | `sys_id` | Get specific record | `sys_id: 'abc123'` |
 | `url_params` | Additional params | `url_params: { sysparm_display_value: 'true' }` |
+
+## Showing files and images (file_id → `<img>`)
+
+Widgets and js_eval are *programmatic* callers: their `executeTool` results never enter the model context, so they get full payloads.
+
+- `executeTool('get_file', {id: fileId})` → `r.data` is a full data URL (`data:image/png;base64,…`) — set it as `img.src`. Works for every file_id (screenshots, attachments, `local_folder` reads, `web_fetch save_file`).
+- Galleries: `executeTool('get_file', {id: fileId, thumbnail: {max: 256}})` → `r.thumbnail.data_url` (small JPEG, `data` omitted).
+- `executeTool('local_folder', {action: 'read', path, encoding: 'base64'})` returns the full `data_url` to widgets/js_eval up to ~48 MB encoded (direct LLM calls: ~1 MB). Above that, `data_url_omitted: true` — fall back to `get_file` on the returned `file_id`. `thumbnail: {max: 256}` works here too.
+- The widget iframe CSP allows `data:` images; `chrome-extension://` / `blob:` URLs from the panel are not loadable from the sandboxed (opaque-origin) iframe — use data URLs.
 
 ## Ask-the-agent buttons
 

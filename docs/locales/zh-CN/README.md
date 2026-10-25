@@ -102,7 +102,7 @@ AppAgent 是一个内置智能体循环的 Chrome 扩展。您描述想要的结
 ## 设置
 
 1. **安装** — 从 Chrome 网上应用店安装 AppAgent 扩展（或在开发时以“加载已解压的扩展程序”方式加载）
-2. **获取 API 密钥** — 在 [OpenRouter](https://openrouter.ai) 注册，直接使用 Anthropic/OpenAI，或连接您的 Claude Code 订阅（企业版或个人版）
+2. **获取 API 密钥** — 在 [OpenRouter](https://openrouter.ai) 或 [Hugging Face](https://huggingface.co/docs/inference-providers) 注册，直接使用 Anthropic/OpenAI，或连接您的 Claude Code 订阅（企业版或个人版）
 3. **配置** — 打开扩展，在“设置 → API 提供商”中添加您的 API 密钥（或使用 Claude 登录）
 4. **开始构建** — 在标签页中打开您的 ServiceNow 实例（会被自动检测），然后开始聊天
 

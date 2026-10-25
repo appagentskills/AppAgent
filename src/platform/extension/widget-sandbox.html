@@ -32,6 +32,10 @@ function connectWidgetEvalDocument() {
         if (!data || port !== _widgetEvalPort) return;
         if (data.type === 'widgetInstanceProbe') {
             port.postMessage({ type: 'widgetContentLoaded', probe_id: data.probe_id });
+        } else if (data.type === 'widgetCaptureState' || data.type === 'applySlots') {
+            // Preferred route for the split pane (core/082-split-view.js via
+            // widgetPortRequest): the port is bound to this exact render.
+            widgetHandleStateRequest(data, function(msg) { if (port === _widgetEvalPort) port.postMessage(msg); });
         } else if (data.type === 'widgetEval') {
             evaluateWidgetScript(data, port);
         }
@@ -67,8 +71,249 @@ async function evaluateWidgetScript(data, port) {
     if (port === _widgetEvalPort) port.postMessage({ type: 'widgetEvalResult', instance_id: data.instance_id, request_id: data.request_id, json: json });
 }
 
+// E (multi-page PDF): print preparation for the ?widget=&print=1 tab (core/120-init.js
+// _dlPrintWidget). The parent cannot read this opaque-origin document, so it asks us to
+// make the widget print-friendly and report the full content height; it then sizes the
+// iframe to that height and prints. Height/overflow clipping (html/body 100vh, inner
+// scroll containers) is removed so nothing is cut at the frame edge.
+var WIDGET_PRINT_CSS = '@page{margin:12mm}' +
+    'html,body{height:auto!important;min-height:0!important;max-height:none!important;overflow:visible!important}' +
+    '[data-aa-print-unclip]{overflow:visible!important;height:auto!important;max-height:none!important}' +
+    '@media print{html,body{-webkit-print-color-adjust:exact;print-color-adjust:exact}' +
+    'tr,img,svg,canvas,figure,pre,blockquote,.card,[class*="card"],[class*="Card"],[data-slot]{break-inside:avoid;page-break-inside:avoid}' +
+    'thead{display:table-header-group}h1,h2,h3,h4{break-after:avoid;page-break-after:avoid}' +
+    '[data-aa-print-fixed]{position:absolute!important}}';
+
+// Mark scroll containers that currently clip content (vertical overflow auto/scroll with
+// hidden rows) so the print CSS expands them; mark fixed-position elements so they are
+// printed once in flow instead of being pinned/clipped to the frame viewport.
+function widgetPrintUnclip() {
+    var els = document.body ? document.body.querySelectorAll('*') : [];
+    for (var i = 0; i < els.length; i++) {
+        var el = els[i], cs;
+        try { cs = getComputedStyle(el); } catch (err) { continue; }
+        if ((cs.overflowY === 'auto' || cs.overflowY === 'scroll') && el.scrollHeight > el.clientHeight + 1) el.setAttribute('data-aa-print-unclip', '1');
+        if (cs.position === 'fixed') el.setAttribute('data-aa-print-fixed', '1');
+    }
+}
+
+// Resolve once every <img> has loaded/errored and fonts are ready, capped at capMs.
+function widgetPrintWaitAssets(capMs) {
+    var waits = [];
+    var imgs = document.images || [];
+    for (var i = 0; i < imgs.length; i++) {
+        (function(img) {
+            if (img.complete) return;
+            waits.push(new Promise(function(r) { img.addEventListener('load', r, { once: true }); img.addEventListener('error', r, { once: true }); }));
+        })(imgs[i]);
+    }
+    if (document.fonts && document.fonts.ready && typeof document.fonts.ready.then === 'function') waits.push(document.fonts.ready.then(null, function() {}));
+    return Promise.race([Promise.all(waits), new Promise(function(r) { setTimeout(r, capMs); })]);
+}
+
+function widgetPrintMeasure() {
+    var d = document.documentElement, b = document.body;
+    return Math.ceil(Math.max(d ? d.scrollHeight : 0, b ? b.scrollHeight : 0, d ? d.getBoundingClientRect().height : 0));
+}
+
+function prepareWidgetForPrint(data) {
+    var reqId = data && typeof data.request_id === 'string' ? data.request_id : '';
+    try {
+        if (!document.getElementById('aa-widget-print-css')) {
+            var st = document.createElement('style');
+            st.id = 'aa-widget-print-css';
+            st.textContent = WIDGET_PRINT_CSS;
+            (document.head || document.documentElement).appendChild(st);
+        }
+    } catch (err) {}
+    var nextFrame = function(cb) { var f = false; var go = function() { if (f) return; f = true; try { cb(); } catch (err) {} }; try { requestAnimationFrame(go); } catch (err) {} setTimeout(go, 50); };
+    var report = function() {
+        try { widgetPrintUnclip(); } catch (err) {}
+        nextFrame(function() { nextFrame(function() {
+            var h = 0;
+            try { h = widgetPrintMeasure(); } catch (err) {}
+            window.parent.postMessage({ type: 'widgetPrintSize', request_id: reqId, height: h }, '*');
+        }); });
+    };
+    try { widgetPrintUnclip(); } catch (err) {}
+    widgetPrintWaitAssets(4000).then(report, report);
+}
+
+// A (split-pane live patch): best-effort UI state capture/restore around a
+// reload, in-place slot replacement, and user-activity reporting so the parent
+// can hold an update while the user is interacting. Keys: #id, then
+// name:TAG:name[:value], then a DOM index path from the nearest id.
+function widgetStatePath(el) {
+    var parts = [];
+    while (el && el.nodeType === 1 && el !== document.documentElement) {
+        if (el.id) { parts.unshift('#' + el.id); break; }
+        var i = 0, s = el;
+        while ((s = s.previousElementSibling)) i++;
+        parts.unshift(el.tagName.toLowerCase() + ':' + i);
+        el = el.parentElement;
+    }
+    return parts.join('>');
+}
+function widgetFindByPath(p) {
+    if (!p) return null;
+    var parts = p.split('>'), el = document.documentElement, start = 0;
+    if (parts[0].charAt(0) === '#') { el = document.getElementById(parts[0].slice(1)); start = 1; }
+    for (var i = start; i < parts.length && el; i++) {
+        var bits = parts[i].split(':');
+        var c = el.children[Number(bits[1])];
+        el = (c && c.tagName.toLowerCase() === bits[0]) ? c : null;
+    }
+    return el || null;
+}
+function widgetStateKey(el) {
+    if (el.id) return '#' + el.id;
+    if (el.name) return 'name:' + el.tagName + ':' + el.name + ((el.type === 'radio' || el.type === 'checkbox') ? ':' + el.value : '');
+    return widgetStatePath(el);
+}
+function widgetFindByKey(key) {
+    if (!key) return null;
+    if (key.charAt(0) === '#' && key.indexOf('>') === -1) return document.getElementById(key.slice(1));
+    if (key.indexOf('name:') === 0) {
+        var b = key.split(':'), els = document.getElementsByName(b[2]);
+        for (var i = 0; i < els.length; i++) {
+            if (els[i].tagName !== b[1]) continue;
+            if (b.length > 3 && els[i].value !== b.slice(3).join(':')) continue;
+            return els[i];
+        }
+        return null;
+    }
+    return widgetFindByPath(key);
+}
+function widgetCaptureState() {
+    var st = { scroll: { x: window.scrollX || 0, y: window.scrollY || 0 }, scrollEls: [], values: [], details: [], keep: [], focus: null };
+    try {
+        var all = document.body ? document.body.querySelectorAll('*') : [];
+        for (var i = 0; i < all.length; i++) if (all[i].scrollTop > 0 || all[i].scrollLeft > 0) st.scrollEls.push({ k: widgetStatePath(all[i]), t: all[i].scrollTop, l: all[i].scrollLeft });
+        document.querySelectorAll('input, textarea, select').forEach(function(el) {
+            var type = (el.type || '').toLowerCase();
+            if (/^(file|hidden|submit|button|reset|image|password)$/.test(type)) return;
+            var v = { k: widgetStateKey(el) };
+            if (type === 'checkbox' || type === 'radio') v.c = !!el.checked;
+            else if (el.tagName === 'SELECT' && el.multiple) v.m = Array.prototype.filter.call(el.options, function(o) { return o.selected; }).map(function(o) { return o.value; });
+            else v.v = el.value;
+            st.values.push(v);
+        });
+        document.querySelectorAll('details').forEach(function(el) { st.details.push({ k: widgetStateKey(el), o: !!el.open }); });
+        document.querySelectorAll('[data-keep-state]').forEach(function(el) {
+            var name = el.getAttribute('data-keep-state');
+            st.keep.push({ k: name ? 'keep:' + name : widgetStateKey(el), h: el.innerHTML });
+        });
+        var ae = document.activeElement;
+        if (ae && ae !== document.body && ae !== document.documentElement) {
+            st.focus = { k: widgetStateKey(ae) };
+            try { if (typeof ae.selectionStart === 'number') { st.focus.s = ae.selectionStart; st.focus.e = ae.selectionEnd; } } catch (err) {}
+        }
+    } catch (err) {}
+    return st;
+}
+function widgetRestoreState(st) {
+    if (!st || typeof st !== 'object') return;
+    var each = function(list, fn) { (Array.isArray(list) ? list : []).forEach(function(x) { try { fn(x); } catch (err) {} }); };
+    each(st.keep, function(x) {
+        var el = x.k.indexOf('keep:') === 0 ? document.querySelector('[data-keep-state="' + x.k.slice(5).replace(/["\\]/g, '\\$&') + '"]') : widgetFindByKey(x.k);
+        if (el && typeof x.h === 'string') el.innerHTML = x.h;
+    });
+    each(st.details, function(x) { var el = widgetFindByKey(x.k); if (el && el.tagName === 'DETAILS') el.open = !!x.o; });
+    each(st.values, function(x) {
+        var el = widgetFindByKey(x.k);
+        if (!el) return;
+        var changed = false;
+        if ('c' in x) { if (el.checked !== x.c) { el.checked = x.c; changed = true; } }
+        else if (Array.isArray(x.m)) { Array.prototype.forEach.call(el.options || [], function(o) { var s = x.m.indexOf(o.value) !== -1; if (o.selected !== s) { o.selected = s; changed = true; } }); }
+        else if (typeof x.v === 'string' && el.value !== x.v) { el.value = x.v; changed = true; }
+        if (changed) { el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); }
+    });
+    each(st.scrollEls, function(x) { var el = widgetFindByPath(x.k); if (el) { el.scrollTop = x.t; el.scrollLeft = x.l; } });
+    try { if (st.scroll) window.scrollTo(st.scroll.x || 0, st.scroll.y || 0); } catch (err) {}
+    if (st.focus) {
+        try {
+            var f = widgetFindByKey(st.focus.k);
+            if (f && typeof f.focus === 'function') {
+                f.focus({ preventScroll: true });
+                if (typeof st.focus.s === 'number' && typeof f.setSelectionRange === 'function') f.setSelectionRange(st.focus.s, st.focus.e);
+            }
+        } catch (err) {}
+    }
+}
+// Replace [data-slot=name] contents in place (no document rewrite). Inline
+// scripts inside a slot are re-created so they execute once.
+function widgetApplySlots(slots) {
+    var applied = [], missing = [];
+    if (!slots || typeof slots !== 'object') return { applied: applied, missing: missing };
+    Object.keys(slots).forEach(function(name) {
+        var els = document.querySelectorAll('[data-slot="' + String(name).replace(/["\\]/g, '\\$&') + '"]');
+        if (!els.length) { missing.push(name); return; }
+        for (var i = 0; i < els.length; i++) {
+            els[i].innerHTML = String(slots[name] == null ? '' : slots[name]);
+            els[i].querySelectorAll('script').forEach(function(old) {
+                var s = document.createElement('script');
+                for (var a = 0; a < old.attributes.length; a++) s.setAttribute(old.attributes[a].name, old.attributes[a].value);
+                s.textContent = old.textContent;
+                old.replaceWith(s);
+            });
+        }
+        applied.push(name);
+    });
+    return { applied: applied, missing: missing };
+}
+var _widgetActivityLastPost = 0;
+function widgetReportActivity(e) {
+    var kind = e.type === 'focusout' ? 'blur' : (e.type === 'focusin' ? 'focus' : 'input');
+    var now = Date.now();
+    if (kind === 'input' && now - _widgetActivityLastPost < 500) return;
+    if (kind === 'input') _widgetActivityLastPost = now;
+    var msg = { type: 'widgetUserActivity', kind: kind, at: now };
+    // The parent holds updates only while an EDITABLE element is focused.
+    if (kind === 'focus') msg.editable = widgetIsEditable(e.target);
+    try { window.parent.postMessage(msg, '*'); } catch (err) {}
+}
+function widgetIsEditable(el) {
+    if (!el || el.nodeType !== 1) return false;
+    var tag = el.tagName;
+    if (tag === 'TEXTAREA' || tag === 'SELECT') return true;
+    if (tag === 'INPUT') return !/^(button|submit|reset|image|checkbox|radio|file|hidden|range|color)$/i.test(el.type || '');
+    return !!el.isContentEditable;
+}
+// document.open() erases document listeners: called at boot AND after every write.
+function widgetBindActivity() {
+    if (typeof document === 'undefined' || !document || typeof document.addEventListener !== 'function') return;
+    ['input', 'keydown', 'pointerdown', 'wheel', 'focusin', 'focusout'].forEach(function(type) {
+        document.addEventListener(type, widgetReportActivity, { capture: true, passive: true });
+    });
+}
+widgetBindActivity();
+
+// Shared by the MessagePort route (preferred) and the window fallback below.
+function widgetHandleStateRequest(data, reply) {
+    if (data.type === 'widgetCaptureState') {
+        var snap = null;
+        try { snap = widgetCaptureState(); } catch (err) {}
+        reply({ type: 'widgetStateSnapshot', request_id: data.request_id || '', state: snap });
+    } else if (data.type === 'applySlots') {
+        var res = { applied: [], missing: [] };
+        try { res = widgetApplySlots(data.slots); } catch (err) {}
+        reply({ type: 'widgetSlotsApplied', request_id: data.request_id || '', applied: res.applied, missing: res.missing });
+    }
+}
+
 function onParentMessage(e) {
     if (e.source !== window.parent) return;
+    // Window FALLBACK for widgetCaptureState/applySlots. The parent prefers the
+    // MessagePort (connectWidgetEvalDocument), but that port only exists once a
+    // registered render has finished loading and is briefly unbound during a
+    // re-probe; frames mounted without a saved widget id never get one. So the
+    // window path stays, guarded by e.source === window.parent (the extension
+    // page). applySlots only runs script inside THIS sandbox, with the same
+    // privilege as the widget's own scripts.
+    if (e.data && (e.data.type === 'widgetCaptureState' || e.data.type === 'applySlots')) {
+        widgetHandleStateRequest(e.data, function(msg) { window.parent.postMessage(msg, '*'); });
+        return;
+    }
     // Window messages are bootstrap/theme only; eval and probes require the
     // original document-owned MessagePort.
     if (e.data && e.data.type === 'loadWidget') {
@@ -82,6 +327,8 @@ function onParentMessage(e) {
         // listener, this one included. Same function reference, so a repeat
         // loadWidget can never double-register (addEventListener dedupes).
         window.addEventListener('message', onParentMessage);
+        widgetBindActivity();
+        var _restoreState = e.data.restoreState || null;
         // Design-token theme hook. The parent injects a token <style> whose dark
         // half is scoped to :root[data-appagent-theme="dark"] (injectWidgetTokens
         // in ui/070-dashboard-ui.js), so we mark the document with the theme the
@@ -103,6 +350,7 @@ function onParentMessage(e) {
         // hidden tab; rAF still wins in a visible/foreground tab (timing unchanged there).
         var _nextFrame = function(cb){ var done=false; var fire=function(){ if(done) return; done=true; try{ cb(); }catch(e){} }; try{ requestAnimationFrame(fire); }catch(e){} setTimeout(fire, 50); };
         var _signalRendered = function() {
+            if (_restoreState) { try { widgetRestoreState(_restoreState); } catch (err) {} _restoreState = null; }
             connectWidgetEvalDocument();
             try { window.parent.postMessage({ type: 'widgetContentLoaded', instance_id: _widgetEvalInstanceId }, '*'); } catch (err) {}
         };
@@ -124,6 +372,9 @@ function onParentMessage(e) {
     // standalone (documentElement always exists, even before any loadWidget) and
     // never touches the ready handshake. Post-render delivery depends on the
     // re-attach inside the loadWidget branch above.
+    if (e.data && e.data.type === 'widgetPrintPrepare') {
+        prepareWidgetForPrint(e.data);
+    }
     if (e.data && e.data.type === 'themeChange') {
         try { document.documentElement.setAttribute('data-appagent-theme', e.data.theme === 'dark' ? 'dark' : 'light'); } catch (err) {}
     }

@@ -1568,8 +1568,14 @@
 .jobs-row-state-badge.state-needs_permission { background: var(--warning-light, #fef3c7); color: var(--warning, #b45309); }
 /* User-paused chat — amber "Paused" badge (matches the .state-paused dot). */
 .jobs-row-state-badge.state-paused { background: var(--warning-light, #fef3c7); color: var(--warning, #b45309); }
-/* Expand-modal card head: badge sits inline between title and buttons. */
-.jobs-expand-card-head .jobs-row-state-badge { margin-top: 0; flex-shrink: 1; min-width: 0; }
+/* Expand-modal card head: the badge sits on its OWN row under the title
+   (grid column 2, aligned with the title text, not under the leading
+   indicator). It is as wide as its label up to the full title column, then
+   ellipsizes its label. */
+.jobs-expand-card-head > .jobs-row-state-badge {
+    grid-column: 2; justify-self: start;
+    margin-top: 0; max-width: 100%; min-width: 0;
+}
 /* Bell shown when a finished chat has an unviewed response. */
 .jobs-row-bell {
     display: inline-flex; align-items: center; justify-content: center;
@@ -1901,7 +1907,7 @@
 .jobs-expand-section-cards > .jobs-expand-card {
     break-inside: avoid;
     margin-bottom: var(--space-6);
-    display: block;
+    display: grid;
 }
 .jobs-expand-empty {
     text-align: center; color: var(--text-muted);
@@ -1911,12 +1917,21 @@
 /* Card: a single flat surface — the title sits ON the card (slightly bold),
    with no separate header band/background. A ::before left accent bar carries
    the chat's state color (running/attention/error); done stays neutral. */
+/* Grid: head + body on the left, the action-icon rail (.jobs-expand-card-
+   actions) stacked vertically on the right spanning both, and the PR/workers
+   drawer full-width underneath. */
 .jobs-expand-card {
     position: relative;
-    display: flex; flex-direction: column;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas: "head actions" "body actions" "drawer drawer";
+    align-items: start;
     border: 1px solid var(--secondary-border);
     border-radius: var(--radius-md);
-    background: var(--bg-white);
+    /* --jobs-card-bg = the card surface; .is-current / .jobs-read override it
+       so the body fade layers and the drawer's PR cards follow the card. */
+    --jobs-card-bg: var(--bg-white);
+    background: var(--jobs-card-bg);
     padding: var(--space-3) var(--space-4);
     min-width: 0;
     flex-shrink: 0;
@@ -1956,26 +1971,48 @@
     background: var(--bg-elevated, var(--bg-white));
 }
 .jobs-expand-card-head {
-    display: flex; align-items: center; gap: var(--space-2);
+    grid-area: head;
+    min-width: 0;
+    /* Row 1: leading indicator | title line (title + trailing dot).
+       Row 2: status pill under the title (column 2). */
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: center;
+    column-gap: var(--space-2); row-gap: 3px;
     margin-bottom: var(--space-2);
 }
+/* Title line: the title gets the full width minus the indicator column and
+   the trailing dot. */
+.jobs-expand-card-titleline {
+    grid-column: 2; grid-row: 1;
+    min-width: 0;
+    display: flex; align-items: center; gap: var(--space-2);
+}
+/* Action icons (open / context ring / pin / dismiss) in a vertical column on
+   the card's right side. */
+.jobs-expand-card-actions {
+    grid-area: actions;
+    display: flex; flex-direction: column; align-items: center;
+    gap: var(--space-1);
+    margin-inline-start: var(--space-2);
+}
+.jobs-expand-card-actions .jobs-row-ctx,
+.jobs-expand-card-actions .jobs-row-btn { flex-shrink: 0; }
 .jobs-expand-card-head .jobs-row-dot,
 .jobs-expand-card-head .jobs-row-bell { flex-shrink: 0; }
 /* Context ring on expand-modal cards — same compact size as the dropdown rows. */
-.jobs-expand-card-head .jobs-row-ctx { width: 22px; height: 22px; flex-shrink: 0; }
-.jobs-expand-card-head .jobs-row-ctx .worker-ctx-circle { width: 22px; height: 22px; }
-.jobs-expand-card-head .jobs-row-ctx .worker-ctx-pct { font-size: 7px; }
-/* Pin / dismiss controls on expand cards (modal + embedded home panel): hover-
-   revealed like the dropdown-row buttons (see .jobs-chat-row rules above); the
-   open-chat button stays always visible, and a pinned pin stays lit so the
-   pinned state reads at a glance (color comes from .jobs-pin-btn.pinned). */
+.jobs-expand-card-actions .jobs-row-ctx { width: 22px; height: 22px; flex-shrink: 0; }
+.jobs-expand-card-actions .jobs-row-ctx .worker-ctx-circle { width: 22px; height: 22px; }
+.jobs-expand-card-actions .jobs-row-ctx .worker-ctx-pct { font-size: 7px; }
+/* Pin / dismiss controls on expand cards (modal + embedded home panel): always
+   visible in the action rail, like the open-chat button (no hover reveal); a
+   pinned pin is lit via .jobs-pin-btn.pinned. */
 .jobs-expand-card .jobs-row-btn.jobs-pin-btn,
-.jobs-expand-card .jobs-row-btn.jobs-card-dismiss { opacity: 0; transition: opacity 0.12s; flex-shrink: 0; }
-.jobs-expand-card:hover .jobs-row-btn.jobs-pin-btn,
-.jobs-expand-card:hover .jobs-row-btn.jobs-card-dismiss { opacity: 1; }
-.jobs-expand-card .jobs-row-btn.jobs-pin-btn.pinned { opacity: 1; }
+.jobs-expand-card .jobs-row-btn.jobs-card-dismiss { flex-shrink: 0; }
 .jobs-expand-card-title {
-    flex: 1; min-width: 0;
+    /* Fills the title line; only the trailing dot shares the row (the state
+       badge lives on its own row below). */
+    flex: 1 1 auto; min-width: 0;
     font-size: var(--text-body-sm);
     /* Normal weight when read — only unread (unopened finished) cards go bold. */
     font-weight: var(--font-normal, 400);
@@ -1986,8 +2023,9 @@
    head (.jobs-unread-dot, from _jobsRowSignals) so it can't be clipped away
    when the title truncates. */
 .jobs-expand-card.jobs-unread .jobs-expand-card-title { font-weight: var(--font-bold, 700); }
-/* Read (seen) cards dim like read emails. */
-.jobs-expand-card.jobs-read { background: var(--bg-hover); }
+/* Read (seen) cards keep the normal card surface (no grey) — only the title
+   dims; unread cards show the blue dot in place of the done check
+   (_jobsExpandCardHtml). */
 .jobs-expand-card.jobs-read .jobs-expand-card-title { color: var(--text-secondary); }
 /* Trailing signals in the card head never shrink. */
 .jobs-expand-card-head .jobs-unread-dot,
@@ -2000,6 +2038,7 @@
    accordion section above. */
 .jobs-expand-card-body {
     --jobs-scroll-fade: rgba(0, 0, 0, 0.14);
+    grid-area: body;
     min-width: 0;
     max-height: clamp(160px, 32vh, 340px);
     overflow-y: auto;
@@ -2027,6 +2066,7 @@
    shared (.jobs-acc-workers-* above); cards are .worker-card from
    24-sub-agents.css. */
 .jobs-expand-card-workers {
+    grid-area: drawer;
     border-top: 1px solid var(--secondary-border);
     border-radius: 0 0 calc(var(--radius-md) - 1px) calc(var(--radius-md) - 1px);
     background: var(--bg-secondary, var(--bg-white));
@@ -2034,6 +2074,25 @@
     margin: var(--space-2) calc(-1 * var(--space-4)) calc(-1 * var(--space-3));
     min-width: 0;
     flex-shrink: 0;
+}
+/* PR cards (_jobsCardPrCardsHtml): top of the drawer, directly above the
+   Workers header/cards. The list + cards are the chat sidebar's
+   .pr-sidebar-list / .pr-sidebar-item (11-version.css); only spacing here. */
+.jobs-card-prs {
+    margin-bottom: var(--space-2);
+    min-width: 0;
+}
+/* PR cards take the CARD's own surface (white / elevated when current / grey
+   when read) via --jobs-card-bg, not the drawer's band. Scoped to
+   .jobs-card-prs so the chat sidebar's .pr-sidebar-item is untouched. Hover
+   adds a border, since --bg-hover === the read card's surface in light mode. */
+.jobs-card-prs .pr-sidebar-item {
+    background: var(--jobs-card-bg, var(--bg-white));
+    border: 1px solid transparent;
+}
+.jobs-card-prs .pr-sidebar-item:hover {
+    background: var(--jobs-card-bg, var(--bg-white));
+    border-color: var(--secondary-border);
 }
 @media (max-width: 560px) {
     .jobs-expand-modal { width: 96vw; height: 90vh; }

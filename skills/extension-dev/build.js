@@ -579,6 +579,8 @@ async function extension_build(args) {
         // the roster filter (097) and worker/025. Before 080-tools/097.
         'src/js/core/078-tool-profiles.js',
         'src/js/core/080-tools.js',
+        // 082-split-view — split-view state + prompt context (SW builds the prompt).
+        'src/js/core/082-split-view.js',
         'src/js/core/085-eval-runner.js',
         'src/js/core/090-codemap.js',
         'src/js/core/095-handle-registry.js',
@@ -601,6 +603,8 @@ async function extension_build(args) {
         // dispatched by 020-tool-execution's run_js_file / run_tests arms; headless.
         // Keep in sync with build/build.js WORKER_SHARED_FILES.
         'src/js/tools/160-run-tests.js',
+        // 165-chat-history: read-only chat_history tool — headless. Keep in sync with build/build.js.
+        'src/js/tools/165-chat-history.js',
         // 170-local-folders: local_folder tool + lfResolveBinaryInput (servicenow_api / web_fetch).
         'src/js/tools/170-local-folders.js',
         'src/js/tools/020-tool-execution.js',

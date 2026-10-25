@@ -217,6 +217,19 @@ async function fetchCredits() {
         return;
     }
 
+    // Hugging Face Inference Providers: no public credits/balance API
+    // (<base>/v1/credits would 404). Show a link to the HF billing page.
+    if (typeof isHuggingFaceEndpoint === 'function' && isHuggingFaceEndpoint(provider.endpoint)) {
+        var hfHtml = '<span class="credits-icon">' + UI_ICONS.money + '</span>' +
+            '<a href="' + HF_BILLING_URL + '" target="_blank" rel="noopener noreferrer" style="color:inherit;text-decoration:none">' + t('Billing') + '</a>';
+        var hfTitle = t('Hugging Face has no balance API — open billing settings. Per-request cost is computed from provider pricing.');
+        [creditsEl, homeCreditsEl].forEach(function(el) {
+            if (!el) return;
+            el.innerHTML = hfHtml; el.className = 'credits-display'; el.title = hfTitle; el.style.display = '';
+        });
+        return;
+    }
+
     var v1Idx = provider.endpoint.indexOf('/v1/');
     if (v1Idx === -1) return;
     var creditsUrl = provider.endpoint.substring(0, v1Idx) + '/v1/credits';
@@ -819,6 +832,7 @@ function completeSummaryAndCreateNewChat() {
     clearUpdateSet();
     renderChatList();
     renderMessages();
+    if (typeof renderSplitViewPane === 'function') renderSplitViewPane();
     renderVersionSidebar();
     updateChatTitleHeader();
     // TA-9: this path bypasses newChat(), so it resets the composer hint itself.
@@ -908,6 +922,7 @@ function newChat() {
     clearUpdateSet();
     renderChatList();
     renderMessages();
+    if (typeof renderSplitViewPane === 'function') renderSplitViewPane();
     renderVersionSidebar();
     updateChatTitleHeader();
     // Reset Workers strip for the fresh new chat (no subs yet — strip
@@ -1054,6 +1069,8 @@ function selectChat(chatId, options) {
     loadVersionHistory();
     renderChatList();
     renderMessages();
+    // Split widget pane follows the displayed chat (core/082-split-view.js).
+    if (typeof renderSplitViewPane === 'function') renderSplitViewPane();
     // MEMFIX: non-recent chats are loaded with their inline base64 payloads
     // evicted (see loadChatsFromStorage). The sync render above shows text
     // immediately (images show placeholders); rehydrate from IDB and re-render
