@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.1.38
+
+### Fixes
+- Claude login stays signed in instead of asking to log in again every day.
+- Workers sidebar cards no longer flash on hover.
+
+---
+
 ## v1.1.37
 
 ### New

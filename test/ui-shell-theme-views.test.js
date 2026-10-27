@@ -291,6 +291,20 @@ describe('ui shell › Workers panel + sub-agent breadcrumb', function() {
         assert.ok(cards[0].querySelector('[data-worker-approval]').hasAttribute('hidden'), 'approval badge hidden by default');
         assert.strictEqual(el.querySelectorAll('.worker-card-progress').length, 0, 'collapsed cards carry no progress panel');
     }, { tags: ['unit'] });
+    test('re-render with unchanged structure keeps the same card nodes (no hover flash) but patches live metrics; a state change rebuilds', async function() {
+        var records = [rec({ agent_id: 'a1' })];
+        var s = await setup(records);
+        s.m.renderWorkersStrip();
+        var card = s.dom.$('.worker-card');
+        records[0].tool_calls_used = 7; // heartbeat tick: volatile metric only
+        s.m.renderWorkersStrip();
+        assert.strictEqual(s.dom.$('.worker-card'), card, 'card node preserved under the pointer');
+        assert.strictEqual(card.querySelector('.worker-tools').textContent, '7 tool calls', 'metric patched in place');
+        records[0].state = 'stopped';
+        s.m.renderWorkersStrip();
+        assert.notStrictEqual(s.dom.$('.worker-card'), card, 'state change rebuilds');
+        assert.ok(s.dom.$('.worker-card').classList.contains('worker-stopped'));
+    }, { tags: ['unit'] });
     test('clicking a card expands its progress panel (empty state + Open chat), second click removes it; Open chat reveals', async function() {
         var s = await setup([rec({ agent_id: 'a1' })]);
         s.m.renderWorkersStrip();

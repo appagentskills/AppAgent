@@ -2692,15 +2692,22 @@ chrome.tabs.onRemoved.addListener(function(tabId) {
 // for both personal accounts and SSO-enforced orgs where claude.ai's
 // /oauth/authorize page returns 403.
 //
-// Uses Claude Desktop's public OAuth client_id (no secret — public client).
+// Uses the Claude Code CLI's public OAuth client_id (no secret — public client).
+// Unlike the Claude Desktop client (89355bc3…, which never returns a
+// refresh_token), this client issues ROTATING refresh tokens (access token
+// lifetime 8h / expires_in 28800). Renewal therefore uses grant_type=
+// refresh_token and only falls back to the cookie authorize when the refresh
+// token is missing or rejected — the hourly cookie authorize used to hit 403
+// session_stale_relogin roughly twice a day. The token endpoint MUST stay on
+// api.anthropic.com (platform.claude.com/v1/oauth/token answers 429).
 //
 // Prerequisite: user is signed into claude.ai in the same Chrome profile.
 
 var CLAUDE_OAUTH = {
-    clientId: '89355bc3-cbfd-4382-905b-976645cad410',
+    clientId: '9d1c250a-e61b-44d9-88ed-5944d1962f5e',
     apiHost: 'https://api.anthropic.com',
-    redirectUri: 'https://claude.ai/desktop/callback',
-    scopes: 'user:inference'
+    redirectUri: 'https://platform.claude.com/oauth/code/callback',
+    scopes: 'user:profile user:inference user:sessions:claude_code user:mcp_servers'
 };
 
 // Guard for silent auto-login (see the claude-oauth-status handler). In-memory
@@ -2740,9 +2747,11 @@ async function resolveActiveOrg(sessionKey) {
     if (fromCookie) return fromCookie;
 
     // Fallback: ask the API which orgs this session belongs to.
-    var res = await fetch(CLAUDE_OAUTH.apiHost + '/api/organizations', {
+    // Bounded like the other OAuth calls: this runs inside the renewal single
+    // flight, so a hang here would pin claudeRenewInFlight.
+    var res = await _claudeOAuthFetch(CLAUDE_OAUTH.apiHost + '/api/organizations', {
         headers: { 'Authorization': 'Bearer ' + sessionKey, 'Accept': 'application/json' }
-    });
+    }, 'Claude org lookup');
     if (!res.ok) throw new Error('Could not list organizations (HTTP ' + res.status + ')');
     var orgs = await res.json();
     var list = Array.isArray(orgs) ? orgs : (orgs && orgs.organizations) || [];
@@ -3035,6 +3044,81 @@ function describeChatGPTUsageLimit(bodyText) {
 // silently re-write claudeOAuth (logging the user back in).
 var claudeOAuthEpoch = 0;
 
+// Single-flight renewal: { epoch, promise } of the renewal in progress, or null.
+// Refresh tokens are single-use (they rotate), so N concurrent callers (pre-
+// stream check, 401 retry, status poll, claude-oauth-refresh, heartbeat) must
+// share ONE refresh — a second refresh with the already-rotated token would
+// fail with invalid_grant. Never shared across a logout: logout clears it and
+// a caller from another epoch starts its own (fenced) renewal.
+var claudeRenewInFlight = null;
+// Last renewal failure { at, message } — lets the 60s status poll back off
+// instead of re-running refresh + cookie authorize every minute (retry storm)
+// once both have failed. User-initiated paths (stream, login) ignore it.
+var claudeRenewLastFailure = null;
+var CLAUDE_RENEW_POLL_BACKOFF_MS = 5 * 60 * 1000;
+// Lifetime the CLI client reports (expires_in) — used only if a token
+// response ever omits expires_in (logged).
+var CLAUDE_OAUTH_DEFAULT_EXPIRES_IN = 28800;
+var CLAUDE_OAUTH_FETCH_TIMEOUT_MS = 30000;
+
+function _claudeOAuthTimeoutSignal() {
+    return (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function')
+        ? AbortSignal.timeout(CLAUDE_OAUTH_FETCH_TIMEOUT_MS) : undefined;
+}
+
+// fetch() for the OAuth endpoints (authorize, code exchange, refresh) bounded by
+// CLAUDE_OAUTH_FETCH_TIMEOUT_MS: a hung request must reject, or it would pin the
+// single-flight claudeRenewInFlight entry (and every caller sharing it) forever.
+async function _claudeOAuthFetch(url, opts, label) {
+    // NOTE: overrides any caller-supplied opts.signal (callers pass none).
+    opts.signal = _claudeOAuthTimeoutSignal();
+    try {
+        return await fetch(url, opts);
+    } catch (e) {
+        if (e && (e.name === 'TimeoutError' || e.name === 'AbortError')) {
+            var t = new Error(label + ' timed out after ' + (CLAUDE_OAUTH_FETCH_TIMEOUT_MS / 1000) + 's');
+            t.claudeOAuthTimeout = true;
+            throw t;
+        }
+        throw e;
+    }
+}
+
+// Diagnostics: how the last renewal/login ended, so a live check can tell which
+// path ran. { path: 'refresh'|'authorize'|'failed', via: 'renew'|'login', at,
+// error? } — NEVER holds a token. Persisted as claudeOAuthLastRenew (survives SW
+// restarts) and echoed as `lastRenew` in the claude-oauth-status reply.
+var claudeOAuthLastRenew = null;
+// Error text safe to persist/log: anything token-shaped (sk-ant-...) is
+// redacted and the result capped at 200 chars.
+function _redactClaudeOAuthError(err) {
+    return String((err && err.message) || err).replace(/sk-ant-[\w-]+/g, '[redacted]').slice(0, 200);
+}
+function _recordClaudeRenew(path, via, err) {
+    var rec = { path: path, via: via, at: Date.now() };
+    if (err) rec.error = _redactClaudeOAuthError(err);
+    claudeOAuthLastRenew = rec;
+    try {
+        var p = chrome.storage.local.set({ claudeOAuthLastRenew: rec });
+        if (p && typeof p.catch === 'function') p.catch(function() {});
+    } catch (e) {}
+    if (path === 'failed') console.warn('[Claude OAuth] ' + via + ' failed: ' + rec.error);
+    else console.info('[Claude OAuth] ' + via + ' succeeded via ' + path);
+}
+
+// User-facing text for a failed renewal on the stream paths (pre-stream check
+// and 401 retry). session_stale_relogin already carries its own instructions.
+function _claudeRenewErrorText(e, prefix) {
+    return (e && e.claudeSessionStale) ? e.message
+        : prefix + ((e && e.message) || e) + '. Open https://claude.ai, sign in, then retry.';
+}
+
+function _claudeOAuthStaleError() {
+    var stale = new Error('Claude sign-in was cancelled by a logout; the new token was discarded.');
+    stale.claudeOAuthStale = true;
+    return stale;
+}
+
 async function startClaudeOAuth(epoch) {
     if (typeof epoch !== 'number') epoch = claudeOAuthEpoch;
     var sessionKey = await getClaudeCookie('sessionKey');
@@ -3046,8 +3130,8 @@ async function startClaudeOAuth(epoch) {
     var pkce = await makePkce();
 
     // Step 1: authorize against api.anthropic.com using the session cookie as bearer + PKCE.
-    // Server responds with { redirect_uri: "https://claude.ai/desktop/callback?code=...&state=..." }.
-    var authRes = await fetch(CLAUDE_OAUTH.apiHost + '/v1/oauth/' + orgId + '/authorize', {
+    // Server responds with { redirect_uri: "https://platform.claude.com/oauth/code/callback?code=...&state=..." }.
+    var authRes = await _claudeOAuthFetch(CLAUDE_OAUTH.apiHost + '/v1/oauth/' + orgId + '/authorize', {
         method: 'POST',
         headers: {
             'Authorization': 'Bearer ' + sessionKey,
@@ -3064,9 +3148,16 @@ async function startClaudeOAuth(epoch) {
             code_challenge: pkce.challenge,
             code_challenge_method: 'S256'
         })
-    });
+    }, 'Claude authorize');
     if (!authRes.ok) {
         var aErr = await authRes.text();
+        if (/session_stale_relogin/.test(aErr)) {
+            // claude.ai wants an interactive re-login; retrying the cookie
+            // authorize will keep failing until the user signs in again.
+            var staleErr = new Error('Your claude.ai session needs a fresh sign-in (session_stale_relogin). Sign out of https://claude.ai and back in, then retry.');
+            staleErr.claudeSessionStale = true;
+            throw staleErr;
+        }
         throw new Error('Authorize failed: ' + authRes.status + ' ' + aErr);
     }
     var authJson = await authRes.json();
@@ -3080,7 +3171,8 @@ async function startClaudeOAuth(epoch) {
     if (returnedState && returnedState !== pkce.state) throw new Error('OAuth state mismatch');
 
     // Step 2: exchange the code for tokens (include code_verifier for PKCE).
-    var tokRes = await fetch(CLAUDE_OAUTH.apiHost + '/v1/oauth/token', {
+    // No `scope` here: the live-verified 200 for the CLI client omitted it.
+    var tokRes = await _claudeOAuthFetch(CLAUDE_OAUTH.apiHost + '/v1/oauth/token', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
         body: JSON.stringify({
@@ -3089,19 +3181,18 @@ async function startClaudeOAuth(epoch) {
             code: code,
             redirect_uri: CLAUDE_OAUTH.redirectUri,
             code_verifier: pkce.verifier,
-            state: pkce.state,
-            scope: CLAUDE_OAUTH.scopes
+            state: pkce.state
         })
-    });
+    }, 'Claude token exchange');
     if (!tokRes.ok) {
         var tErr = await tokRes.text();
         throw new Error('Token exchange failed: ' + tokRes.status + ' ' + tErr);
     }
-    return saveOAuthCreds(await tokRes.json(), undefined, epoch);
+    return await saveOAuthCreds(await tokRes.json(), undefined, epoch);
 }
 
 async function refreshClaudeToken(refreshToken) {
-    var res = await fetch(CLAUDE_OAUTH.apiHost + '/v1/oauth/token', {
+    var res = await _claudeOAuthFetch(CLAUDE_OAUTH.apiHost + '/v1/oauth/token', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
         body: JSON.stringify({
@@ -3109,7 +3200,7 @@ async function refreshClaudeToken(refreshToken) {
             client_id: CLAUDE_OAUTH.clientId,
             refresh_token: refreshToken
         })
-    });
+    }, 'Claude token refresh');
     if (!res.ok) {
         var errText = await res.text();
         throw new Error('Token refresh failed: ' + res.status + ' ' + errText);
@@ -3117,43 +3208,148 @@ async function refreshClaudeToken(refreshToken) {
     return await res.json();
 }
 
-// Renew the Claude access token. The Claude Desktop OAuth client (the one this
-// extension uses) does NOT issue refresh tokens, so refreshClaudeToken() above
-// always fails for us. Instead we silently re-run startClaudeOAuth(), which only
-// needs the user's claude.ai sessionKey cookie (long-lived). If a refresh_token
-// IS present we still try the proper refresh first — that's the standards path
-// and would work if Anthropic ever turns it on for this client.
-async function renewClaudeToken(oauth, epoch) {
-    if (typeof epoch !== 'number') epoch = claudeOAuthEpoch;
-    if (oauth && oauth.refreshToken) {
+function readStoredClaudeOAuth() {
+    return new Promise(function(resolve) {
         try {
-            var tokenData = await refreshClaudeToken(oauth.refreshToken);
-            return saveOAuthCreds(tokenData, oauth.refreshToken, epoch);
-        } catch (e) {
-            // TA4-3: fenced by a logout - a cookie re-auth would be dropped too.
-            if (e && e.claudeOAuthStale) throw e;
-            // fall through to silent re-auth
-            console.warn('[Claude OAuth] refresh failed, falling back to silent re-auth:', e && e.message);
-        }
-    }
-    // Silent re-auth via the claude.ai session cookie.
-    return await startClaudeOAuth(epoch);
+            chrome.storage.local.get('claudeOAuth', function(d) { resolve((d && d.claudeOAuth) || null); });
+        } catch (e) { resolve(null); }
+    });
 }
 
-function saveOAuthCreds(tokenData, existingRefresh, epoch) {
+// Renew the Claude access token. The CLI OAuth client issues rotating refresh
+// tokens, so the refresh_token grant is the primary path; the cookie authorize
+// (startClaudeOAuth) is only the fallback when there is no refresh token (e.g.
+// creds stored by the old Desktop client) or it was rejected (invalid_grant —
+// reusing a rotated token does not revoke the family). Single-flight per
+// service worker (see claudeRenewInFlight); concurrent callers share the
+// promise. The caller's `oauth` snapshot may be stale (another caller already
+// rotated the token), so the latest stored creds are re-read first.
+function renewClaudeToken(oauth, epoch) {
+    if (typeof epoch !== 'number') epoch = claudeOAuthEpoch;
+    // A caller from before a logout is fenced up front: no storage read, no
+    // refresh (it must not consume the NEW session's rotating refresh token),
+    // and it never replaces the current-epoch in-flight entry.
+    if (epoch !== claudeOAuthEpoch) return Promise.reject(_claudeOAuthStaleError());
+    if (claudeRenewInFlight && claudeRenewInFlight.epoch === epoch) return claudeRenewInFlight.promise;
+    return _claudeSingleFlight(epoch, 'renew', function(info) { return _renewClaudeTokenOnce(oauth, epoch, info); });
+}
+
+// Explicit login (the login button). Goes through the SAME single-flight slot
+// as renewals so it never races one: it waits for a same-epoch renewal already
+// in flight to settle (whatever its outcome — the user asked for a fresh
+// login), then runs the cookie authorize as the new in-flight entry, which
+// later renew callers join instead of spending the refresh token in parallel.
+function loginClaudeOAuth(epoch, via) {
+    if (typeof epoch !== 'number') epoch = claudeOAuthEpoch;
+    if (epoch !== claudeOAuthEpoch) return Promise.reject(_claudeOAuthStaleError());
+    return _claudeSingleFlight(epoch, via || 'login', function(info) {
+        return startClaudeOAuth(epoch).then(function(creds) { info.path = 'authorize'; return creds; });
+    });
+}
+
+// Installs `run` as the claudeRenewInFlight entry for `epoch`, chained after
+// any same-epoch entry it supersedes. Shared bookkeeping: back-off state
+// (claudeRenewLastFailure), diagnostics (_recordClaudeRenew) and clearing the
+// slot when done. `run(info)` sets info.path to the path that produced creds.
+function _claudeSingleFlight(epoch, via, run) {
+    var prev = (claudeRenewInFlight && claudeRenewInFlight.epoch === epoch) ? claudeRenewInFlight.promise : null;
+    var entry = { epoch: epoch, via: via, promise: null };
+    entry.promise = (async function() {
+        try {
+            if (prev) { try { await prev; } catch (e) {} }
+            // A logout while waiting for `prev` fences us before any network call.
+            if (epoch !== claudeOAuthEpoch) throw _claudeOAuthStaleError();
+            var info = {};
+            var creds = await run(info);
+            claudeRenewLastFailure = null;
+            if (info.path) _recordClaudeRenew(info.path, via);
+            return creds;
+        } catch (e) {
+            // A run started before a logout that fails for another reason (e.g. a
+            // timeout) must not re-create the back-off/diagnostics logout cleared.
+            if (!(e && e.claudeOAuthStale) && epoch === claudeOAuthEpoch) {
+                claudeRenewLastFailure = { at: Date.now(), message: (e && e.message) || String(e) };
+                _recordClaudeRenew('failed', via, e);
+            }
+            throw e;
+        } finally {
+            if (claudeRenewInFlight === entry) claudeRenewInFlight = null;
+        }
+    })();
+    claudeRenewInFlight = entry;
+    return entry.promise;
+}
+
+async function _renewClaudeTokenOnce(oauth, epoch, info) {
+    info = info || {};
+    var latest = await readStoredClaudeOAuth();
+    if (latest && latest.accessToken && oauth && latest.accessToken !== oauth.accessToken &&
+        Date.now() < latest.expiresAt - 60000) {
+        // Another renewal already rotated the token since the caller read it.
+        return latest;
+    }
+    var cur = (latest && latest.accessToken) ? latest : oauth;
+    var refreshErr = null;
+    if (cur && cur.refreshToken) {
+        try {
+            var tokenData = await refreshClaudeToken(cur.refreshToken);
+            var refreshed = await saveOAuthCreds(tokenData, cur.refreshToken, epoch);
+            info.path = 'refresh';
+            return refreshed;
+        } catch (e) {
+            // TA4-3: fenced by a logout - a cookie re-auth would be dropped too.
+            // A storage failure would also fail the cookie re-auth's save, and
+            // burn a cookie authorize for nothing - surface it as is.
+            if (e && (e.claudeOAuthStale || e.claudeOAuthSaveFailed)) throw e;
+            refreshErr = e;
+            console.warn('[Claude OAuth] refresh failed, falling back to cookie authorize: ' + _redactClaudeOAuthError(e));
+        }
+    }
+    // Fallback: silent re-auth via the claude.ai session cookie. Errors here
+    // (incl. session_stale_relogin) surface only after the refresh failed too.
+    try {
+        var authorized = await startClaudeOAuth(epoch);
+        info.path = 'authorize';
+        return authorized;
+    } catch (e2) {
+        // session_stale_relogin keeps its clean, actionable message (it is shown
+        // as is on the stream paths); the refresh error is in the warn log above.
+        if (refreshErr && e2 && !e2.claudeOAuthStale && !e2.claudeSessionStale && e2.message) {
+            e2.message += ' (refresh token also rejected: ' + String(refreshErr.message || refreshErr).slice(0, 200) + ')';
+        }
+        throw e2;
+    }
+}
+
+async function saveOAuthCreds(tokenData, existingRefresh, epoch) {
     if (typeof epoch === 'number' && epoch !== claudeOAuthEpoch) {
         // TA4-3: the user logged out after this login/renew started - drop it
         // (no storage write, no broadcast).
-        var stale = new Error('Claude sign-in was cancelled by a logout; the new token was discarded.');
-        stale.claudeOAuthStale = true;
-        throw stale;
+        throw _claudeOAuthStaleError();
+    }
+    if (!tokenData || !tokenData.access_token) throw new Error('Claude token response has no access_token');
+    var expiresIn = Number(tokenData.expires_in);
+    if (!(expiresIn > 0)) {
+        console.warn('[Claude OAuth] token response has no expires_in; assuming ' + CLAUDE_OAUTH_DEFAULT_EXPIRES_IN + 's');
+        expiresIn = CLAUDE_OAUTH_DEFAULT_EXPIRES_IN;
     }
     var creds = {
         accessToken: tokenData.access_token,
+        // Rotating refresh tokens: keep the NEW one; keep the old only if the
+        // response carries none.
         refreshToken: tokenData.refresh_token || existingRefresh,
-        expiresAt: Date.now() + (tokenData.expires_in || 3600) * 1000
+        expiresAt: Date.now() + expiresIn * 1000
     };
-    chrome.storage.local.set({ claudeOAuth: creds });
+    // Persist BEFORE broadcasting: the old refresh token is already dead
+    // server-side, so losing the rotated one would force a cookie re-auth.
+    try { await chrome.storage.local.set({ claudeOAuth: creds }); }
+    catch (e) {
+        // Do not report success (or broadcast) creds we could not persist.
+        console.error('[Claude OAuth] failed to persist creds:', e && e.message);
+        var saveErr = new Error('Could not save the renewed Claude token: ' + ((e && e.message) || e));
+        saveErr.claudeOAuthSaveFailed = true;
+        throw saveErr;
+    }
     chrome.runtime.sendMessage({ type: 'claude-oauth-updated', claudeOAuth: creds }).catch(function() {});
     return creds;
 }
@@ -3163,7 +3359,8 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
     if (message.type === 'claude-oauth-login') {
         // Manual login re-enables auto-login and clears any stale failed-cookie guard.
         chrome.storage.local.remove(['claudeOAuthSuppressAutoLogin', 'claudeAutoLoginFailedFor']);
-        startClaudeOAuth().then(function(creds) {
+        claudeRenewLastFailure = null;
+        loginClaudeOAuth().then(function(creds) {
             sendResponse({ success: true, claudeOAuth: creds });
         }).catch(function(err) {
             sendResponse({ error: err.message });
@@ -3171,6 +3368,10 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
         return true;
     }
     if (message.type === 'claude-oauth-refresh') {
+        // DEBUG / DIAGNOSTIC entry: nothing in src/ sends it (the panel renews via
+        // the status poll and the stream paths). Kept to force a renewal by hand
+        // (e.g. chrome.runtime.sendMessage({type:'claude-oauth-refresh'}) from the
+        // panel console) and for the unit tests; it shares the single flight.
         // TA4-3: capture the epoch on arrival, so a logout during the get/renew fences it.
         var refreshEpoch = claudeOAuthEpoch;
         chrome.storage.local.get('claudeOAuth', function(data) {
@@ -3183,7 +3384,9 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
     if (message.type === 'claude-oauth-status') {
         // TA4-3: captured on arrival; a logout mid-poll fences its auto-login/renew writes.
         var statusEpoch = claudeOAuthEpoch;
-        chrome.storage.local.get(['claudeOAuth', 'claudeAutoLoginFailedFor', 'claudeOAuthSuppressAutoLogin'], async function(data) {
+        chrome.storage.local.get(['claudeOAuth', 'claudeAutoLoginFailedFor', 'claudeOAuthSuppressAutoLogin', 'claudeOAuthLastRenew'], async function(data) {
+            // Additive diagnostics field on logged-in replies (no tokens).
+            function lastRenew() { return claudeOAuthLastRenew || data.claudeOAuthLastRenew || null; }
             if (!data.claudeOAuth) {
                 // AUTO-LOGIN: no token stored yet. If the user is signed into
                 // claude.ai (sessionKey cookie present) and has not manually
@@ -3202,9 +3405,9 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
                     try {
                         try { sk = await getClaudeCookie('sessionKey'); } catch (e) {}
                         if (sk && sk !== data.claudeAutoLoginFailedFor) {
-                            var creds = await startClaudeOAuth(statusEpoch);
+                            var creds = await loginClaudeOAuth(statusEpoch, 'auto-login');
                             chrome.storage.local.remove('claudeAutoLoginFailedFor');
-                            sendResponse({ loggedIn: true, expired: false, expiresAt: creds.expiresAt });
+                            sendResponse({ loggedIn: true, expired: false, expiresAt: creds.expiresAt, lastRenew: lastRenew() });
                             return;
                         }
                     } catch (e) {
@@ -3219,9 +3422,17 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
                 return;
             }
             var oauth = data.claudeOAuth;
-            // Auto-renew if expired or expiring within 1 minute. Uses refresh_token
-            // if available, otherwise falls back to silent re-auth via the claude.ai
-            // session cookie (the Desktop OAuth client we use does not issue refresh tokens).
+            // Auto-renew ONLY if expired or expiring within 1 minute (the poll
+            // never forces a refresh of a valid token). Goes through the single-
+            // flight renewClaudeToken: refresh_token first, cookie authorize as
+            // fallback. After a failure the poll backs off for
+            // CLAUDE_RENEW_POLL_BACKOFF_MS instead of retrying every minute.
+            var pollBackoff = claudeRenewLastFailure && !claudeRenewInFlight &&
+                (Date.now() - claudeRenewLastFailure.at) < CLAUDE_RENEW_POLL_BACKOFF_MS;
+            if (Date.now() > oauth.expiresAt - 60000 && pollBackoff) {
+                sendResponse({ loggedIn: true, expired: Date.now() > oauth.expiresAt, expiresAt: oauth.expiresAt, lastRenew: lastRenew() });
+                return;
+            }
             if (Date.now() > oauth.expiresAt - 60000) {
                 try {
                     oauth = await renewClaudeToken(oauth, statusEpoch);
@@ -3229,14 +3440,15 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
                     // TA4-3: a logout fenced the renew - report logged out, not expired.
                     if (e && e.claudeOAuthStale) { sendResponse({ loggedIn: false }); return; }
                     // Renew failed — login is truly expired (claude.ai session gone too)
-                    sendResponse({ loggedIn: true, expired: true, expiresAt: oauth.expiresAt });
+                    sendResponse({ loggedIn: true, expired: true, expiresAt: oauth.expiresAt, lastRenew: lastRenew() });
                     return;
                 }
             }
             sendResponse({
                 loggedIn: true,
                 expired: Date.now() > oauth.expiresAt,
-                expiresAt: oauth.expiresAt
+                expiresAt: oauth.expiresAt,
+                lastRenew: lastRenew()
             });
         });
         return true;
@@ -3244,7 +3456,11 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
     if (message.type === 'claude-oauth-logout') {
         // TA4-3: bump the epoch FIRST so an in-flight login/renew can't re-write the token.
         claudeOAuthEpoch++;
-        chrome.storage.local.remove('claudeOAuth');
+        // Never share an in-flight renewal across a logout (it is fenced anyway).
+        claudeRenewInFlight = null;
+        claudeRenewLastFailure = null;
+        claudeOAuthLastRenew = null;
+        chrome.storage.local.remove(['claudeOAuth', 'claudeOAuthLastRenew']);
         // Suppress auto-login so an explicit logout sticks — otherwise the next
         // status poll would immediately re-exchange the still-present cookie.
         chrome.storage.local.set({ claudeOAuthSuppressAutoLogin: true });
@@ -3361,7 +3577,7 @@ async function runClaudeOAuthStream(requestBody, sink, abortSignal) {
             try {
                 oauth = await renewClaudeToken(oauth);
             } catch(e) {
-                sink({ type: 'error', error: 'Token refresh failed: ' + e.message + '. Open https://claude.ai, sign in, then retry.' });
+                sink({ type: 'error', error: _claudeRenewErrorText(e, 'Token refresh failed: ') });
                 sink({ type: 'done' });
                 return;
             }
@@ -3425,7 +3641,7 @@ async function runClaudeOAuthStream(requestBody, sink, abortSignal) {
                     errBodyText = null;
                     continue;
                 } catch (e) {
-                    sink({ type: 'error', error: 'Session expired and silent re-auth failed: ' + e.message + '. Open https://claude.ai, sign in, then retry.' });
+                    sink({ type: 'error', error: _claudeRenewErrorText(e, 'Session expired and silent re-auth failed: ') });
                     sink({ type: 'done' });
                     return;
                 }

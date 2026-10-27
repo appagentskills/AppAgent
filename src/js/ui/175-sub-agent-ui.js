@@ -2429,9 +2429,29 @@ function renderWorkersStrip() {
         if (ra !== rb) return ra - rb;
         return (b.last_activity_at || 0) - (a.last_activity_at || 0);
     });
+    // Skip the rebuild when the cards' STRUCTURE is unchanged and they are
+    // still in place. The sidebar re-invokes this on every message render
+    // (renderVersionSidebar), and replacing the cards under the pointer drops
+    // :hover and replays the .worker-card background transition, so a hovered
+    // card flashes on every render. The key deliberately omits the volatile
+    // values updateSidebarWorkerMetrics patches in place (tool-call counter,
+    // context ring, activity, files/PRs, approval badge, progress panel) and
+    // the expanded flag (toggleWorkerProgress already updates the DOM).
+    var structKey = currentChatId + '|' + mine.map(function(r) {
+        return [r.agent_id, r.chat_id || '', r.name || '', r.state,
+            _subIsPaused(r) ? 'p' : '', _subIsQueued(r) ? 'q' : '', r.depth || 1,
+            r._reconstructed ? 'r' : '', _subModelLine(r),
+            Array.isArray(r.profiles) ? r.profiles.join(',') : ''].join(':');
+    }).join('|');
+    if (stripEl.__workersKey === structKey && stripEl.querySelector('.sidebar-workers-list')) {
+        stripEl.style.display = '';
+        try { updateSidebarWorkerMetrics(); } catch (_) {}
+        return;
+    }
     var chips = mine.map(_workerCardHtml).join('');
     stripEl.innerHTML = '<div class="sidebar-workers-header">' + escapeHtml(t('Workers ({count})', { count: mine.length })) + '</div>' +
         '<div class="sidebar-workers-list">' + chips + '</div>';
+    stripEl.__workersKey = structKey;
     stripEl.style.display = '';
 }
 
