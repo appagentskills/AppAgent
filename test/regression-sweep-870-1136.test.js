@@ -26,7 +26,7 @@ function scope(overrides, calls) {
     });
 }
 function run(code, ret, env) { return new Function('env', 'with (env) {\n' + code + '\nreturn ' + ret + ';\n}')(env); }
-function tick() { return new Promise(function(r) { setTimeout(r, 0); }); }
+function tick() { return freshTimeout(0); }
 
 describe('sweep M1: Continue after cold-chat hydration (ui/170 selectChat)', function() {
     test('a message-evicted skeleton re-runs syncChatControlsUI once its messages are back', async function() {

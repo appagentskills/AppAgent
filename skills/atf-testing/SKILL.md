@@ -302,12 +302,12 @@ gs.setProperty('sn_atf.runner.enabled', 'true');
 It is a single instance-wide property — set it once per instance.
 
 ### 7. Dictionary `mandatory=true` is UI-only
-`GlideRecord.insert()` ignores it. To test mandatory enforcement, use a **Form Submission** step (`sys_atf_step_config` for "Submission") instead of an RSS step doing GlideRecord inserts. RSS-based tests for mandatory fields will give false negatives. Note: Form Submission steps require a connected browser test runner, so they fall outside this skill's pure-API scope (see "What this skill deliberately does NOT cover").
+`GlideRecord.insert()` ignores it. To test mandatory enforcement, use a **Form Submission** step (`sys_atf_step_config` for "Submission") instead of an RSS step doing GlideRecord inserts. RSS-based tests for mandatory fields will give false negatives. Note: Form Submission steps require a connected browser test runner, so they fall outside this skill's pure-API scope (see "What this skill deliberately does not cover").
 
 ### 8. Cross-step output references
 The syntax `${steps.<step_sys_id>.<output>}` does **not** work as a literal string in `sys_variable_value.value` for `record_id` references. The proper format involves an output binding stored differently and is hard to get right via API.
 
-**Recommendation:** Avoid cross-step output references. Use a single RSS step that does the insert AND the validation in one script. This keeps tests self-contained and easier to author.
+**Recommendation:** Avoid cross-step output references. Use a single RSS step that does the insert and the validation in one script. This keeps tests self-contained and easier to author.
 
 ### 9. Step `description` doesn't auto-update
 ATF business rules try to regenerate the step description on save (using a `description_generator` script per step config). For complex configurations this can throw `IllegalStateException: Table name cannot be null`. The errors are noisy but **non-fatal** — records still save. Ignore them or set `description` explicitly.
@@ -399,7 +399,7 @@ while (vv.next()) {
 }
 ```
 
-## What this skill deliberately does NOT cover
+## What this skill deliberately does not cover
 
 - **UI / Form Submission steps** — work fine but require a real browser test runner (`sys_atf_agent`) connected, which is outside pure-API scope. Use these only when testing UI policies, client scripts, or mandatory-field UI enforcement.
 - **Custom step configs** — possible to define new step types via `sys_atf_step_config`, but rarely worth it. Stick to RSS for custom logic.

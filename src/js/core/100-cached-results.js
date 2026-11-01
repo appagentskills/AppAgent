@@ -336,7 +336,7 @@ function processToolResultForCache(chatId, toolCallId, toolName, result) {
     // behavior itself is unchanged (same threshold, same outline, same tools);
     // sub-agent chats are skipped (workers cannot spawn workers by default).
     if (!chat.isSubAgent) {
-        truncated._cached.orchestrator_directive = 'ORCHESTRATION: this oversized result just consumed orchestrator context. Next time, delegate this kind of heavy read (bulk fetch, grep/file dump, log scan) to a sub-agent worker on a cheap tier and consume only its distilled report.';
+        truncated._cached.orchestrator_directive = 'Orchestration note: this oversized result just consumed orchestrator context. Next time, delegate this kind of heavy read (bulk fetch, grep/file dump, log scan) to a sub-agent worker on a cheap tier and consume only its distilled report.';
     }
 
     // Add stats summary
@@ -438,7 +438,7 @@ function processUserMessageForCache(chatId, content) {
     var preview = content.substring(0, 500);
     if (content.length > 500) preview += '\n... [truncated, ' + (content.length - 500) + ' more chars]';
 
-    var description = 'USER MESSAGE CACHED: The user pasted a long message (' + sizeKB + 'KB, ' + totalLines + ' lines, limit: ' + limitKB + 'KB). ';
+    var description = 'User message cached: the user pasted a long message (' + sizeKB + 'KB, ' + totalLines + ' lines, limit: ' + limitKB + 'KB). ';
     description += 'The full text is cached with content_id "' + contentId + '". ';
     description += 'Use cached_content_read (with start_line/end_line), cached_content_search (regex), or cached_content_outline to inspect the full content.';
 

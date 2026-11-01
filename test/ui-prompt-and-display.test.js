@@ -12,7 +12,7 @@ var CSS = ['src/css/00-tokens.css', 'src/css/05-tools.css', 'src/css/10-approval
 // typeof-probed optional globals left unstubbed on purpose (fallback paths).
 var PROMPT_ALLOW = ['formatContent', 'ensureChatPayloads'];
 var HOSTILE = '<img src=x onerror="window.__pwn=1"><script>window.__pwn=2</script>';
-function wait(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
+function wait(ms) { return freshTimeout(ms); }
 // Every awaited PRODUCT promise goes through guard(): a promise that never
 // settles becomes an assertion failure (well under the harness per-test
 // timeout, which would otherwise abort the whole run and destroy the sandbox).

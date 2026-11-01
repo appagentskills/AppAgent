@@ -14,7 +14,7 @@ function _cutFns(src, names) {
         return src.slice(m.index, end + 2);
     }).join('\n');
 }
-function _tick() { return new Promise(function(r) { setTimeout(r, 0); }); }
+function _tick() { return freshTimeout(0); }
 async function _flush() { for (var i = 0; i < 5; i++) await _tick(); }
 
 var NOOP_CONSOLE = { warn: function() {}, error: function() {}, log: function() {} };

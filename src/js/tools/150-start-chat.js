@@ -261,6 +261,12 @@ async function executeStartChat(args, options) {
     if (typeof autoResizeTextarea === 'function') { try { autoResizeTextarea(input); } catch (e) {} }
 
     if (mode === 'draft') {
+        // Persist the draft like a typed one (programmatic .value fires no
+        // input event), so a reload / chat switch does not lose it.
+        if (chatId && typeof chatPendingTexts !== 'undefined' && chatPendingTexts) {
+            chatPendingTexts[chatId] = finalMessage;
+            if (typeof persistPendingTextsToStorage === 'function') { try { persistPendingTextsToStorage(); } catch (e) {} }
+        }
         input.focus();
         input.setSelectionRange(input.value.length, input.value.length);
         return {

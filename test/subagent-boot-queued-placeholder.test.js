@@ -5,7 +5,7 @@
 // globals stub only IDB/chrome/timers/runtime plumbing.
 var T = { tags: ['unit'], timeout: 5000 };
 var quiet = { log: function() {}, warn: function() {}, error: function() {}, info: function() {} };
-function tick(ms) { return new Promise(function(r) { setTimeout(r, ms || 5); }); }
+function tick(ms) { return freshTimeout(ms || 5); }
 
 function fakeDb(list) {
     var st = { puts: [] };

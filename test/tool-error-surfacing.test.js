@@ -342,7 +342,8 @@ describe('run_tests error surfacing (160): coded sandbox errors and the no-tests
 
     test('K. once any test ran the guard stays out (plain failure, no error_code)', async function() {
         var entry = await runTestsEntry(async function() { return envelope([fr(TA, 'pass', 1, 0, 0), fr(TB, 'empty', 0, 0, 0)]); });
-        var r = await entry.run({ files: [TA, TB] }, 0, {});
+        // shards:1 — this fake returns both files from a single eval call.
+        var r = await entry.run({ files: [TA, TB], shards: 1 }, 0, {});
         assert.strictEqual(r.success, false);
         assert.strictEqual(r.error_code, undefined);
         assert.strictEqual(r.tests_ran, undefined);

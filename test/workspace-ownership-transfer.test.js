@@ -163,7 +163,7 @@ describe('merged-mid-task wsPush result wiring (tools/020-tool-execution.js)', f
         var body = src.slice(i);
         assert.ok(/_previousPrMerged = !!listRes\.body\[0\]\.merged_at;/.test(body), 'flag derived from the newest PR for the head');
         assert.ok(/previous_pr_number: _previousPrNumber \|\| undefined,\s*previous_pr_merged: _previousPrNumber \? _previousPrMerged : undefined,/.test(body), 'result carries previous_pr_merged only when a previous PR exists');
-        assert.ok(/this PR contains ONLY the files pushed now/.test(body), 'stale-branch message explains the clean diff');
+        assert.ok(/this PR contains only the files pushed now/.test(body), 'stale-branch message explains the clean diff');
         assert.ok(/title: args\.pr_title,/.test(body), 'new PR payload uses the explicit pr_title, not a commit-message fallback');
         assert.ok(!/_wsDefaultPrTitle\(args\.commit_message\)/.test(body), 'removed auto-title fallback must not bypass explicit reset intent');
     });

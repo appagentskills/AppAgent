@@ -58,7 +58,7 @@ describe('split view', function() {
         var f = await fixture();
         await f.m.executeSplitView({ action: 'open', widget_id: 'w1' }, { chatId: 'c1' });
         await f.m.closeSplitView();
-        assert.ok(/SPLIT VIEW: CLOSED/.test(f.m.buildSplitViewContext('c1')));
+        assert.ok(/Split view: closed/.test(f.m.buildSplitViewContext('c1')));
         var st = await f.m.executeSplitView({ action: 'status' }, { chatId: 'c1' });
         assert.strictEqual(st.split_view.shown, false);
         assert.strictEqual(st.split_view.closed_by_user, true);
@@ -72,7 +72,7 @@ describe('split view', function() {
         assert.strictEqual(r.success, true);
         assert.strictEqual(f.stored.appagent_split_views.c1.widgetId, 'w1', 'keyed by the root chat id');
         assert.ok(!f.stored.appagent_split_views.sub1, 'no per-sub entry');
-        assert.ok(/SPLIT VIEW \u2014 INTERACTIVE WIDGET EDITING/.test(f.m.buildSplitViewContext('c1')), 'parent sees it');
+        assert.ok(/Split view \u2014 interactive widget editing/.test(f.m.buildSplitViewContext('c1')), 'parent sees it');
         assert.ok(/widget_id: w1/.test(f.m.buildSplitViewContext('sub2')), 'sibling sub sees it');
         assert.strictEqual(f.m.buildSplitViewContext('c2'), '', 'unrelated chat has its own (empty) state');
         var st = await f.m.executeSplitView({ action: 'status' }, { chatId: 'c1' });
@@ -80,7 +80,7 @@ describe('split view', function() {
         assert.strictEqual(st.split_view.root_chat_id, 'c1');
         f.g.currentChatId = 'sub2';
         await f.m.closeSplitView();
-        assert.ok(/SPLIT VIEW: CLOSED/.test(f.m.buildSplitViewContext('c1')), 'user close from a sub closes the family pane');
+        assert.ok(/Split view: closed/.test(f.m.buildSplitViewContext('c1')), 'user close from a sub closes the family pane');
     }, { tags: ['unit'] });
     test('user Split view button writes the same state the tool writes and toggles closed', async function() {
         var f = await fixture();

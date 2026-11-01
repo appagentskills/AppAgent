@@ -149,6 +149,28 @@ function _hHooks(suite, key) {
     return key === 'after' ? out.reverse() : out;
 }
 
+// Timer-throttling guard. Every await on a real setTimeout resumes INSIDE that
+// timer task, so the next setTimeout is "nested" (HTML timer nesting level).
+// In the hidden test sandbox Chrome's intensive throttling aligns timers with
+// nesting level >= 5 to ~1/minute, so a chain of awaited timers (within a
+// test, or carried across tests through this runner's own awaits) stalls until
+// the host's 30s per-test abort kills the whole run. A MessageChannel task is
+// not a timer and restarts at nesting level 0.
+function _hFreshTask() {
+    return new Promise(function(r) {
+        if (typeof MessageChannel !== 'function') { r(); return; }
+        var ch = new MessageChannel();
+        ch.port1.onmessage = function() { ch.port1.close(); r(); };
+        ch.port2.postMessage(0);
+    });
+}
+// Real setTimeout(ms) scheduled from a fresh (non-timer) task: same timer
+// ordering semantics as a plain setTimeout wait, but never part of a nested
+// chain. Tests use it for every "wait a tick / wait N ms" helper.
+function freshTimeout(ms) {
+    return _hFreshTask().then(function() { return new Promise(function(r) { setTimeout(r, ms || 0); }); });
+}
+
 function _hWithTimeout(promise, ms, label) {
     var timer;
     return Promise.race([
@@ -192,6 +214,7 @@ async function run(opts) {
             if (t.skip || !tagged) { rec.status = 'skip'; rec.reason = t.skip ? 'test.skip' : 'tag filter'; results.push(rec); continue; }
             if (opts.read_only_host && (t.tags.indexOf('contract') >= 0 || t.tags.indexOf('runtime') >= 0)) { rec.status = 'skip'; rec.reason = 'unsupported: live contract/runtime tools disabled by host read-only policy'; results.push(rec); continue; }
             if (!devMode && t.tags.indexOf('runtime') >= 0) { rec.status = 'skip'; rec.reason = 'runtime: dev mode not active'; results.push(rec); continue; }
+            await _hFreshTask();   // each test (and its timeout timer) starts at timer nesting level 0
             var t0 = Date.now();
             let ctx = { name: fullName, assertions: 0, denied: [], token: { settled: false } };
             _hState.current = ctx;
@@ -208,7 +231,7 @@ async function run(opts) {
             } catch (e) {
                 if (e && e.code === 'HARNESS_SKIP') { rec.status = 'skip'; rec.reason = e.message; }
                 else { rec.status = 'fail'; rec.error = _hErr(e); }
-                if (e && e.code === 'HARNESS_TIMEOUT') { _hState.aborted = true; if (opts.onTimeout) opts.onTimeout(); }
+                if (e && e.code === 'HARNESS_TIMEOUT') { _hState.aborted = true; if (opts.onTimeout) opts.onTimeout({ test: fullName, file: _hState.file }); }
             }
             ctx.token.settled = true;
             // Cleanup has its own bounded budget, but NEVER follows a timeout.
@@ -217,7 +240,7 @@ async function run(opts) {
             } catch (e2) {
                 if (rec.status === 'pass') { rec.status = 'fail'; rec.error = _hErr(e2); }
                 else rec.after_error = _hErr(e2).message;
-                if (e2 && e2.code === 'HARNESS_TIMEOUT') { _hState.aborted = true; if (opts.onTimeout) opts.onTimeout(); }
+                if (e2 && e2.code === 'HARNESS_TIMEOUT') { _hState.aborted = true; if (opts.onTimeout) opts.onTimeout({ test: fullName + ' (afterEach)', file: _hState.file }); }
             }
             if (ctx.denied.length) {
                 rec.denied_calls = ctx.denied.slice();
@@ -552,7 +575,7 @@ function install(target) {
     target.describe = describe; target.test = test; target.it = test;
     target.beforeEach = beforeEach; target.afterEach = afterEach;
     target.assert = assert; target.scratchPath = scratchPath; target.skipTest = skip;
-    target.fakeChrome = fakeChrome; target.fakeWindow = fakeWindow;
+    target.fakeChrome = fakeChrome; target.fakeWindow = fakeWindow; target.freshTimeout = freshTimeout;
     target.registerRunner = registerRunner; target.loadSources = loadSources;
     return target;
 }
@@ -563,7 +586,7 @@ module.exports = {
     assert: assert, AssertionError: AssertionError, describe: describe, test: test, beforeEach: beforeEach, afterEach: afterEach,
     reset: reset, run: run, skip: skip, install: install,
     scratchPath: scratchPath, isScratchPath: isScratchPath, snapshotDirty: snapshotDirty, snapshotDirtyState: snapshotDirtyState, fingerprint: fingerprint, checkIsolation: checkIsolation,
-    cleanupScratch: cleanupScratch, heartbeat: heartbeat, fakeChrome: fakeChrome, fakeWindow: fakeWindow,
+    cleanupScratch: cleanupScratch, heartbeat: heartbeat, fakeChrome: fakeChrome, fakeWindow: fakeWindow, freshTimeout: freshTimeout,
     toolDecision: toolDecision, installToolGuard: installToolGuard,
     registerRunner: registerRunner, loadSources: loadSources,
     I18N_CORE: HARNESS_I18N_CORE, _wantsI18n: _hWantsI18n,

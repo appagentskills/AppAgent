@@ -112,7 +112,7 @@ describe('SW body eviction + deferred boot cleanup', function() {
         assert.strictEqual(m.scheduleDeferredBootCleanup('t', function() { runs += 100; }, 0), false, 'second schedule is a no-op');
         assert.strictEqual(runs, 0, 'not run synchronously');
         assert.strictEqual(m.scheduleDeferredBootCleanup('bad', function() { return Promise.reject(new Error('x')); }, 0), true);
-        for (var i = 0; i < 100 && runs === 0; i++) await new Promise(function(r) { setTimeout(r, 50); });
+        for (var i = 0; i < 100 && runs === 0; i++) await freshTimeout(50);
         assert.strictEqual(runs, 1, 'ran exactly once');
     }, U);
 });

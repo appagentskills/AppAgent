@@ -352,6 +352,27 @@ describe('reload sequence (real 270-iframe-panel.js)', function() {
         var malformed = h.api.suiteRows({ success: false, error: 'boom' }, h.api.files.slice());
         assert.ok(malformed.length === 5 && malformed.every(function(r) { return r.state === 'error' && r.detail.indexOf('Malformed or incomplete test result') === 0; }));
     }, T);
+    // Sharded run_tests: a per-test timeout aborts only its shard, so rows are judged
+    // on their own entry (aborted -> fail, not_run -> error) and the rest keep results.
+    test('a sharded per-test timeout fails only the aborted/not_run rows; other rows keep their own result', async function() {
+        var fx = await reloadKit(), h = fx.setup({});
+        var files = h.api.files.slice().concat(['test/z1.test.js', 'test/z2.test.js', 'test/z3.test.js']);
+        var list = files.map(function(f) { return { file: f, status: 'pass', passed: 1, failed: 0, skipped: 0, no_assertions: 0, failures: [] }; });
+        list[6] = { file: files[6], status: 'aborted', aborted: true, passed: 0, failed: 1, skipped: 0, no_assertions: 0, failures: [{ name: 's \u203a slow', message: 'Per-test timeout' }], error: 'Per-test timeout: s \u203a slow' };
+        list[7] = { file: files[7], status: 'not_run', passed: 0, failed: 0, skipped: 0, no_assertions: 0, failures: [], error: 'Not run: shard aborted' };
+        var result = { success: false, aborted: true, error: 'Per-test timeout in test/z2.test.js \u203a s \u203a slow (shard 2/4)', files: list,
+            summary: { files: 8, total: 7, passed: 6, failed: 1, skipped: 0, no_assertions: 0, aborted: 1, not_run: 1 },
+            isolation: { ok: true, host_verified: true, violations: [] }, denied_calls: [] };
+        var rows = h.api.suiteRows(result, files, h.api.files.length);
+        assert.strictEqual(rows[5].state, 'pass', 'completed full-suite file keeps its own result');
+        assert.strictEqual(rows[6].state, 'fail');
+        assert.match(rows[6].detail, /Per-test timeout/);
+        assert.strictEqual(rows[7].state, 'error');
+        assert.match(rows[7].detail, /Not run/);
+        var strictAborted = list.slice(); strictAborted[0] = { file: files[0], status: 'not_run', passed: 0, failed: 0, skipped: 0, no_assertions: 0, failures: [], error: 'Not run' };
+        var r2 = { success: false, aborted: true, error: 'x', files: strictAborted, summary: { files: 8, total: 6, passed: 5, failed: 1, skipped: 0, no_assertions: 0 }, isolation: result.isolation, denied_calls: [] };
+        assert.notStrictEqual(h.api.suiteRows(r2, files, h.api.files.length)[0].state, 'pass', 'a not_run strict suite never passes');
+    }, T);
     // m4: without deploy-folder permission Reload ASKS (never a silent timed restart on the old files).
     test('no deploy-folder permission asks Grant access / Restart anyway / Cancel; Cancel (or a superseded modal) never reloads', async function() {
         var fx = await reloadKit();
@@ -707,5 +728,101 @@ describe('reload sequence (real 270-iframe-panel.js)', function() {
         assert.strictEqual(ov.children[0].role, 'dialog');
         assert.strictEqual(ov.children[0]['aria-modal'], 'true', 'the dialog is aria-modal');
         ui.close();
+    }, T);
+});
+// Full suite: Reload blocks on ANY failing test/*.test.js, shows which, and still offers Force build.
+describe('reload full test suite gate (real 270-iframe-panel.js)', function() {
+    function addTests(h, paths) { paths.forEach(function(p) { h.files.push({ path: p, sha: p, dirty: false }); }); }
+    function rowText(r) { return [String(r.textContent || '')].concat((r.children || []).map(rowText)).join('\n'); }
+    function failing(files, file, name) {
+        var r = reloadFixture({}).good(files), f = r.files.find(function(x) { return x.file === file; });
+        f.status = 'fail'; f.failed = 1; f.failures = [{ name: name, message: 'expected 2\n    at stack' }];
+        r.summary.failed++; r.summary.total++; r.success = false; return r;
+    }
+    test('every other top-level test file runs after the tooling suites, in one call', async function() {
+        var fx = await reloadKit(), store = {}, h = fx.setup({ store: store });
+        addTests(h, ['test/zeta.test.js', 'test/alpha.test.js', 'test/nested/x.test.js', 'test/harness.js', 'test/reload-preflight.test.js']);
+        h.files.push({ path: 'test/gone.test.js', sha: 'g', deleted: true });
+        await settle(h.api.reload());
+        var runs = h.approvals.filter(function(c) { return c.name === 'run_tests'; });
+        assert.strictEqual(runs.length, 1);
+        assert.deepStrictEqual(runs[0].args.files, h.api.files.concat(['test/alpha.test.js', 'test/zeta.test.js']));
+        assert.strictEqual(runs[0].args.timeout_ms, 600000);
+        assert.deepStrictEqual(rowStates(h), ['pass', 'pass', 'pass', 'pass', 'pass', 'pass']);
+        assert.ok(rowText(h.rows[5]).indexOf('Full test suite') >= 0, 'labelled Full test suite row');
+        assert.strictEqual(count(h, 'extension_build'), 1);
+        assert.strictEqual(store[h.api.passKey].files, runs[0].args.files.join('\n'), 'the pass record covers the full suite');
+    }, T);
+    test('a failing test anywhere blocks the build, names file + test, and Force build proceeds', async function() {
+        var fx = await reloadKit(), h = fx.setup({ run: function(args) { return failing(args.files, 'test/alpha.test.js', 'adds numbers'); } });
+        addTests(h, ['test/alpha.test.js', 'test/beta.test.js']);
+        var p = h.api.reload();
+        await waitFor(function() { return forceShown(h) && !h.find('Force build').disabled; }, 'force offered');
+        assert.strictEqual(count(h, 'extension_build'), 0, 'blocked: no build before the user decides');
+        assert.deepStrictEqual(rowStates(h), ['pass', 'pass', 'pass', 'pass', 'pass', 'fail']);
+        var status = h.byClass('reload-preflight-status')[0].textContent;
+        assert.ok(status.indexOf('Failing test files: test/alpha.test.js') >= 0 && status.indexOf('beta') < 0, status);
+        var text = rowText(h.rows[5]);
+        assert.ok(text.indexOf('test/alpha.test.js › adds numbers — expected 2') >= 0, text);
+        assert.ok(text.indexOf('at stack') < 0, 'only the first message line in the list');
+        h.find('Force build').click();
+        await settle(p);
+        assert.strictEqual(count(h, 'extension_build'), 1, 'explicit Force build still builds');
+    }, T);
+    test('Cancel after a full-suite failure never builds', async function() {
+        var fx = await reloadKit(), h = fx.setup({ run: function(args) { return failing(args.files, 'test/alpha.test.js', 'x'); } });
+        addTests(h, ['test/alpha.test.js']);
+        var p = h.api.reload();
+        await waitFor(function() { return forceShown(h) && !h.find('Force build').disabled; }, 'force offered');
+        h.find('Cancel').click();
+        await settle(p);
+        assert.strictEqual(count(h, 'extension_build'), 0);
+        assert.strictEqual(count(h, 'reload'), 0);
+    }, T);
+    test('tag-filter skips in a full-suite file are not failures', async function() {
+        var fx = await reloadKit(), h = fx.setup({ run: function(args) {
+            var r = fx.good(args.files), f = r.files.find(function(x) { return x.file === 'test/c.contract.test.js'; });
+            f.passed = 0; f.skipped = 2; f.skips = [{ name: 'a', reason: 'tag filter' }, { name: 'b', reason: 'tag filter' }];
+            r.summary.passed -= 2; r.summary.skipped += 2; return r;
+        } });
+        addTests(h, ['test/c.contract.test.js']);
+        await settle(h.api.reload());
+        assert.deepStrictEqual(rowStates(h).slice(5), ['pass']);
+        assert.strictEqual(count(h, 'extension_build'), 1);
+    }, T);
+    test('a full-suite file missing from the envelope, or unverified isolation, fails closed', async function() {
+        var fx = await reloadKit(), mode = 'missing', h = fx.setup({ run: function(args) {
+            var r = fx.good(args.files);
+            if (mode === 'missing') { r.files.pop(); r.summary.files--; r.summary.passed -= 2; r.summary.total -= 2; }
+            else r.isolation.host_verified = false;
+            return r;
+        } });
+        addTests(h, ['test/alpha.test.js']);
+        var p = h.api.reload();
+        await waitFor(function() { return forceShown(h) && !h.find('Force build').disabled; }, 'force offered (missing)');
+        assert.strictEqual(rowStates(h)[5], 'error');
+        h.find('Cancel').click(); await settle(p);
+        mode = 'isolation';
+        var h2 = fx.setup({ run: function(args) { var r = fx.good(args.files); r.isolation.host_verified = false; return r; } });
+        addTests(h2, ['test/alpha.test.js']);
+        var p2 = h2.api.reload();
+        await waitFor(function() { return forceShown(h2) && !h2.find('Force build').disabled; }, 'force offered (isolation)');
+        assert.strictEqual(rowStates(h2)[5], 'error');
+        assert.strictEqual(count(h2, 'extension_build'), 0);
+        h2.find('Cancel').click(); await settle(p2);
+    }, T);
+    test('a suite larger than one batch splits into bounded run_tests calls covering every file once', async function() {
+        var fx = await reloadKit(), h = fx.setup(), extra = [];
+        for (var i = 0; i < 310; i++) extra.push('test/t' + String(i).padStart(3, '0') + '.test.js');
+        addTests(h, extra);
+        await settle(h.api.reload());
+        var runs = h.approvals.filter(function(c) { return c.name === 'run_tests'; });
+        assert.strictEqual(runs.length, 2);
+        assert.strictEqual(runs[0].args.files.length, 300);
+        assert.deepStrictEqual(runs[0].args.files.slice(0, 5), h.api.files.slice());
+        assert.deepStrictEqual(runs[0].args.files.concat(runs[1].args.files), h.api.files.concat(extra));
+        assert.ok(runs.every(function(r) { return r.args.timeout_ms === 600000; }));
+        assert.strictEqual(rowStates(h)[5], 'pass');
+        assert.strictEqual(count(h, 'extension_build'), 1);
     }, T);
 });

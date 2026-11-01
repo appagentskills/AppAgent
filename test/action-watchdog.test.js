@@ -55,7 +55,7 @@ describe('#6b action watchdog (tools/120-actions.js)', function() {
         var ids = Object.keys(m.activeActions);
         return ids.length ? m.activeActions[ids[0]] : null;
     }
-    async function settle() { for (var i = 0; i < 4; i++) { await new Promise(function(r) { setTimeout(r, 0); }); } }
+    async function settle() { for (var i = 0; i < 4; i++) { await freshTimeout(0); } }
 
     test('(3) startAction awaits saveChatsToStorage BEFORE runAgent', async function() {
         var m = await load(); var s = reset(m);

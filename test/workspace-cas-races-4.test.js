@@ -111,7 +111,7 @@ function b64(s) { return btoa(unescape(encodeURIComponent(s))); }
 async function blobSha(w, s) { var fn = w.m.computeGitBlobSha || w.m.__scope.computeGitBlobSha; return await fn(s); }
 async function edit(w, path, content, at) { var cur = await w.s.getWorkspaceFile(WK, path); await w.s.setWorkspaceFile(Object.assign({}, cur, { content: content, dirty: true, last_modified_at: at, last_modified_by_chat_id: 'c2' })); }
 
-function tick(ms) { return new Promise(function(r) { setTimeout(r, ms || 5); }); }
+function tick(ms) { return freshTimeout(ms || 5); }
 function gateFirstRead(w, gate) {
     var reads = 0, real = w.s.getWorkspaceFile;
     w.m.__scope.getWorkspaceFile = async function(repo, path) { var r = await real(repo, path); if (reads++ === 0) await gate.promise; return r; };

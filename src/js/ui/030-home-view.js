@@ -575,8 +575,11 @@ function renderHome() {
                 '<textarea id="home-message-input" rows="1" placeholder="' + escapeHtml(t('Send a message...')) + '" onkeydown="handleHomeKeyDown(event)" oninput="autoResizeTextarea(this)" aria-label="' + escapeHtml(t('Message input')) + '"></textarea>' +
                 '<button id="home-attach-btn" onclick="document.getElementById(\'home-image-file-input\').click()" title="' + escapeHtml(t('Attach file (image, PDF, CSV, text)')) + '" aria-label="' + escapeHtml(t('Attach file')) + '">' + UI_ICONS.attach + '</button>' +
                 '<input type="file" id="home-image-file-input" accept="image/*,.pdf,application/pdf,.csv,.txt,.md,.json,.xml,.log,.yml,.yaml,text/*" multiple="multiple" style="display:none;" onchange="handleImageFileSelect(event)" />' +
-                '<button id="home-send-btn" onclick="sendHomeMessage()" aria-label="' + escapeHtml(t('Send message')) + '">' + UI_ICONS.send + '</button>' +
+                // Born disabled (no flash of the primary colour): syncSendButton enables it.
+                '<button id="home-send-btn" disabled onclick="sendHomeMessage()" aria-label="' + escapeHtml(t('Send message')) + '">' + UI_ICONS.send + '</button>' +
             '</div>' +
+            // Draft-size hint (item 8), painted by composerSyncDraftSize (ui/246).
+            '<div class="composer-draft-hint" id="home-draft-hint" aria-live="polite" hidden></div>' +
             _homeRecentPromptsHtml(recentPrompts) +
             // Free-text example chips fallback (only when no `home` actions exist).
             (shuffledExamples.length
@@ -823,13 +826,9 @@ function fillHomeInput(text) {
     }
 }
 
-// Handle keydown in home input
+// Home composer keydown — shared logic lives in ui/246-composer.js.
 function handleHomeKeyDown(e) {
-    // Skip Enter while user is composing IME input (CJK languages send keyCode 229 / isComposing=true).
-    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
-        e.preventDefault();
-        sendHomeMessage();
-    }
+    composerHandleKeyDown(e, 'home');
 }
 
 // Send message from home input
@@ -843,8 +842,9 @@ function sendHomeMessage() {
     delete chatPendingTexts['home'];
     persistPendingTextsToStorage();
 
-    // Clear home input value so newChat()'s savePendingTextForContext doesn't re-save it
-    input.value = '';
+    // Clear home input value so newChat()'s savePendingTextForContext doesn't re-save it.
+    // Resets the grown height too, so the next Home visit starts at one line.
+    composerResetInput(input);
 
     // Preserve pending images before newChat() clears them
     var homePendingImages = pendingImageAttachments.slice();

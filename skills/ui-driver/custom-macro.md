@@ -13,7 +13,7 @@ These embed an **arbitrary** widget / UI macro / UI page. The markup is bespoke 
 3. Drive each with the matching recipe from `select2.md` / `native-inputs.md`.
 4. If the control lives in a dialog/overlay, see **`modals.md`**.
 
-## Custom widgets may define their OWN input-type taxonomy
+## Custom widgets may define their own input-type taxonomy
 
 A custom widget can use input types that don't map 1:1 to catalog variable types. Profile the directive's `ng-switch` to learn the type, then drive with the nearest existing recipe. Verified live on a custom SP widget that defined its own `<widget>-input` taxonomy:
 

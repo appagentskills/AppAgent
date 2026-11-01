@@ -13,7 +13,10 @@ async function bfLoad() {
     return { src: src, mod: mod };
 }
 
-function bfDelay(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
+// freshTimeout (harness): a real timer that is never part of a nested chain
+// (each of the 4 workers awaits ~16 delays in a row, which Chrome throttles
+// to ~1/min in the hidden sandbox when chained with plain setTimeout).
+function bfDelay(ms) { return freshTimeout(ms); }
 
 describe('build.js bounded fan-out', function() {
     test('_mapLimit caps in-flight calls and preserves order', async function() {

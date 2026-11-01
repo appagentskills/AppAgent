@@ -81,7 +81,7 @@ Numeric Scale is a horizontal radio group `1..N` (anchor by `aria-label`/`value`
   - empty asterisk:  `class="fa fa-asterisk mandatory sp-field-label-padding ng-scope"`
   - filled asterisk: the same **plus** a real trailing ` mandatory-filled`, and `aria-label` flips `Required ` → `Required Filled `
   - safest check — the aria-label flip: `/aria-label="Required Filled/.test(html)`; or capture the real `class` attribute and test *that* string (not the raw markup) for the word `mandatory-filled`.
-  - ⚠️ the aria-label value has a **TRAILING SPACE** (`"Required Filled "`) — verified live. The unanchored regex above is safe; a regex that closes the quote (`/Required Filled"/`) **misses**.
+  - ⚠️ the aria-label value has a **trailing space** (`"Required Filled "`) — verified live. The unanchored regex above is safe; a regex that closes the quote (`/Required Filled"/`) **misses**.
 
 ---
 

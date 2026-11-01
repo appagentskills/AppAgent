@@ -28,10 +28,11 @@ async function runReviewedUiAudit(sources) {
         'savePendingTextForContext', 'restorePendingTextForContext', 'persistPendingTextsToStorage',
         'persistPendingImagesToSession', 'getEditedTurnAttachments', 'editMessage',
         'setPendingImagesOwner', 'getPendingImagesOwnerContext',
-        '_attachmentChars', 'isFileDrag', 'resetDropOverlay', '_armDropHeartbeat',
+        '_attachmentChars', '_dataUrlDecodedBytes', '_isFittableImage', 'isFileDrag', 'resetDropOverlay', '_armDropHeartbeat',
         'handleDragOver', 'handleDragEnter', 'handleDragLeave', 'handleDrop'];
     var code = i18nCore + '\n' + names.map(function(n) { return declaration(attachments, n); }).join('\n') + '\n' +
         declaration(navigation, 'selectChat') + '\n' + declaration(sources['src/js/ui/030-home-view.js'], 'sendHomeMessage') + '\n' +
+        declaration(sources['src/js/ui/246-composer.js'], 'composerResetInput') + '\n' +
         declaration(sources['src/js/ui/050-history-view.js'], 'openChatFromHistory');
     function fixture(view) {
         var readers = [], images = [], compression = [], renders = [], writes = [], errors = [], elements = {}, api;
@@ -48,13 +49,15 @@ async function runReviewedUiAudit(sources) {
             isRunning: false, activeStreamingChatId: null, lastApiError: null,
             pendingInjection: null, pendingInjectionImages: null,
             dragDepth: 0, _dropHb: null, DROP_OVERLAY_HEARTBEAT_MS: 1000, MAX_PENDING_ATTACHMENT_CHARS: 30 * 1024 * 1024,
+            MAX_IMAGE_RAW_BYTES: 50 * 1024 * 1024, MAX_IMAGE_ATTACHMENT_BYTES: 4718592,
+            SCREENSHOT_MAX_LONG_EDGE: 3000, _imgW: 1400, _imgH: 700,
             window: { innerWidth: 1024, currentSearchHighlight: null },
             appStorage: { setItem: function() {} },
             document: { getElementById: element, body: element('body'), createElement: function() {
                 return { getContext: function() { return { drawImage: function() {} }; }, toDataURL: function() { return 'data:image/png;base64,raw'; } };
             } },
             FileReader: function() { readers.push(this); this.readAsDataURL = this.readAsText = function() {}; },
-            Image: function() { images.push(this); this.width = 1400; this.height = 700; },
+            Image: function() { images.push(this); this.width = env._imgW; this.height = env._imgH; },
             compressBase64Image: function() { return new Promise(function(resolve, reject) { compression.push({ resolve: resolve, reject: reject }); }); },
             newFileId: function() { return 'file_' + (readers.length + images.length); },
             setSetting: function(k, v) { writes.push({ key: k, value: JSON.parse(JSON.stringify(v)) }); },
@@ -102,7 +105,7 @@ async function runReviewedUiAudit(sources) {
         var f = fixture(); f.api.processImageFile(file('image/png', 'photo.png')); finish(f.readers[0], 'image'); f.images[0].onload();
         f.switchTo('B'); var before = f.renders.length; f.compression[0].resolve('compressed'); await Promise.resolve();
         var image = f.env.chatPendingImages.A[0];
-        check(image.base64 === 'compressed' && image.width === 1200 && image.height === 600 && image.file_id, 'image payload or metadata lost');
+        check(image.base64 === 'compressed' && image.width === 1400 && image.height === 700 && image.file_id, 'image payload or metadata lost');
         check(f.renders.length === before && !f.env.pendingImageAttachments.length, 'wrong composer rendered');
     });
     await test('send before upload completion creates next origin draft without resurrecting sent attachments', function() {
@@ -132,6 +135,42 @@ async function runReviewedUiAudit(sources) {
         f.api.processImageFile(file('text/plain', 'bad.txt')); f.readers[0].onerror();
         f.api.processImageFile(file('image/png', 'bad.png')); finish(f.readers[1], 'image'); f.images[0].onload(); f.compression[0].reject(new Error('bad')); await Promise.resolve(); await Promise.resolve();
         check(!f.env.pendingImageAttachments.length && f.errors.length === 4, 'failure path attached payload or hid error');
+    });
+    await test('image size is checked after resize + compression, not on the raw file', async function() {
+        // A 15MB raw photo (over the old 10MB raw cap) is accepted once compressed small.
+        var f = fixture(); f.api.processImageFile({ type: 'image/jpeg', name: 'phone.jpg', size: 15 * 1024 * 1024 });
+        check(f.readers.length === 1 && !f.errors.length, '15MB raw image rejected before resize/compression');
+        finish(f.readers[0], 'image'); f.images[0].onload();
+        f.compression[0].resolve('data:image/jpeg;base64,' + 'A'.repeat(400000)); await Promise.resolve();
+        check(f.env.pendingImageAttachments.length === 1 && f.env.pendingImageAttachments[0].name === 'phone' && !f.errors.length, 'compressed image not attached');
+        // Over the 50MB raw sanity cap: rejected up front with the real limits.
+        var g = fixture(); g.api.processImageFile({ type: 'image/png', name: 'huge.png', size: 60 * 1024 * 1024 });
+        check(!g.readers.length && g.errors.length === 1 && /50MB/.test(g.errors[0]) && /4\.5MB/.test(g.errors[0]), 'raw sanity cap missing or message wrong: ' + g.errors[0]);
+        // Still over 4.5MB after compression: clear error, nothing attached.
+        var h = fixture(); h.api.processImageFile(file('image/png', 'noise.png')); finish(h.readers[0], 'image'); h.images[0].onload();
+        h.compression[0].resolve('data:image/jpeg;base64,' + 'A'.repeat(6600000)); await Promise.resolve();
+        check(!h.env.pendingImageAttachments.length && h.errors.length === 1 && /4\.5MB after compression/.test(h.errors[0]) && /noise\.png/.test(h.errors[0]), 'oversized compressed image attached or message wrong: ' + h.errors[0]);
+        // Decoded-size helper: padding-aware.
+        check(f.api._dataUrlDecodedBytes('data:x;base64,QUJD') === 3 && f.api._dataUrlDecodedBytes('QQ==') === 1 && f.api._dataUrlDecodedBytes(null) === 0, 'decoded size wrong');
+    });
+    await test('images downscale to the shared 3000px long edge (not 1200) and never upscale', async function() {
+        var src = declaration(attachments, 'processImageFile');
+        check(/maxDim\s*=\s*SCREENSHOT_MAX_LONG_EDGE\b/.test(src) && !/\b1200\b/.test(src), 'processImageFile does not use SCREENSHOT_MAX_LONG_EDGE or still caps at 1200');
+        check(/var SCREENSHOT_MAX_LONG_EDGE = 3000;/.test(sources['src/js/tools/020-tool-execution.js']), 'shared SCREENSHOT_MAX_LONG_EDGE is not 3000');
+        function run(w, h) {
+            var f = fixture(); f.env._imgW = w; f.env._imgH = h;
+            f.api.processImageFile(file('image/png', 'p.png')); finish(f.readers[0], 'image'); f.images[0].onload();
+            f.compression[0].resolve('data:image/jpeg;base64,QUJD');
+            return Promise.resolve().then(function() { return f.env.pendingImageAttachments[0]; });
+        }
+        var landscape = await run(6000, 3000);
+        check(landscape.width === 3000 && landscape.height === 1500, 'landscape not capped at 3000: ' + landscape.width + 'x' + landscape.height);
+        var portrait = await run(2000, 4500);
+        check(portrait.width === 1333 && portrait.height === 3000, 'portrait not capped at 3000: ' + portrait.width + 'x' + portrait.height);
+        var mid = await run(2500, 1600);
+        check(mid.width === 2500 && mid.height === 1600, 'image under 3000 was resized (old 1200 cap?): ' + mid.width + 'x' + mid.height);
+        var small = await run(300, 200);
+        check(small.width === 300 && small.height === 200, 'small image upscaled: ' + small.width + 'x' + small.height);
     });
     await test('saving an empty active draft clears a stale map entry', function() {
         var f = fixture(); f.env.chatPendingImages.A = [{ name: 'stale' }]; f.api.savePendingImagesForContext('A'); check(!f.env.chatPendingImages.A, 'stale draft retained');
@@ -412,5 +451,5 @@ async function runReviewedUiAudit(sources) {
     return results;
 }
 // ─── harness registration (js_eval sandbox; see test/harness.js) ─────────────
-var PATHS = ["src/js/core/025-i18n.js","src/js/app/050-image-attachments.js","src/js/app/040-send-message.js","src/js/ui/170-chat-management.js","src/js/ui/030-home-view.js","src/js/ui/050-history-view.js","src/js/ui/160-notifications.js","src/js/ui/250-message-render.js","src/js/core/055-emoji-shortcodes.js","src/platform/extension/platform-bridge.js","src/html/body.html","src/css/04-header.css","src/js/ui/040-tools-settings.js","src/js/ui/060-docs-view.js","src/js/ui/180-search.js"];
+var PATHS = ["src/js/core/025-i18n.js","src/js/app/050-image-attachments.js","src/js/app/040-send-message.js","src/js/ui/170-chat-management.js","src/js/ui/030-home-view.js","src/js/ui/246-composer.js","src/js/ui/050-history-view.js","src/js/ui/160-notifications.js","src/js/ui/250-message-render.js","src/js/core/055-emoji-shortcodes.js","src/platform/extension/platform-bridge.js","src/html/body.html","src/css/04-header.css","src/js/ui/040-tools-settings.js","src/js/ui/060-docs-view.js","src/js/ui/180-search.js","src/js/tools/020-tool-execution.js"];
 await registerRunner('reviewed-ui-regressions', async function() { return runReviewedUiAudit(await loadSources(PATHS)); });

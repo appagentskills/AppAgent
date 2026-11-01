@@ -13,7 +13,7 @@ Audit the most recently merged PRs of the connected repo for regressions, using 
 
 Core principles:
 
-- **Evidence only.** A finding must be backed by `grep`/`read` proof in the current main — never by the patch text alone. Judge code as it exists NOW (later PRs may already have fixed it).
+- **Evidence only.** A finding must be backed by `grep`/`read` proof in the current main — never by the patch text alone. Judge code as it exists now (later PRs may already have fixed it).
 - **Orchestrate, don't do.** Sub-agents do the heavy lifting — scoping/discovery, patch reading, and the fix implementation. The parent only scopes, triages, verifies, and pushes. Patch dumps and greps stay out of the parent context.
 - **The sweep PR is itself swept next time.** Sweep PRs are not exempt from review.
 
@@ -30,13 +30,13 @@ Core principles:
    - The last sweep PR is recognizable by its branch (`*regression-sweep*`) or title ("Regression sweep over PRs #A-#B"). Scope = all **merged** PRs created after the last sweep's coverage, **including the last sweep PR itself if it was never reviewed**.
    - If nothing is unreviewed, finish early: `state: 'done'`, `output: '✅ No unreviewed merged PRs.'`, `auto_dismiss_ms: 4000`.
 
-3. **Sync to latest**: `workspace` `status` on the existing main workspace — it auto-syncs with the remote so reviewers judge latest code. ⚠️ Do **NOT** `workspace clone`: clone deletes the workspace files **and** its meta (including the `meta.prs` history step 2 relies on) and wipes other chats' uncommitted edits.
+3. **Sync to latest**: `workspace` `status` on the existing main workspace — it auto-syncs with the remote so reviewers judge latest code. ⚠️ Don't `workspace clone`: clone deletes the workspace files **and** its meta (including the `meta.prs` history step 2 relies on) and wipes other chats' uncommitted edits.
 
 4. **Spawn reviewers** (`spawn_sub_agent` with explicit `tier: "medium"`; pool limits are per connection group — 2 concurrent for Anthropic-OAuth subs, 4 per other endpoint, 6 overall; excess spawns queue, so serialize fan-outs beyond your group's cap):
    - One sub-agent per PR (batch several small PRs into one agent if > 4 PRs in scope).
    - Instructions per agent: fetch `GET /pulls/{n}/files` + PR body; inspect the **current** state of every touched function via workspace read/grep; hunt for undefined symbols, broken references (CSS classes/IDs never defined, renamed functions with stale callers), listener leaks, inverted conditions, missed call sites, races, null derefs; do a déroulement of the changed feature; **no edits**; report via `report_to_parent`.
    - Pass an `output_schema` like: `{pr, findings: [{id, severity (critical|major|minor), file, symbol, problem, evidence, suggested_fix}], verified_ok: []}`.
-   - Keep the DEFAULT `wake_parent: true` and END your turn — the first reviewer to finish wakes you, and you triage each report AS IT ARRIVES (event-driven) instead of blocking on `await_all`. As each report lands, update the progress card with the running findings-so-far count — don't wait for all reviewers before the first user-visible status. Escalate an individual reviewer only if its findings warrant it (`wake_sub_agent({ tier: "large" })`); don't raise the whole fan-out. Do NOT use `wake_parent: false` here.
+   - Keep the default `wake_parent: true` and end your turn — the first reviewer to finish wakes you, and you triage each report as it arrives (event-driven) instead of blocking on `await_all`. As each report lands, update the progress card with the running findings-so-far count — don't wait for all reviewers before the first user-visible status. Escalate an individual reviewer only if its findings warrant it (`wake_sub_agent({ tier: "large" })`); don't raise the whole fan-out. Don't use `wake_parent: false` here.
 
 5. **Triage & fix**:
    - Deduplicate findings; re-verify each critical/major finding yourself with one targeted `workspace` `read` before editing.

@@ -1,6 +1,6 @@
 ---
 name: github-api
-description: Call the GitHub REST API from this extension. web_fetch now auto-attaches the stored GitHub token (the same credential the workspace tool uses for clone/push) on any request targeting the CONFIGURED GitHub instance's REST base (api.github.com for github.com, or <instance>/api/v3 for GitHub Enterprise), so authenticated REST calls work against PRIVATE repos with no manual token handling. Quick-reference for repos, branches, files/contents, commits, pull requests, PR files/commits, PR comments (conversation + inline review), reviews/approvers, and merging PRs (mergeability checks, merge methods, update-branch, branch deletion, direct branch merges), plus a reusable js_eval helper, pagination, rate-limit and error notes.
+description: Call the GitHub REST API from this extension. web_fetch now auto-attaches the stored GitHub token (the same credential the workspace tool uses for clone/push) on any request targeting the configured GitHub instance's REST base (api.github.com for github.com, or <instance>/api/v3 for GitHub Enterprise), so authenticated REST calls work against private repos with no manual token handling. Quick-reference for repos, branches, files/contents, commits, pull requests, PR files/commits, PR comments (conversation + inline review), reviews/approvers, and merging PRs (mergeability checks, merge methods, update-branch, branch deletion, direct branch merges), plus a reusable js_eval helper, pagination, rate-limit and error notes.
 ---
 
 # GitHub REST API
@@ -306,4 +306,4 @@ tighter limit (~30/min). Batch and cache; avoid tight loops.
 - Token scope: the same PAT/OAuth used for git now powers REST reads/writes, so its scope
   applies to both. Write calls (POST/PUT/DELETE) act as the connected user — confirm intent.
 - `web_fetch` `method` enum is GET/POST/PUT/DELETE only — **no PATCH**. PATCH-only endpoints (edit PR/issue title/body, edit a comment) are therefore not reachable via `web_fetch`; to refresh a PR's title/body use `workspace push` with `pr_title`/`pr_body` on the same `branch_name`.
-- GraphQL on GitHub Enterprise lives at `<instance>/api/graphql` — **outside** the `/api/v3` REST base, so the token is NOT auto-attached; pass `Authorization: Bearer <token>` yourself (on github.com `api.github.com/graphql` is on the REST host and does auto-attach).
+- GraphQL on GitHub Enterprise lives at `<instance>/api/graphql` — **outside** the `/api/v3` REST base, so the token is not auto-attached; pass `Authorization: Bearer <token>` yourself (on github.com `api.github.com/graphql` is on the REST host and does auto-attach).

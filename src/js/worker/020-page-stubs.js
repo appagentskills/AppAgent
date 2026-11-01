@@ -643,7 +643,7 @@ function executeAfterResponseHooks(chatId, anchorUserIdx) {
     // caveat ride along on a standalone progress-finalize run too (the run is
     // already happening — the caveat still never forces one itself).
     if (caveatEligible && (tasks.length > 0 || progressWillPush) && (chat._caveatHookTries || 0) < 2) {
-        tasks.push('OPTIONALLY call the set_caveat tool — set_caveat({caveat: "..."}) with a short warning (1-2 sentences) — ONLY IF your answer contains something the user must not miss — you deviated from the plan or instructions, made an assumption that needs double-checking, left the work partially incomplete, or ended with a question or requested action the user might overlook; do NOT flag routine always-visible follow-ups — e.g. "extension needs to be reloaded" or "PR not merged yet" — those are already shown to the user; only flag things the user would otherwise miss; if there is nothing like that, do NOT call set_caveat');
+        tasks.push('optionally call the set_caveat tool — set_caveat({caveat: "..."}) with a short warning (1-2 sentences) — only if your answer contains something the user must not miss — you deviated from the plan or instructions, made an assumption that needs double-checking, left the work partially incomplete, or ended with a question or requested action the user might overlook; don\'t flag routine always-visible follow-ups — e.g. "extension needs to be reloaded" or "PR not merged yet" — those are already shown to the user; only flag things the user would otherwise miss; if there is nothing like that, don\'t call set_caveat');
         caveatTarget._caveatAsked = true;
         chat._caveatHookTries = (chat._caveatHookTries || 0) + 1;
         caveatPushed = true;
@@ -655,7 +655,7 @@ function executeAfterResponseHooks(chatId, anchorUserIdx) {
     var progressPushed = false;
     var progressTaskNum = 0;
     if (progressWillPush) {
-        tasks.push('finalize the chat progress card by calling the update_action_state tool with the appropriate TERMINAL state — `pr_opened` if a PR was opened/pushed during this task, `finished_with_caveat` if you are also flagging a caveat with set_caveat, `error` if the task failed, otherwise `finished` — passing the full tasks array (all marked done) and a short markdown `output` summary' + (_hkWakeRun ? ' of everything since the user\'s last message' : '') + '; SKIP this call entirely if no substantive work was done (pure conversational answer)');
+        tasks.push('finalize the chat progress card by calling the update_action_state tool with the appropriate terminal state — `pr_opened` if a PR was opened/pushed during this task, `finished_with_caveat` if you are also flagging a caveat with set_caveat, `error` if the task failed, otherwise `finished` — passing the full tasks array (all marked done) and a short markdown `output` summary' + (_hkWakeRun ? ' of everything since the user\'s last message' : '') + '; skip this call entirely if no substantive work was done (pure conversational answer)');
         progressTarget._progressAsked = true;
         chat._progressHookTries = (chat._progressHookTries || 0) + 1;
         progressPushed = true;
@@ -663,19 +663,19 @@ function executeAfterResponseHooks(chatId, anchorUserIdx) {
     }
     var instruction;
     if (tasks.length === 1) {
-        instruction = 'Now ' + tasks[0] + '. Do NOT say anything else.';
+        instruction = 'Now ' + tasks[0] + '. Don\'t say anything else.';
     } else {
         var numbered = tasks.map(function(t, i) { return (i + 1) + ') ' + t; }).join('; ');
-        instruction = 'Now do the following, calling ALL the tools in THIS SINGLE response (parallel tool calls), and say nothing else: ' + numbered + '.';
+        instruction = 'Now do the following, calling all the tools in this single response (parallel tool calls), and say nothing else: ' + numbered + '.';
         if (caveatPushed) {
             // The caveat item is OPTIONAL — the model must skip it when there is
-            // nothing to flag, so soften the "calling ALL the tools" wording.
+            // nothing to flag, so soften the "calling all the tools" wording.
             // caveatTaskNum (captured at push time) — NOT tasks.length — because
             // the progress task may have been pushed after it.
-            instruction += ' (Item ' + caveatTaskNum + ' — set_caveat — is OPTIONAL: call it only if your answer has a genuine must-read warning; if not, skip it and just call the other tool(s).)';
+            instruction += ' (Item ' + caveatTaskNum + ' — set_caveat — is optional: call it only if your answer has a genuine must-read warning; if not, skip it and just call the other tool(s).)';
         }
         if (progressPushed) {
-            instruction += ' (Item ' + progressTaskNum + ' — update_action_state — is also conditional: skip it ONLY when no substantive work was done this turn.)';
+            instruction += ' (Item ' + progressTaskNum + ' — update_action_state — is also conditional: skip it only when no substantive work was done this turn.)';
         }
     }
 

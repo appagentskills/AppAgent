@@ -10,7 +10,7 @@
 describe('B2c-1 permission boot race (worker/130 permissions-update vs worker/020 load)', function() {
     function flush(n) {
         var p = Promise.resolve();
-        for (var i = 0; i < (n || 5); i++) p = p.then(function() { return new Promise(function(r) { setTimeout(r, 0); }); });
+        for (var i = 0; i < (n || 5); i++) p = p.then(function() { return freshTimeout(0); });
         return p;
     }
     function clone(v) { return JSON.parse(JSON.stringify(v)); }

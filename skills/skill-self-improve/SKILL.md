@@ -9,7 +9,7 @@ actions:
 
 # Skill Self-Improve
 
-Improves ONE existing skill from evidence: how it actually ran in past chats, plus current documentation of the system it drives. Output is a **brief proposal**; nothing is saved without explicit user approval.
+Improves one existing skill from evidence: how it actually ran in past chats, plus current documentation of the system it drives. Output is a **brief proposal**; nothing is saved without explicit user approval.
 
 **Hard rules**
 - **No scope drift.** Every edit must serve the skill's original purpose (its description + first section). New capabilities, new actions, or rewrites are out of scope — list them under "Out of scope ideas" (max 2 lines) instead of editing.
@@ -21,7 +21,7 @@ Improves ONE existing skill from evidence: how it actually ran in past chats, pl
 
 ## Action Lifecycle: Improve a Skill
 
-1. `update_action_state({ state:'running', icon:'zap', label:'Improving skill…', tasks:[{label:'Pick skill',status:'running'},{label:'Baseline',status:'pending'},{label:'Mine past runs',status:'pending'},{label:'Research',status:'pending'},{label:'Draft edits',status:'pending'},{label:'Read-only validation',status:'pending'},{label:'Propose & apply',status:'pending'}] })`. Pass the FULL tasks array on every later update.
+1. `update_action_state({ state:'running', icon:'zap', label:'Improving skill…', tasks:[{label:'Pick skill',status:'running'},{label:'Baseline',status:'pending'},{label:'Mine past runs',status:'pending'},{label:'Research',status:'pending'},{label:'Draft edits',status:'pending'},{label:'Read-only validation',status:'pending'},{label:'Propose & apply',status:'pending'}] })`. Pass the full tasks array on every later update.
 2. **Pick skill.** Use the skill id from the caller context if given. Otherwise `prompt_user` with a `select` field listing the ACTIVE SKILLS (id — description) from the system prompt (exclude `skill-self-improve`). The card shows "Waiting for input" automatically while the form is pending.
 3. **Baseline.** `get_skill({skill_id})` → keep the exact body (old_text), its files list (read relevant ones with `read_file`), its tools, and a 1-line statement of its purpose. Note the target system(s) (e.g. ServiceNow Table API, GitHub REST, X/Twitter GraphQL) and any versions/endpoints it hard-codes.
 4. **Find past executions** (see "Transcript access" below):

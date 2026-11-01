@@ -8,7 +8,7 @@ var U = await runFile('test/ui-helpers.js', { workspace: WS }, WS);
 var XKEY = 'sys_script_include_' + 'a'.repeat(32);
 
 function domErr(name, msg) { var e = new Error(msg); e.name = name; return e; }
-function settle() { return new Promise(function(r) { setTimeout(r, 30); }); }
+function settle() { return freshTimeout(30); }
 
 function fakeIdb(seed) {
     var DEL = {}, db = { data: { skills: {}, skillAssets: {} }, failOn: null, commits: 0 };

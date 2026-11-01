@@ -267,6 +267,11 @@ function updateContextIndicator() {
     // Per-model windows are no longer tracked.
     var contextLimit = (typeof getAssumedContextTokens === 'function') ? getAssumedContextTokens() : 200000;
 
+    // Item 8: the unsent draft counts toward the next request.
+    var draftInput = document.getElementById('message-input');
+    var draftTokens = (typeof composerDraftTokens === 'function' && draftInput) ? composerDraftTokens(draftInput.value) : 0;
+    totalTokens += draftTokens;
+
     // Hide indicator if tokens < 10k (for new/empty chats)
     if (totalTokens < 10000) {
         indicator.style.display = 'none';
@@ -287,13 +292,69 @@ function updateContextIndicator() {
 
     // Show percentage and token count in tooltip
     var tokenDisplay = totalTokens >= 1000 ? Math.round(totalTokens / 1000) + 'k' : totalTokens;
-    indicator.title = t('{percent}% context used ({tokens} tokens)', { percent: percentage, tokens: tokenDisplay });
+    if (draftTokens > 0) {
+        var draftDisplay = draftTokens >= 1000 ? Math.round(draftTokens / 1000) + 'k' : draftTokens;
+        indicator.title = t('{percent}% context used ({tokens} tokens, incl. ~{draft} in draft)', { percent: percentage, tokens: tokenDisplay, draft: draftDisplay });
+    } else {
+        indicator.title = t('{percent}% context used ({tokens} tokens)', { percent: percentage, tokens: tokenDisplay });
+    }
 }
 
-// Auto-resize textarea
+// Re-fit a composer when its WIDTH changes (panel resize, sidebar toggle):
+// one ResizeObserver, rAF-throttled per textarea. Textareas are observed lazily
+// on their first autoResizeTextarea call, so a re-rendered home composer is
+// picked up too.
+var _composerResizeObserver = null;
+var _composerObserved = (typeof WeakSet === 'function') ? new WeakSet() : null;
+function _observeComposerWidth(textarea) {
+    if (!_composerObserved || typeof ResizeObserver !== 'function' || _composerObserved.has(textarea)) return;
+    if (!_composerResizeObserver) {
+        _composerResizeObserver = new ResizeObserver(function(entries) {
+            entries.forEach(function(entry) {
+                var el = entry.target;
+                // A re-rendered home composer leaves its old textarea detached:
+                // stop observing it instead of keeping it alive in the observer.
+                if (!el.isConnected) {
+                    _composerResizeObserver.unobserve(el);
+                    if (_composerObserved) _composerObserved.delete(el);
+                    return;
+                }
+                var w = entry.contentRect ? entry.contentRect.width : el.clientWidth;
+                if (el._autoResizeWidth === w) return;
+                el._autoResizeWidth = w;
+                if (el._autoResizeRaf) return;
+                el._autoResizeRaf = requestAnimationFrame(function() {
+                    el._autoResizeRaf = 0;
+                    if (el.isConnected) autoResizeTextarea(el);
+                });
+            });
+        });
+    }
+    _composerObserved.add(textarea);
+    _composerResizeObserver.observe(textarea);
+}
+
+// Auto-resize textarea. ONE cap: the CSS max-height (06-input.css,
+// min(40vh, 320px)) is read here instead of a hard-coded JS limit.
 function autoResizeTextarea(textarea) {
+    if (!textarea) return;
+    _observeComposerWidth(textarea);
+    var cs = (typeof getComputedStyle === 'function') ? getComputedStyle(textarea) : null;
+    var cap = cs ? parseFloat(cs.maxHeight) : NaN;
+    var prevScroll = textarea.scrollTop;
     textarea.style.height = 'auto';
-    textarea.style.height = Math.min(textarea.scrollHeight, 200) + 'px';
+    var full = textarea.scrollHeight;
+    var capped = isFinite(cap) && cap > 0 && full > cap;
+    textarea.style.height = (capped ? cap : full) + 'px';
+    if (capped) {
+        // At the cap the box scrolls: keep the caret visible. Typing at the end
+        // follows the bottom; otherwise keep the previous scroll position.
+        var atEnd = textarea.selectionEnd === textarea.value.length;
+        textarea.scrollTop = atEnd ? textarea.scrollHeight : prevScroll;
+    }
+    if (typeof syncSendButton === 'function') syncSendButton();
+    // Item 8: draft-size hint + (debounced) context ring, ui/246-composer.js.
+    if (typeof composerSyncDraftSize === 'function') composerSyncDraftSize(textarea);
 }
 
 // Trigger resize on all widget iframes

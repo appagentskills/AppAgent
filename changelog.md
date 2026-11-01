@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.1.39
+
+### New
+- Composer `/` and `@` picker with ranked search over docs, files and chats.
+- Composer history recall (↑/↓), large pastes attached as files, and Send turns into Stop while running.
+- Split view button on sidebar widget cards.
+
+### Fixes
+- Attached images are resized and compressed to fit size limits instead of being skipped.
+- Screenshots are capped at 3000px for all providers.
+
+---
+
 ## v1.1.38
 
 ### Fixes

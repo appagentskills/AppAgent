@@ -16,7 +16,7 @@ function _cutFns(src, names) {
 }
 
 var NOOP_CONSOLE = { warn: function() {}, error: function() {}, log: function() {} };
-function _tick() { return new Promise(function(r) { setTimeout(r, 0); }); }
+function _tick() { return freshTimeout(0); }
 
 function _approvalMsgs() {
     return [{ role: 'user', content: 'go' }, { role: 'assistant', content: '', tool_calls: [{ id: 't1' }] },

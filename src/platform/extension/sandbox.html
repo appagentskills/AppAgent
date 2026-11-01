@@ -280,12 +280,17 @@ window.loadModules = async function(paths, opts) {
 };
 // Page-bundle build order (build/build.js JS_TIERS: core → ui → tools → app,
 // numeric prefix within a tier) via `workspace ls`; opts.tiers narrows it.
+// `ls` DECORATES dirty entries: "name *" or "name * \u26a0 WIP by another ...
+// chat" (tools/020-tool-execution.js). Strip everything from the first
+// whitespace+"*" (same rule as rtSelectTestFiles in tools/160-run-tests.js):
+// stripping only a trailing "*" silently dropped every module another chat had
+// dirty (e.g. app/040-send-message.js -> handleKeyDown/sendMessage missing).
 window.buildOrder = async function(opts) {
     opts = opts || {};
     var tiers = opts.tiers || ['core', 'ui', 'tools', 'app'], out = [];
     for (var i = 0; i < tiers.length; i++) {
         var r = await window.executeTool('workspace', { action: 'ls', path: 'src/js/' + tiers[i], workspace: opts.workspace });
-        var entries = ((r && r.entries) || []).map(function(e) { return String(e).replace(/\s*\*$/, ''); }).filter(function(e) { return /\.js$/.test(e); }).sort();
+        var entries = ((r && r.entries) || []).map(function(e) { return String(e).replace(/\s+\*.*$/, '').trim(); }).filter(function(e) { return /\.js$/.test(e); }).sort();
         entries.forEach(function(e) { out.push('src/js/' + tiers[i] + '/' + e); });
     }
     return out;

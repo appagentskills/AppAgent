@@ -88,7 +88,7 @@ describe('#17 pull-debug-state reply carries sandboxes + offscreen (worker/130-p
         fn.apply(null, names.map(function(n) { return scope[n]; }));
         return posted;
     }
-    async function settle() { await new Promise(function(r) { setTimeout(r, 0); }); await Promise.resolve(); await new Promise(function(r) { setTimeout(r, 0); }); }
+    async function settle() { await freshTimeout(0); await Promise.resolve(); await freshTimeout(0); }
     test('hasDocument resolves true → state.sandboxes + state.offscreen.hasDocument:true merged with _swOffscreenDebug()', async function() {
         var body = await slice();
         var posted = run(body, { hasDocument: function() { return Promise.resolve(true); }, offDbg: function() { return { keepAlivePort: false, idleSince: 7, creating: false, readyWaiters: 2 }; } });

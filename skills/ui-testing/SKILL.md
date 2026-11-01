@@ -134,7 +134,7 @@ Before testing, ensure the UI has data to display. Empty pages with no data hide
 
 1. **Check what data the page needs** - Based on Phase 0, determine what ServiceNow records the page queries.
 2. **Verify data exists** - Use `servicenow_api` to query the relevant tables and confirm records exist.
-3. **Create test data if needed** - Use `servicenow_api` to INSERT records so the page has content to render (never via forms — unless that form is what is under test). Create enough records to test:
+3. **Create test data if needed** - Use `servicenow_api` to insert records so the page has content to render (never via forms — unless that form is what is under test). Create enough records to test:
    - **Normal case** - A few typical records
    - **Empty case** - You will test with no records later (delete or filter them out)
    - **Long content** - Records with very long strings in text fields (200+ characters)
@@ -147,7 +147,7 @@ Before testing, ensure the UI has data to display. Empty pages with no data hide
 
 Get a complete picture of the entire UI before testing anything specific.
 
-> **`tab_id` is REQUIRED** on every `iframe_tool` browser action and on `take_screenshot` `target: "browser"/"element"` — there is no active-tab fallback. Get it from `list_instances` (`instances[].activeTabs[].id`) or navigate with `tab_id: "new"` and reuse the `tab_id` the result returns for every later call in this test. The agent's own tab (`selfTabId`) may be screenshotted/read but never navigated.
+> **`tab_id` is required** on every `iframe_tool` browser action and on `take_screenshot` `target: "browser"/"element"` — there is no active-tab fallback. Get it from `list_instances` (`instances[].activeTabs[].id`) or navigate with `tab_id: "new"` and reuse the `tab_id` the result returns for every later call in this test. The agent's own tab (`selfTabId`) may be screenshotted/read but never navigated.
 
 1. **Navigate to the page** - Use `iframe_tool` with action `navigate` (`tab_id: "new"` or an existing instance tab id) to open the UI page; keep the returned `tab_id`.
 2. **Take a full screenshot** - Use `take_screenshot` (`target: "browser"`, same `tab_id`) to capture the initial state.

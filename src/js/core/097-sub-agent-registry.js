@@ -241,20 +241,20 @@ var SUB_AGENT_PREAMBLE = [
     '',
     '------',
     '',
-    'YOU ARE A SUB-AGENT.',
+    'You are a sub-agent.',
     '',
     'A parent agent spawned you for focused, context-heavy work in your own context window, keeping its own lean. Your task is in the first user message.',
     '',
-    'YOUR ROLE: you are the worker — do the substantive work yourself, inline, and report; do not orchestrate or delegate. Any orchestration/delegation policy above (e.g. in a custom system prompt) is your PARENT\'s job, not yours. spawn_sub_agent / stop_sub_agent / wake_sub_agent are denied unless the parent passed `allow_nested:true`; you may only stop/wake/message your own descendants (enforced server-side).',
+    'Your role: you are the worker — do the substantive work yourself, inline, and report; do not orchestrate or delegate. Any orchestration/delegation policy above (e.g. in a custom system prompt) is your parent\'s job, not yours. spawn_sub_agent / stop_sub_agent / wake_sub_agent are denied unless the parent passed `allow_nested:true`; you may only stop/wake/message your own descendants (enforced server-side).',
     '',
-    'RULES:',
+    'Rules:',
     '- Verify directly — you are the executor: confirm the end state yourself (read the record back, re-run the query, screenshot if browser tools are in your roster) and include that evidence in your report.',
     '- Keep a progress card with `update_action_state` (state + `tasks`); it is mirrored live onto your card in the parent chat and exposed via `agent_status`.',
     '- Need parent input mid-task? `report_to_parent({status:"need_input", ...})` settles the parent\'s handle and parks you until it wakes you with instructions.',
     '- Plan-approval gate: a report proposing further work beyond your task goes out as `status:"need_input"`; wait for approval — never self-approve and continue.',
     '- Idle and waiting? Call `sleep_self` to free your worker pool slot.',
     '',
-    'REPORTING (`report_to_parent` — the parent sees only this, never your transcript):',
+    'Reporting (`report_to_parent` — the parent sees only this, never your transcript):',
     '- Summarize; never echo raw tool output. `summary` is concise markdown (rendered to the user in the parent chat), ≤ 4 KB by default — the parent may set another cap via spawn `summary_cap_kb` (1–16 KB); longer summaries are truncated by the registry.',
     '- `data`: unless your task declares an "Expected output schema" (which wins), use {task, findings, evidence: [...], confidence: "high"|"medium"|"low", open_questions: [...]} — task = one-line restatement of what you understood, findings = the distilled result, evidence = concrete pointers per claim (sys_ids, file paths + line numbers, URLs), open_questions = what you could not resolve.',
     '- Put larger payloads in `artifacts` (doc_ids, file_ids), never long lists/dumps in `summary`; stage long results in a smart doc (`document`: `shared` scope lets the parent read it, `chat` keeps it private).',
@@ -2421,7 +2421,7 @@ function spawnSubAgent(args, ctx) {
         try { schemaStr = (typeof args.output_schema === 'string') ? args.output_schema : JSON.stringify(args.output_schema, null, 2); }
         catch (e) { schemaStr = String(args.output_schema); }
         firstMsg += '\n\n## Expected output schema\n\n```json\n' + schemaStr + '\n```'
-            + '\nWhen you call report_to_parent, the `data` field MUST be a JSON object that conforms EXACTLY to the schema above — same keys, same types, no extra keys, no prose inside data. Put any human-readable narration in `summary`; put the schema-conformant structured result in `data`. The parent parses `data` programmatically, so a mismatched shape will break it.';
+            + '\nWhen you call report_to_parent, the `data` field must be a JSON object that conforms exactly to the schema above — same keys, same types, no extra keys, no prose inside data. Put any human-readable narration in `summary`; put the schema-conformant structured result in `data`. The parent parses `data` programmatically, so a mismatched shape will break it.';
     }
     // Structured-brief nudge (Orchestrator §3): a thin brief is NOT rejected —
     // the sub gets a gentle directive to reconstruct the missing pieces, and
@@ -4164,7 +4164,7 @@ function _escalationSuggestion(rec) {
         out.action = 'cross_check';
         out.note = 'Suggestion only (never auto-applied): the sub already runs at the top tier'
             + (idx === -1 ? ' (or an unmapped tier)' : '')
-            + ' — instead of escalating, spawn a FRESH single-turn reviewer sub (spawn_sub_agent, a different or higher tier) given ONLY the task + deliverable + rubric, never the transcript, to cross-check its deliverable.';
+            + ' — instead of escalating, spawn a fresh single-turn reviewer sub (spawn_sub_agent, a different or higher tier) given only the task + deliverable + rubric, never the transcript, to cross-check its deliverable.';
     }
     return out;
 }
@@ -4654,7 +4654,7 @@ function _subReleaseWorkspaceOwnership(rec) {
 }
 function _subNoteForceTaken(rec, paths) {
     if (!rec || !Array.isArray(paths) || !paths.length) return;
-    var note = '\u26A0 Workspace files force-taken from another chat stay owned by this sub (NOT handed to the root chat): ' + paths.join(', ') + '. Push them (releases ownership) or discard.';
+    var note = '\u26A0 Workspace files force-taken from another chat stay owned by this sub (not handed to the root chat): ' + paths.join(', ') + '. Push them (releases ownership) or discard.';
     try { console.warn('[SubAgents] ' + rec.agent_id + ' ' + note); } catch (e0) {}
     rec.workspace_force_taken = paths.slice();
     if (rec.last_report && typeof rec.last_report.summary === 'string' && rec.last_report.summary.indexOf('force-taken from another chat') < 0) {
@@ -6025,7 +6025,7 @@ function _saturationWarning(rec) {
     if (!s.saturated) return null;
     return 'Recipient sub is at ~' + s.context_pct + '% of the assumed 200k context window ('
         + Math.round(s.context_tokens / 1000) + 'k tokens) — per the WORKER SATURATION rule,'
-        + ' spawn a FRESH sub seeded with a handover instead of piling on.';
+        + ' spawn a fresh sub seeded with a handover instead of piling on.';
 }
 
 // ---------- agent_status ----------

@@ -967,6 +967,8 @@ function newChat() {
         inputEl.placeholder = typeof DEFAULT_COMPOSER_PLACEHOLDER === 'string' ? t(DEFAULT_COMPOSER_PLACEHOLDER) : t('Send a message...');
         inputEl.style.height = 'auto';
         inputEl.focus();
+        // Empty composer: grey Send out now (ui/246), not on the next keystroke.
+        if (typeof syncSendButton === 'function') syncSendButton();
     }
 
     // Start with empty pending images for the new chat

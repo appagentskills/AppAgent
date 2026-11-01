@@ -1,15 +1,21 @@
 /* Input area - centered when empty */
 .input-area { padding: var(--space-8) var(--space-10) var(--space-10); border-top: 1px solid var(--border); }
 .input-area.centered { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); width: 100%; max-width: 600px; border: none; padding: 0 var(--space-10); }
-.input-container { display: flex; gap: var(--space-4); max-width: 800px; margin: 0 auto; align-items: flex-end; background: var(--bg-white); border: 1px solid var(--secondary-border); border-radius: var(--radius-input); padding-block: var(--space-4); padding-inline: var(--space-9) var(--space-4); box-shadow: var(--shadow-xs); transition: all var(--transition-normal); }
-.input-container:focus-within { border-color: var(--primary); box-shadow: var(--shadow-lg); }
-.input-container textarea { flex: 1; padding: var(--space-5) 0; border: none; font-size: var(--text-lg); resize: none; font-family: inherit; color: var(--text-primary); background: transparent; min-height: 24px; max-height: 120px; overflow-y: auto; line-height: var(--leading-normal); }
-.input-container textarea:focus { outline: none; }
-#send-btn { width: 44px; height: 44px; border-radius: var(--radius-full); background: var(--primary); color: var(--text-inverse); border: none; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: all var(--transition-normal); flex-shrink: 0; }
-#send-btn:hover { background: var(--primary-hover); transform: scale(1.05); }
+/* One shared composer: chat (.input-container) + home (.home-search-container, 030-home-view.js). */
+.input-container, .home-search-container { display: flex; gap: var(--space-4); align-items: flex-end; background: var(--bg-white); border: 1px solid var(--secondary-border); border-radius: var(--radius-input); padding-block: var(--space-4); padding-inline: var(--space-9) var(--space-4); box-shadow: var(--shadow-xs); transition: all var(--transition-normal); }
+.input-container { max-width: 800px; margin: 0 auto; }
+.input-container:focus-within, .home-search-container:focus-within { border-color: var(--primary); box-shadow: var(--shadow-lg); }
+/* ONE cap for both composers; autoResizeTextarea reads it. */
+.input-container textarea, .home-search-container textarea { flex: 1; padding: var(--space-5) 0; border: none; font-size: var(--text-lg); resize: none; font-family: inherit; color: var(--text-primary); background: transparent; min-height: 24px; max-height: min(40vh, 320px); overflow-y: auto; line-height: var(--leading-normal); }
+.input-container textarea:focus, .home-search-container textarea:focus { outline: none; }
+#send-btn, #home-send-btn { width: 44px; height: 44px; border-radius: var(--radius-full); background: var(--primary); color: var(--text-inverse); border: none; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: all var(--transition-normal); flex-shrink: 0; }
+#send-btn:hover, #home-send-btn:hover { background: var(--primary-hover); transform: scale(1.05); }
 #send-btn:focus { outline: 2px solid var(--primary); outline-offset: 2px; }
-#send-btn svg { width: 18px; height: 18px; }
-#send-btn:disabled { background: var(--secondary-light); color: var(--text-muted); cursor: not-allowed; transform: none; }
+#send-btn svg, #home-send-btn svg { width: 18px; height: 18px; }
+/* After :hover, so disabled wins on hover too. No transition into the
+   disabled state, so a fresh/emptied composer never fades from the primary
+   colour; enabling still animates (the enabled rule's transition applies). */
+#send-btn:disabled, #home-send-btn:disabled, #home-send-btn:disabled:hover { background: var(--secondary-light); color: var(--text-muted); cursor: not-allowed; transform: none; transition: none; }
 #pause-btn { padding: var(--space-4) var(--space-7); background: transparent; color: var(--text-secondary); border: 1px solid var(--secondary-border); border-radius: var(--radius-pill); cursor: pointer; font-size: var(--text-body); height: 36px; display: none; align-items: center; gap: var(--space-3); flex-shrink: 0; align-self: center; }
 #pause-btn:hover { background: var(--secondary-light); border-color: var(--secondary-border-dark); }
 #pause-btn.visible { display: flex; }
@@ -19,9 +25,35 @@
 #continue-btn { padding: var(--space-4) var(--space-8); background: transparent; color: var(--primary); border: 1px solid var(--primary); border-radius: var(--radius-pill); cursor: pointer; font-size: var(--text-body); height: 36px; display: none; align-items: center; gap: var(--space-3); flex-shrink: 0; align-self: center; }
 #continue-btn:hover { background: var(--primary-light); border-color: var(--primary-hover); }
 #continue-btn.visible { display: flex; }
-#attach-btn { width: 36px; height: 36px; border-radius: var(--radius-full); background: transparent; color: var(--text-muted); border: 1px solid var(--secondary-border); cursor: pointer; display: flex; align-items: center; justify-content: center; transition: all var(--transition-normal); flex-shrink: 0; align-self: center; }
-#attach-btn:hover { background: var(--secondary-light); color: var(--primary); border-color: var(--primary-light); }
-#attach-btn svg { width: 16px; height: 16px; }
+#attach-btn, #home-attach-btn { width: 36px; height: 36px; border-radius: var(--radius-full); background: transparent; color: var(--text-muted); border: 1px solid var(--secondary-border); cursor: pointer; display: flex; align-items: center; justify-content: center; transition: all var(--transition-normal); flex-shrink: 0; align-self: center; }
+#attach-btn:hover, #home-attach-btn:hover { background: var(--secondary-light); color: var(--primary); border-color: var(--primary-light); }
+#attach-btn svg, #home-attach-btn svg { width: 16px; height: 16px; }
+/* Draft-size hint under both composers (item 8, ui/246 composerSyncDraftSize). */
+.composer-draft-hint { max-width: 800px; margin: var(--space-2) auto 0; font-size: var(--text-caption); color: var(--text-muted); text-align: end; }
+.composer-draft-hint[hidden] { display: none; }
+
+/* Item 11: the chat Send button doubles as Stop / 'Interrupting…' while a run is live (ui/246). */
+#send-btn.is-stop { background: var(--text-primary); color: var(--bg-white); }
+#send-btn.is-stop:hover { background: var(--text-secondary); }
+#send-btn.is-stop:disabled,
+#send-btn[aria-disabled="true"],
+#send-btn[aria-disabled="true"]:hover { background: var(--secondary-light); color: var(--text-muted); cursor: default; }
+.composer-picker mark { background: transparent; color: var(--primary); font-weight: 600; padding: 0; }
+
+/* Item 10: '/' active-skill and '@' reference picker above the composer (ui/247). */
+.input-container, .home-search-container { position: relative; }
+.composer-picker { position: absolute; inset-inline: 0; bottom: calc(100% + var(--space-2)); z-index: 30; max-height: 260px; overflow-y: auto; background: var(--bg-white); border: 1px solid var(--secondary-border); border-radius: var(--radius-md); box-shadow: var(--shadow-lg); padding: var(--space-2) 0; text-align: start; }
+.composer-picker[hidden] { display: none; }
+/* New chat page: open below the composer, over the chips/sections under it. */
+.composer-picker.composer-picker-below { top: calc(100% + var(--space-2)); bottom: auto; z-index: 50; }
+.composer-picker-option { display: flex; align-items: center; gap: var(--space-3); padding: var(--space-2) var(--space-4); cursor: pointer; font-size: var(--text-body); color: var(--text-primary); min-width: 0; }
+.composer-picker-option:hover, .composer-picker-option.active { background: var(--secondary-light); }
+.composer-picker-option.active { box-shadow: inset 3px 0 0 var(--primary); }
+.composer-picker-icon { flex: 0 0 18px; width: 18px; height: 18px; display: inline-flex; align-items: center; justify-content: center; color: var(--text-secondary); }
+.composer-picker-icon svg { width: 16px; height: 16px; }
+.composer-picker-label { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+.composer-picker-detail { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-muted); font-size: var(--text-caption); text-align: end; }
+.composer-picker-empty { padding: var(--space-3) var(--space-4); color: var(--text-muted); font-size: var(--text-caption); }
 .btn-icon { font-size: var(--text-body-lg); }
 
 /* Pending Images Container */
@@ -30,7 +62,10 @@
 .pending-image-item:hover { transform: scale(1.05); box-shadow: var(--shadow-lg); }
 .pending-image-item img { width: 100%; height: 100%; object-fit: cover; border-radius: var(--radius-lg); }
 .pending-image-remove { position: absolute; top: -4px; inset-inline-end: -4px; width: 20px; height: 20px; background: var(--danger); color: var(--text-inverse); border: 2px solid white; border-radius: var(--radius-full); cursor: pointer; display: none; align-items: center; justify-content: center; font-size: var(--text-body-sm); font-weight: bold; line-height: 1; z-index: 10; box-shadow: var(--shadow-sm); }
-.pending-image-item:hover .pending-image-remove { display: flex; }
+.pending-image-item:hover .pending-image-remove, .pending-image-item:focus-within .pending-image-remove { display: flex; }
+.pending-image-item:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+/* Touch devices have no hover: keep the remove button visible. */
+@media (hover: none) { .pending-image-remove { display: flex; } }
 .pending-image-remove:hover { background: var(--danger-hover); transform: scale(1.1); }
 .pending-images-hint { font-size: var(--text-caption); color: var(--text-muted); width: 100%; margin-top: var(--space-2); }
 

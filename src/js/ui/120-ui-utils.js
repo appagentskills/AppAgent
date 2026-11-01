@@ -1033,16 +1033,16 @@ function renderVersionSidebar() {
         html += '<div class="version-section-title">' + UI_ICONS.widget + ' ' + t('Widgets ({count})', { count: widgets.length }) + '</div>';
         html += '<div id="widget-sidebar-list" class="widget-sidebar-list">';
         widgets.forEach(function(widget) {
-            var isOnDashboard = dashboardWidgets && dashboardWidgets[widget.id];
-            var dashboardBtnClass = isOnDashboard ? 'widget-sidebar-btn widget-dashboard-btn on-dashboard' : 'widget-sidebar-btn widget-dashboard-btn';
-            var dashboardBtnTitle = isOnDashboard ? t('Pinned \u2014 click to change') : t('Pin to dashboard\u2026');
-            var dashboardBtnIcon = isOnDashboard ? UI_ICONS.pinFilled : UI_ICONS.pin;
+            // Split view toggle (core/082-split-view.js) replaces the former
+            // pin-to-dashboard button; pinning stays available in the Widget
+            // Library and the widget's own header.
+            var splitBtnHtml = typeof splitViewButtonHtml === 'function' ? splitViewButtonHtml(widget.id, 'widget-sidebar-btn') : '';
             html += '<div class="widget-sidebar-item" role="button" tabindex="0" data-kbd-click onclick="scrollToWidget(\'' + widget.id + '\')">' +
                 '<span class="widget-sidebar-icon">' + UI_ICONS.widget + '</span>' +
                 '<span class="widget-sidebar-title">' + escapeHtml(widget.title) + '</span>' +
                 '<div class="widget-sidebar-actions">' +
                 '<button class="widget-sidebar-btn" onclick="event.stopPropagation();showWidgetInPanel(\'' + widget.id + '\')" title="' + t('Open in new tab') + '">' + UI_ICONS.externalLink + '</button>' +
-                '<button class="' + dashboardBtnClass + '" data-widget-id="' + widget.id + '" onclick="showWidgetPinMenu(\'' + widget.id + '\', event)" title="' + dashboardBtnTitle + '">' + dashboardBtnIcon + '</button>' +
+                splitBtnHtml +
                 '<button class="widget-sidebar-btn" onclick="event.stopPropagation();openWidgetFullscreen(\'' + widget.id + '\')" title="' + t('Fullscreen') + '">' + UI_ICONS.maximize + '</button>' +
                 '</div>' +
             '</div>';

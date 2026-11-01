@@ -8,7 +8,7 @@ Define the test scenarios for the UI page before starting to test. What should t
 
 ## Available Tools
 
-> **`tab_id` is REQUIRED** on every `iframe_tool` browser action and on `take_screenshot` `target: "browser"`/`"element"` (no active-tab fallback). Get it from `list_instances` (`instances[].activeTabs[].id`) or open a tab with `navigate` + `tab_id: "new"` and reuse the returned `tab_id`. Never navigate the agent's own tab (`selfTabId`).
+> **`tab_id` is required** on every `iframe_tool` browser action and on `take_screenshot` `target: "browser"`/`"element"` (no active-tab fallback). Get it from `list_instances` (`instances[].activeTabs[].id`) or open a tab with `navigate` + `tab_id: "new"` and reuse the returned `tab_id`. Never navigate the agent's own tab (`selfTabId`).
 
 ### Inspection Tools
 

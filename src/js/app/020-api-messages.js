@@ -345,7 +345,7 @@ function buildAPIMessages(chatMessages, chatId) {
                 var totalLines = (existing.fullContent || content).split('\n').length;
                 return _freezeSent(originalMsg, '[User pasted a long message — cached]\n' + JSON.stringify({
                     _cached_user_message: {
-                        message: 'USER MESSAGE CACHED: ' + sizeKB + 'KB, ' + totalLines + ' lines (limit: ' + limitKB + 'KB). Use cached_content_read/search/outline with content_id "' + originalMsg.cachedContentId + '".',
+                        message: 'User message cached: ' + sizeKB + 'KB, ' + totalLines + ' lines (limit: ' + limitKB + 'KB). Use cached_content_read/search/outline with content_id "' + originalMsg.cachedContentId + '".',
                         content_id: originalMsg.cachedContentId,
                         size: sizeKB + 'KB',
                         totalLines: totalLines
@@ -1074,6 +1074,10 @@ function syncChatControlsUI(chatId) {
     if (msgs && typeof msgs.setAttribute === 'function') {
         if (state === 'pause') msgs.setAttribute('aria-busy', 'true');
         else if (typeof msgs.removeAttribute === 'function') msgs.removeAttribute('aria-busy');
+    }
+    // Item 11: the chat Send button doubles as Stop / 'Interrupting…' (ui/246).
+    if (typeof syncSendButton === 'function') {
+        try { syncSendButton(); } catch (e) {}
     }
     return state;
 }

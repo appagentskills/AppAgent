@@ -25,7 +25,7 @@ function _ccmDoesNotThrow(fn) {
     try { fn(); } catch (e) { err = e; }
     assert.ok(err === null, 'expected no throw, got: ' + (err && (err.stack || err.message || err)));
 }
-async function _ccmSettle() { for (var i = 0; i < 6; i++) { await new Promise(function(r) { setTimeout(r, 0); }); } }
+async function _ccmSettle() { for (var i = 0; i < 6; i++) { await freshTimeout(0); } }
 
 describe('cold-chat eviction: tools/100 prompt_user on a skeleton', function() {
     var m, g, chats, store, hydrates, saves, injected;

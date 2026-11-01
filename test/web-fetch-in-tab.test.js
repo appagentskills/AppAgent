@@ -140,7 +140,7 @@ describe('web_fetch tab_id (in-tab page-context fetch)', function() {
         assert.strictEqual(flagged.success, false);
         assert.strictEqual(flagged.binary, true);
         assert.match(flagged.error, /binary \(application\/pdf\)/);
-        assert.match(flagged.hint, /WITHOUT tab_id and with save_file:true/);
+        assert.match(flagged.hint, /without tab_id and with save_file:true/);
         assert.strictEqual(flagged.body, undefined);
         var unflagged = await m.run({ tab_id: 9, url: 'https://shop.example.com/i.png' },
             fakeScripting({ ok: true, status: 200, content_type: 'image/png', body: '\u0089PNG', page_origin: 'https://shop.example.com' }, []));

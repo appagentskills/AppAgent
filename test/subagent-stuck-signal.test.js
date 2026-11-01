@@ -8,7 +8,7 @@ var quiet = { log: function() {}, warn: function() {}, error: function() {}, inf
 var GRACE = 120000;
 var CORE = ['src/js/core/095-handle-registry.js', 'src/js/core/097-sub-agent-registry.js'];
 var REG_ONLY = ['src/js/core/097-sub-agent-registry.js'];
-function tick(ms) { return new Promise(function(r) { setTimeout(r, ms || 5); }); }
+function tick(ms) { return freshTimeout(ms || 5); }
 function clone(v) { return v === undefined ? undefined : JSON.parse(JSON.stringify(v)); }
 
 // Store-aware fake IDB (records keyed by parentChatId / agent_id); every

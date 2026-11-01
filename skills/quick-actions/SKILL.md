@@ -19,8 +19,8 @@ One-click workflows a PM does daily on ServiceNow.
 Runs a smoke test on the page currently open in the browser panel.
 
 1. `update_action_state({ state: 'running', icon: 'eye', label: 'Capturing page…', tasks: [{label: 'Get page info', status: 'running'}, {label: 'Check for errors', status: 'pending'}, {label: 'Visual snapshot', status: 'pending'}] })`
-2. `list_instances` → pick the target tab id (`instances[].activeTabs[].id`; the instance tab the user is on). `tab_id` is REQUIRED on every browser call — there is no active-tab fallback. If no instance tab is open, say so and stop.
-3. `iframe_tool` action `get_page_info` with that `tab_id` — verify there IS a page
+2. `list_instances` → pick the target tab id (`instances[].activeTabs[].id`; the instance tab the user is on). `tab_id` is required on every browser call — there is no active-tab fallback. If no instance tab is open, say so and stop.
+3. `iframe_tool` action `get_page_info` with that `tab_id` — verify there is a page
 4. `iframe_tool` action `get_console_logs` with the same `tab_id` — check for JS errors
 5. `update_action_state` with `tasks` progress
 6. `take_screenshot` `{target: 'browser', tab_id}` to capture the current view

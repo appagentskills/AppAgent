@@ -12,7 +12,7 @@ var U = await runFile('test/ui-helpers.js', { workspace: WS }, WS);
 var CSS = ['src/css/00-tokens.css', 'src/css/02-layout.css', 'src/css/06-input.css'];
 var BASE = ['src/js/core/055-emoji-shortcodes.js', 'src/js/core/060-ui-constants.js', 'src/js/ui/180-search.js'];
 var SIDEBAR = BASE.concat(['src/js/ui/210-chat-menus.js']);
-var COMPOSER = BASE.concat(['src/js/app/020-api-messages.js', 'src/js/app/040-send-message.js', 'src/js/app/050-image-attachments.js', 'src/js/ui/030-home-view.js']);
+var COMPOSER = BASE.concat(['src/js/app/020-api-messages.js', 'src/js/app/040-send-message.js', 'src/js/app/050-image-attachments.js', 'src/js/ui/030-home-view.js', 'src/js/ui/246-composer.js']);
 var ALLOW = ['isChatPaused', 'isChatRunning', '_isChatInSilentHook', 'renderSubAgentBreadcrumb', '_storageDegraded', 'buildDegradedChatListHtml',
     'dispatchChatMeta', 'ensureChatPayloads', 'renderHistoryPage', 'pushPauseToggleToOffscreen', 'pushInterruptToOffscreen', '_supersedeInterruptToggle',
     '_silentHookChats', '_agentBusPort', 'currentProvider', 'autoResizeTextarea', '_openAgentBus', 'smartDocuments', 'sdocOpenPreview', 'AgentEvents'];
@@ -299,7 +299,7 @@ describe('ui composer › attachment chips + drag overlay', function() {
         c.s.DROP_OVERLAY_HEARTBEAT_MS = 20;
         var ov = c.dom.$('#drop-overlay');
         function ev() { return { preventDefault: noop, stopPropagation: noop, dataTransfer: { types: ['Files'] } }; }
-        function wait(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
+        function wait(ms) { return freshTimeout(ms); }
         c.m.handleDragEnter(ev()); c.m.handleDragEnter(ev()); c.m.handleDragLeave(ev());
         assert.strictEqual(ov.classList.contains('visible'), true);
         assert.strictEqual(c.s.dragDepth, 1, 'one dragleave was lost');
@@ -625,7 +625,7 @@ describe('ui sidebar › search', function() {
         });
         var si = t.dom.$('#chat-search-input');
         function type(v) { si.value = v; U.fireInline(si, 'input', t.m); }
-        function settle() { return new Promise(function(r) { setTimeout(r, 320); }); }
+        function settle() { return freshTimeout(320); }
         type('ne');
         await settle();
         assert.strictEqual(t.s.chatSearchQuery, 'ne');

@@ -14,7 +14,7 @@ The `html_widget` tool creates rich visual presentations inline in chat instead 
 ## Permanent identity and saved versions
 
 - **Iteration is a new version, not a new widget.** Keep the existing `widget_id` for fixes, redesigns, regeneration, and follow-ups. Never infer identity from title/HTML.
-- Read first: `html_widget({action:"read", widget_id:"widget_…"})` returns HTML, `latest_version` and history. Save the SAME `widget_id`, with `expected_version` from that read and a unique `operation_id`. On `VERSION_CONFLICT`, read and reconcile; never blindly overwrite.
+- Read first: `html_widget({action:"read", widget_id:"widget_…"})` returns HTML, `latest_version` and history. Save the same `widget_id`, with `expected_version` from that read and a unique `operation_id`. On `VERSION_CONFLICT`, read and reconcile; never blindly overwrite.
 - `action:"list"` discovers retained widgets even after unpin/chat deletion. `action:"read", version:N` reads history without restoring it.
 - Omitted `widget_id` follows the explicit widget-edit target on the **current user request only**. A later ordinary user request does not inherit that target; pass the permanent `widget_id` explicitly to continue editing. The “Edit with agent” composer target is consumed once when its prefilled request is sent. `create_new:true` deliberately creates a distinct artifact, never an iteration. Return `widget_id` and `version` from js_eval.
 - Reuse `operation_id` only for an identical retry; separate edits need new keys. Top-level tool-call IDs are a fallback; sandbox/js_eval retry chains need explicit stable keys.
@@ -49,7 +49,7 @@ Use `html_widget` when showing:
 ### Environment
 - Widgets run in an **isolated iframe** - no access to parent window or page globals
 - **`executeTool()`** is available for calling agent tools (including ServiceNow API)
-- CSS is fully isolated - use `<style>` tags freely (the app's design tokens ARE pre-injected, see below)
+- CSS is fully isolated - use `<style>` tags freely (the app's design tokens are pre-injected, see below)
 - **No external dependencies** - no CDN links, external fonts, or libraries
 - Use vanilla HTML/CSS/JS only
 
@@ -77,7 +77,7 @@ Widget iframe mounts delegate native fullscreen. Call `video.requestFullscreen()
 
 Every widget gets a `<style data-appagent-tokens="1">` block prepended, so `var(--token)` works with no setup. Light/dark switches **live** - an attribute flip on `<html>`, no re-render, widget state survives. Both injected selectors are wrapped in `:where()` (zero specificity), so **any** rule of your own overrides a token - `:root{}`, `body{}`, `.cls{}` or an inline `style=`. The block is added at render time and is **not** part of the stored widget HTML (so don't `edit_html` against it).
 
-`color-scheme` is deliberately NOT set, so set your own: `body { background: var(--bg-main); color: var(--text-primary); }`.
+`color-scheme` is deliberately not set, so set your own: `body { background: var(--bg-main); color: var(--text-primary); }`.
 
 These tokens are **always defined**, so a `var(--x, fallback)` fallback will never be used - pick an explicit value, or a different custom-property name, if you need your own default.
 
@@ -139,7 +139,7 @@ Widgets and js_eval are *programmatic* callers: their `executeTool` results neve
 
 ## Ask-the-agent buttons
 
-A widget button can hand a question off to a NEW chat with the `start_chat` tool:
+A widget button can hand a question off to a new chat with the `start_chat` tool:
 
 ```html
 <button id="ask">Ask the agent</button>
@@ -153,7 +153,7 @@ document.getElementById('ask').onclick = async function () {
 </script>
 ```
 
-`include_widget: true` prepends `Context: widget <id> ("<title>") — read it with iframe_tool get_visible_text or take_screenshot.` using the CALLING widget's id (also readable as `window._widgetId`). In foreground modes (`send` without `background`, and `draft`) the view switches to the new chat and this widget's iframe is destroyed — don't await feedback there; use `background: true` if the button must show a result.
+`include_widget: true` prepends `Context: widget <id> ("<title>") — read it with iframe_tool get_visible_text or take_screenshot.` using the calling widget's id (also readable as `window._widgetId`). In foreground modes (`send` without `background`, and `draft`) the view switches to the new chat and this widget's iframe is destroyed — don't await feedback there; use `background: true` if the button must show a result.
 
 ## Common Gotchas
 

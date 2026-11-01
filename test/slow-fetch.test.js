@@ -25,7 +25,7 @@ describe('slow-fetch: hard timeout + pending handle', function() {
             if (signal) signal.addEventListener('abort', function() { clearTimeout(t); var e = new Error('The operation was aborted.'); e.name = 'AbortError'; reject(e); });
         });
     }
-    function wait(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
+    function wait(ms) { return freshTimeout(ms); }
     var OPTS = { chatId: 'c1' };
 
     test('fast call returns the normal result (no pending, no notice)', async function() {

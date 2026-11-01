@@ -689,7 +689,7 @@ async function startAction(skillId, actionName, extraContext) {
     var userMsg = 'Run action: **' + actionName + '**\n\n' +
         'This is a background Action from the skill "' + (skill.name || skillId) + '". ' +
         'Look up the "Action Lifecycle: ' + actionName + '" section in the skill body and execute it. ' +
-        'The PM never sees this chat — they only see the action button. You MUST call `update_action_state` frequently (running/stuck/done/error) with a `tasks` todo list and a final `output` summary so they can track progress and see the result.';
+        'The PM never sees this chat — they only see the action button. Please call `update_action_state` frequently (running/stuck/done/error) with a `tasks` todo list and a final `output` summary so they can track progress and see the result.';
     if (extraContext && typeof extraContext === 'string') {
         userMsg += '\n\n**Context from the caller:**\n' + extraContext;
     }

@@ -517,7 +517,8 @@ async function executeGetFile(args) {
             if (imgData.indexOf('data:') !== 0) {
                 imgData = 'data:' + mime + ';base64,' + imgData;
             }
-            // Resize if either dimension exceeds limit (Anthropic caps at 2000px for many-image requests)
+            // Downscale only if the long edge exceeds SCREENSHOT_MAX_LONG_EDGE (3000px,
+            // the cross-provider safe cap), then compress >4.5MB
             imgData = fixDataUrlMime(imgData);
             var resized = await resizeImageIfNeeded(imgData);
             resized.base64 = fixDataUrlMime(resized.base64);

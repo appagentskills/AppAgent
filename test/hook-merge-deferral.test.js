@@ -7,7 +7,7 @@ var _q = { log: function() {}, warn: function() {}, error: function() {}, info: 
 function _settle(p) {
     return Promise.race([Promise.resolve(p).catch(function() {}), new Promise(function(r) { setTimeout(r, 200); })]);
 }
-var HOOK = 'Now do the following, calling ALL the tools in THIS SINGLE response (parallel tool calls), and say nothing else: 1) x; 2) y.';
+var HOOK = 'Now do the following, calling all the tools in this single response (parallel tool calls), and say nothing else: 1) x; 2) y.';
 
 describe('hook-run injection deferral (HOOK-MERGE)', function() {
     test('_isHookRunStart: only a trailing hook row starts a hook run', async function() {

@@ -70,7 +70,7 @@ The `blocked` family of fields is **only present when a block was hit.** A succe
 - **`udm=14` is critical.** It's Google's "Web only" mode — strips the AI Overview and returns the classic, parseable 10-blue-link SERP. Without `udm=14`, the response is 470 KB of JS with only 2 `<h3>` tags. With it, it's 320 KB with the full 10 results.
 - **5-second spacing is the sustainable rate** (tested: 37 consecutive clean queries at 5 s; ~20 clean queries at 2.5 s before block).
 - **Block signal:** `HTTP 200` + `body.length < 150 KB` + `0 <h3> tags`. This is the JS-required interstitial Google serves when it suspects scraping.
-  - **NOT** a 202, **NOT** a `/sorry/` redirect.
+  - Not a 202, and not a `/sorry/` redirect.
   - The string `/httpservice/retry/enablejs` appears in **every** Google page (it's the noscript fallback) — never use it as a block signal. (Wasted an hour learning this the hard way.)
 - **Recovery: ~2 minutes, automatic, no CAPTCHA.** Block is per-fingerprint, not per-IP — a real Chrome session (the iframe panel) is unaffected and can be used for one-off queries while web_fetch cools down.
 - **Parser:** pairs `<a href="..."><h3>...</h3>` anchors with the nearest snippet div within ~5000 chars. Snippet div classes rotate; current set: `VwiC3b`, `yXK7lf`, `GI74Re`, `MUxGbd`, `s8bAkb`, `Hdw6tb`, `lEBKkf`, `kvH3mc`. If results start coming back empty despite no block, add the new class name here.
@@ -99,7 +99,7 @@ Google embeds freshness stamps in ~all news / recent results — that's the main
 
 ## When the response says `blocked: true`
 
-The tool does **NOT** touch the iframe. **The agent decides what to do.** Typical options:
+The tool doesn't touch the iframe. **The agent decides what to do.** Typical options:
 
 1. **Switch engines.** If Google is blocked, retry with `engine: "ddg"` (or vice versa). Different fingerprints, independent block state. Usually the fastest recovery.
 2. **Wait.** Google clears in ~2 min automatically. Sleep then re-invoke with `queries: <response>.remaining`.

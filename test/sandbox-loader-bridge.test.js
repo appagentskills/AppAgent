@@ -142,6 +142,36 @@ describe('workspace sandbox loaders and promise bridge', function() {
         assert.deepStrictEqual(Object.keys(h.window._pendingCalls), []);
     }, { tags: ['unit'], timeout: 2000 });
 
+    // Regression: `workspace ls` decorates dirty entries as "name *" or
+    // "name * \u26a0 WIP by another ... chat". buildOrder used to strip only a
+    // trailing "*", so a module another chat had dirty dropped out of the bundle
+    // order (ui-shell "inline handlers must resolve": handleKeyDown, sendMessage).
+    test('buildOrder strips every ls decoration so dirty modules stay in tier/numeric order', async function() {
+        var h = loaderBridgeFixture({}, false);
+        var LS = {
+            'src/js/core': ['020-b.js * \u26a0 WIP by another RUNNING agent', '010-a.js', 'README.md'],
+            'src/js/ui': ['sub/ (2 files)', '010-c.js *'],
+            'src/js/tools': [],
+            'src/js/app': ['040-send-message.js * \u26a0 WIP by another (dormant) chat', '010-x.js']
+        };
+        var done = false, order = null;
+        h.window.buildOrder({ workspace: 'owner/repo::main' }).then(function(v) { order = v; done = true; });
+        for (var answered = 0, spins = 0; !done && spins < 200; spins++) {
+            await Promise.resolve();
+            var calls = h.calls();
+            if (calls.length > answered) {
+                var c = calls[answered++];
+                assert.strictEqual(c.name, 'workspace');
+                assert.deepStrictEqual(c.args, { action: 'ls', path: c.args.path, workspace: 'owner/repo::main' });
+                h.emit({ type: 'sandboxToolResult', id: c.id, result: { success: true, entries: LS[c.args.path] } });
+            }
+        }
+        assert.ok(done, 'buildOrder settled');
+        assert.deepStrictEqual(order, ['src/js/core/010-a.js', 'src/js/core/020-b.js', 'src/js/ui/010-c.js',
+            'src/js/app/010-x.js', 'src/js/app/040-send-message.js']);
+        assert.deepStrictEqual(Object.keys(h.window._pendingCalls), []);
+    }, { tags: ['unit'], timeout: 2000 });
+
     test('transport errors reject only their pending source read and release the entry', async function() {
         var h = loaderBridgeFixture({}, false);
         var failed = h.window.loadFile('broken.js');

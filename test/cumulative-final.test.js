@@ -21,9 +21,9 @@ describe('C1 CUMULATIVE FINAL policy (core/110-system-prompt.js)', function() {
         var m = await load();
         var cf = m.ORCHESTRATOR_POLICY_LINES.filter(function(l) { return l.indexOf('CUMULATIVE FINAL:') === 0; });
         assert.strictEqual(cf.length, 1, 'exactly one CUMULATIVE FINAL line');
-        assert.ok(/after any wake run/.test(cf[0]) && /EVERYTHING since the user's last real message/.test(cf[0]) && /earlier wake runs/.test(cf[0]) && /Never assume the user read/.test(cf[0]));
+        assert.ok(/after any wake run/.test(cf[0]) && /everything since the user's last real message/.test(cf[0]) && /earlier wake runs/.test(cf[0]) && /Never assume the user read/.test(cf[0]));
         var fan = m.ORCHESTRATOR_POLICY_LINES.filter(function(l) { return l.indexOf('FAN-OUT:') === 0; })[0];
-        assert.ok(/Interim answers as reports arrive are cumulative: restate ALL results so far, not only the newest report\./.test(fan));
+        assert.ok(/Interim answers as reports arrive are cumulative: restate all results so far, not only the newest report\./.test(fan));
         assert.ok(m.DEFAULT_SYSTEM_PROMPT_TEMPLATE.indexOf("from mid-run or from earlier wake runs since the user's last message") !== -1);
     }, T);
     test('policy appears exactly ONCE for default, custom and placeholder-custom prompts; never for subs', async function() {
@@ -126,7 +126,7 @@ describe('C3 _isRealUserRow (app/020-api-messages.js) + progress turn key (app/0
 
 describe('C4 wake-run hook wording (worker/020-page-stubs.js)', function() {
     var LONG = new Array(71).join('0123456789');
-    var NORMAL = 'Now do the following, calling ALL the tools in THIS SINGLE response (parallel tool calls), and say nothing else: 1) provide a TL;DR of your answer using the set_tldr tool (1-2 short sentences, max 280 chars); 2) finalize the chat progress card by calling the update_action_state tool with the appropriate TERMINAL state \u2014 `pr_opened` if a PR was opened/pushed during this task, `finished_with_caveat` if you are also flagging a caveat with set_caveat, `error` if the task failed, otherwise `finished` \u2014 passing the full tasks array (all marked done) and a short markdown `output` summary; SKIP this call entirely if no substantive work was done (pure conversational answer). (Item 2 \u2014 update_action_state \u2014 is also conditional: skip it ONLY when no substantive work was done this turn.)';
+    var NORMAL = 'Now do the following, calling all the tools in this single response (parallel tool calls), and say nothing else: 1) provide a TL;DR of your answer using the set_tldr tool (1-2 short sentences, max 280 chars); 2) finalize the chat progress card by calling the update_action_state tool with the appropriate terminal state \u2014 `pr_opened` if a PR was opened/pushed during this task, `finished_with_caveat` if you are also flagging a caveat with set_caveat, `error` if the task failed, otherwise `finished` \u2014 passing the full tasks array (all marked done) and a short markdown `output` summary; skip this call entirely if no substantive work was done (pure conversational answer). (Item 2 \u2014 update_action_state \u2014 is also conditional: skip it only when no substantive work was done this turn.)';
     async function run(rows, anchor) {
         var G = { chats: {}, hooksEnabled: { autoTitle: false, autoTldr: true, autoLinks: false, autoCaveat: false, autoProgress: true, showHookMessages: true } };
         var runs = [];
@@ -162,6 +162,6 @@ describe('C4 wake-run hook wording (worker/020-page-stubs.js)', function() {
     test('anchor with merged user text is a normal turn (normal wording)', async function() {
         var rows = base().concat([{ role: 'assistant', content: 'dispatched' }, { role: 'user', injected: true, hasUserText: true, content: 'notice\n\ntyped' }, { role: 'assistant', content: LONG }]);
         var r = await run(rows, 4);
-        assert.strictEqual(r.hook, 'Now provide a TL;DR of your answer using the set_tldr tool (1-2 short sentences, max 280 chars). Do NOT say anything else.');
+        assert.strictEqual(r.hook, 'Now provide a TL;DR of your answer using the set_tldr tool (1-2 short sentences, max 280 chars). Don\'t say anything else.');
     }, T);
 });

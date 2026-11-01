@@ -95,10 +95,15 @@ async function runTestRunPolicyTests(sources) {
 
     for (var termination of ['deadline', 'per-test', 'abort', 'error']) {
         h = realm(); P = h.P; key = h.key(); var controller = new AbortController();
-        var ended = P.runFrame({ registry: P.registry, context: key, document: h.document, window: h.window, code: '', dispatch: h.dispatch, signal: controller.signal }).then(function() { return false; }, function() { return true; });
+        // A per-test timeout RESOLVES with an aborted partial envelope (so sharded
+        // runs keep completed files); every other termination rejects.
+        var ended = P.runFrame({ registry: P.registry, context: key, document: h.document, window: h.window, code: '', dispatch: h.dispatch, signal: controller.signal }).then(function(r) {
+            return termination === 'per-test' && !!r && r.host_test_boundary === true && r.value.aborted === true &&
+                r.value.timed_out.file === 'test/x.test.js' && r.value.timed_out.test === 'suite \u203a slow' && r.value.files.length === 1;
+        }, function() { return termination !== 'per-test'; });
         frame = h.frames[0];
         if (termination === 'deadline') h.advance(10001);
-        if (termination === 'per-test') h.emit(frame, { type: 'sandboxTestTimeout' });
+        if (termination === 'per-test') h.emit(frame, { type: 'sandboxTestTimeout', file: 'test/x.test.js', test: 'suite \u203a slow', partial: { files: [{ file: 'test/a.test.js', status: 'pass', passed: 1, failed: 0, skipped: 0 }] } });
         if (termination === 'abort') controller.abort();
         if (termination === 'error') frame.events.error();
         check(termination + ' destroys and revokes exact frame', await ended && h.removed() === 1 && !P.registry.gate(key, 'run_js_file', { path: 'a', mode: 'source' }).ok);

@@ -331,6 +331,11 @@ function kbdCanPause() {
     if (typeof togglePause !== 'function' || typeof _chatControlsState !== 'function') return false;
     if (typeof currentChatId === 'undefined' || !currentChatId) return false;
     if (kbdOverlayOpen() || kbdMenuOpen()) return false;
+    // Item 7: while the composer shows a recalled message, Esc restores the
+    // draft (composer keydown) instead of pausing the run.
+    if (typeof composerIsBrowsingHistory === 'function' && composerIsBrowsingHistory()) return false;
+    // An open '/' '@' composer picker (ui/247) owns Esc: it closes the list.
+    if (typeof composerPickerIsOpen === 'function' && composerPickerIsOpen()) return false;
     var a = document.activeElement;
     // Esc in another field (search, settings) keeps its own meaning.
     if (kbdIsTextField(a) && a.id !== 'message-input' && a.id !== 'home-message-input') return false;

@@ -127,7 +127,7 @@ async function requestProgrammaticToolApproval(toolName, args, options) {
                 if (msg.status === 'allowed' || msg.status === 'session_allowed' || msg.status === 'always_allowed') {
                     return Object.assign({ allowed: true }, baseResult);
                 } else if (msg.status === 'denied') {
-                    return Object.assign({ allowed: false, error: displayName + ' was DENIED by user. STOP immediately — do NOT retry or work around this. Acknowledge the denial and ask the user how to proceed.' }, baseResult);
+                    return Object.assign({ allowed: false, error: displayName + ' was denied by the user. Stop this operation — don\'t retry it or work around it. Acknowledge the denial and ask the user how they\'d like to proceed.' }, baseResult);
                 }
                 // status === 'pending' should not happen here (means approval in progress)
                 break;
@@ -158,6 +158,6 @@ async function requestProgrammaticToolApproval(toolName, args, options) {
     if (approved) {
         return Object.assign({ allowed: true }, baseResult);
     } else {
-        return Object.assign({ allowed: false, error: displayName + ' was DENIED by user. STOP immediately — do NOT retry or work around this. Acknowledge the denial and ask the user how to proceed.' }, baseResult);
+        return Object.assign({ allowed: false, error: displayName + ' was denied by the user. Stop this operation — don\'t retry it or work around it. Acknowledge the denial and ask the user how they\'d like to proceed.' }, baseResult);
     }
 }

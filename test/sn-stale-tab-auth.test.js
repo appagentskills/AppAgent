@@ -419,7 +419,7 @@ async function buildValidate(valid, recoverWith) {
     api.w = w; api.stored = stored; api.msgs = msgs; api.pings = pings;
     return api;
 }
-function settle() { return new Promise(function(r) { setTimeout(r, 20); }); }
+function settle() { return freshTimeout(20); }
 
 describe('panel validateToken sibling recovery', function() {
     test('dead token + healthy sibling: recovers once, connected, persisted', async function() {

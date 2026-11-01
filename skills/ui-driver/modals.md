@@ -2,7 +2,7 @@
 
 Catalog forms are flat, but **custom SP widgets** (and some record-producer flows) open **modals**. The component recipes (`select2.md`, `native-inputs.md`, `date-datetime-picker.md`) work **unchanged inside a modal** — a modal only changes **scoping, commit-button disambiguation, close detection, and multi-stage flow**.
 
-**Verified on** TWO live builds: **(A)** a custom SP widget (`/esc?id=<widget_id>`) — an add-sub-record flow with a two-stage **custom** modal; **(B)** a catalog record producer whose “add a row” dialog is the standard **MRVS (Multi-Row Variable Set) Bootstrap modal** (see §6). ⚠️ The two builds **contradict each other on every concrete selector** (container class, anchors, button gating, staging, early-record) — only the **meta-rules** (profile first, scope to the modal, disambiguate the commit button, field-based close detection, re-profile after commit) are portable. Treat the per-build details below as worked examples, not constants.
+**Verified on** two live builds: **(A)** a custom SP widget (`/esc?id=<widget_id>`) — an add-sub-record flow with a two-stage **custom** modal; **(B)** a catalog record producer whose “add a row” dialog is the standard **MRVS (Multi-Row Variable Set) Bootstrap modal** (see §6). ⚠️ The two builds **contradict each other on every concrete selector** (container class, anchors, button gating, staging, early-record) — only the **meta-rules** (profile first, scope to the modal, disambiguate the commit button, field-based close detection, re-profile after commit) are portable. Treat the per-build details below as worked examples, not constants.
 
 > Shared helpers (`ift`, `gp`, `sleep`) come from `select2.md` — reuse them.
 
@@ -21,16 +21,16 @@ The page underneath still has its own controls. Either prefix selectors with the
 
 The modal's **Save / Add / Submit** button is frequently a **different DOM node** than the page's primary button, and a bare `button.btn-primary` matches **both**. Separate them:
 
-- Verified live (build A): the page's primary button was `button.btn-primary.ng-scope`; the modal's save was `button.btn-primary` **without** `ng-scope` → `button.btn-primary:not(.ng-scope)` hit the modal one. ⚠️ **`:not(.ng-scope)` is NOT a portable disambiguator** — on build B (an MRVS flow) it matched **4 of 5** `btn-primary` buttons (the MRVS “Add” row buttons are also `btn-primary` without `ng-scope`). Prefer, in order: a **unique button id** (`#mrvs_save_button` vs `#submit-btn`), **scoping under the modal container** (`.modal-content button.btn-primary`), then a separating class found via `get_properties` → `classList`.
+- Verified live (build A): the page's primary button was `button.btn-primary.ng-scope`; the modal's save was `button.btn-primary` **without** `ng-scope` → `button.btn-primary:not(.ng-scope)` hit the modal one. ⚠️ **`:not(.ng-scope)` is not a portable disambiguator** — on build B (an MRVS flow) it matched **4 of 5** `btn-primary` buttons (the MRVS “Add” row buttons are also `btn-primary` without `ng-scope`). Prefer, in order: a **unique button id** (`#mrvs_save_button` vs `#submit-btn`), **scoping under the modal container** (`.modal-content button.btn-primary`), then a separating class found via `get_properties` → `classList`.
 - The modal button **may** be validity-gated for real — verified on build A: `ng-disabled="!formValid || isSubmitting || (isEditMode && !isFormDirty())"`, which flips enabled the moment the required field is valid. But on build B the MRVS save button was `ng-disabled="disableControls()"` — a **processing flag, enabled regardless of validity**. As always: **read the `ng-disabled` expression first** (`SKILL.md` golden rules) to decide whether the disabled state means anything.
 
-## 4. Commit, then wait for CLOSE via `selector_gone`
+## 4. Commit, then wait for close via `selector_gone`
 
 After clicking the commit button, `wait_for selector_gone` on a **modal-unique field** (e.g. `input[placeholder="First name"]`) — not the generic container, which may be reused by the next stage.
 
-## 5. ⚠️ Multi-stage: RE-PROFILE after every commit
+## 5. ⚠️ Multi-stage: re-profile after every commit
 
-A modal submit may **not** be the end. Verified (build A): submitting stage A (a short first stage, e.g. Email + a type select) **immediately created the backend record** AND **auto-opened stage B** (a details stage with more fields — e.g. names, a country-code select2 + native phone input, checkboxes, more select2s) with the stage-A fields now read-only. **The full field set was not knowable from stage A.** After each commit, re-profile (`SKILL.md` Standard loop step 5).
+A modal submit may **not** be the end. Verified (build A): submitting stage A (a short first stage, e.g. Email + a type select) **immediately created the backend record** and **auto-opened stage B** (a details stage with more fields — e.g. names, a country-code select2 + native phone input, checkboxes, more select2s) with the stage-A fields now read-only. **The full field set was not knowable from stage A.** After each commit, re-profile (`SKILL.md` Standard loop step 5).
 
 ⚠️ **Both halves of that pattern are build-specific.** Build B's MRVS modal was **single-stage** (full field set up front) and its commit was **client-side only** — it just added a row to the on-page grid and **no backend record existed** until the page-level Submit (`ORDERBYDESCsys_created_on` discovery right after a modal commit finds nothing on MRVS flows). Re-profiling after commit is still the rule — it's how you *learn* which build you're on.
 
@@ -63,7 +63,7 @@ await ift({action:"click", selector:"button.btn-primary:not(.ng-scope)"});
 - **`button.btn-primary` is ambiguous** — page vs modal vs MRVS “Add” buttons; prefer unique ids (`#mrvs_save_button`) or `.modal-content` scoping; `:not(.ng-scope)` worked on one build and matched 4/5 buttons on another.
 - **Multi-stage** — one submit can create the record and open the *next* modal (build A); re-profile every time.
 - **Close detection** — `wait_for selector_gone` on a modal-unique field, not a shared container (verified: `.modal-content` lingers count=1 after close).
-- **Early backend record is BUILD-SPECIFIC** — build A created it on stage-A submit (discover via a typed value + `ORDERBYDESCsys_created_on`); build B's MRVS commit created **nothing** until final page submit. Check the table via API before assuming either.
+- **Early backend record is build-specific** — build A created it on stage-A submit (discover via a typed value + `ORDERBYDESCsys_created_on`); build B's MRVS commit created **nothing** until final page submit. Check the table via API before assuming either.
 - **Conditionally-rendered page fields exist in the DOM with `visible:false`** before their trigger field is set (verified: Schedule start/end dates appeared — became visible — only after Location was committed). Test conditional rendering via `get_properties` → `.visible`, **not** `match_count`.
 
 ---

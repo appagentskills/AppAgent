@@ -165,7 +165,7 @@ function getChatContextTokens(chat) {
 // the chat is past 50% of the assumed context window (user-editable global
 // setting — getAssumedContextTokens, core/030-config.js). Three tiers:
 // >=50% warns (main: delegate to sub-agents; sub: wrap up + report_to_parent
-// suggesting a fresh successor); >=60% is the FINAL WARNING (the agent has
+// suggesting a fresh successor); >=60% is the final warning (the agent has
 // ignored the 50% tier — stop all work and report/wrap up IMMEDIATELY);
 // >=100% has NO hard stop here but maximum urgency (stop and report NOW) —
 // the only hard stop is the flag-gated SUB-AGENT one in
@@ -189,19 +189,19 @@ function appendContextNotice(chat, content) {
         // parent showed a red "Final report \u00b7 error" card. need_input is
         // the non-error status report_to_parent accepts (done|error|need_input)
         // and the one the saturation hard stop below already asks for.
-        var subStatus = ' Use status "need_input" (a context-limited partial result is NOT an error; reserve "error" for real failures) and say in the summary what is done and what is left.';
+        var subStatus = ' Use status "need_input" (a context-limited partial result is not an error; reserve "error" for real failures) and say in the summary what is done and what is left.';
         if (pct >= 100) {
             notice = isSub
-                ? '\u26d4 [CONTEXT EXCEEDED] Your context window is full (~' + pct + '%). STOP immediately and call report_to_parent NOW with everything you have, recommending a handoff to a fresh sub-agent for the remainder.' + subStatus
-                : '\u26d4 [CONTEXT EXCEEDED] Your context window is full (~' + pct + '%). Stop working now: give the user your conclusion/report immediately with what you have. Delegate anything unfinished to a sub-agent.';
+                ? '\u26d4 [Context full] Your context window is full (~' + pct + '%). Please stop now and call report_to_parent with everything you have, recommending a handoff to a fresh sub-agent for the remainder.' + subStatus
+                : '\u26d4 [Context full] Your context window is full (~' + pct + '%). Stop working now: give the user your conclusion/report immediately with what you have. Delegate anything unfinished to a sub-agent.';
         } else if (pct >= 60) {
             notice = isSub
-                ? '\u26d4 [CONTEXT \u2014 FINAL WARNING] You are past 60% of your context window (~' + pct + '%). You have ignored previous warnings. STOP all work NOW and call report_to_parent immediately with what you have; the parent must hand remaining work to a fresh sub-agent.' + subStatus
-                : '\u26d4 [CONTEXT \u2014 FINAL WARNING] You are past 60% of your context window (~' + pct + '%). You have ignored previous warnings. STOP taking on new work NOW: wrap up and give the user your conclusion this turn, and delegate anything unfinished to sub-agents (spawn_sub_agent).';
+                ? '\u26d4 [Context \u2014 final warning] You are past 60% of your context window (~' + pct + '%). Earlier notices already asked you to wrap up. Please stop all work now and call report_to_parent right away with what you have; the parent must hand remaining work to a fresh sub-agent.' + subStatus
+                : '\u26d4 [Context \u2014 final warning] You are past 60% of your context window (~' + pct + '%). Earlier notices already asked you to wrap up. Stop taking on new work now: wrap up and give the user your conclusion this turn, and delegate anything unfinished to sub-agents (spawn_sub_agent).';
         } else {
             notice = isSub
-                ? '\u26a0\ufe0f [CONTEXT] You are past 50% of your context window (~' + pct + '%). Stop taking on new work: wrap up your current step NOW and call report_to_parent with your findings so far, recommending the parent hand any remaining work to a fresh sub-agent.' + subStatus
-                : '\u26a0\ufe0f [CONTEXT] You are past 50% of your context window (~' + pct + '%). Model quality degrades from here. Delegate ALL remaining heavy or verbose work to sub-agents (spawn_sub_agent) and keep this thread lean \u2014 orchestrate, don\'t do.';
+                ? '\u26a0\ufe0f [Context] You are past 50% of your context window (~' + pct + '%). Stop taking on new work: wrap up your current step now and call report_to_parent with your findings so far, recommending the parent hand any remaining work to a fresh sub-agent.' + subStatus
+                : '\u26a0\ufe0f [Context] You are past 50% of your context window (~' + pct + '%). Model quality degrades from here. Delegate all remaining heavy or verbose work to sub-agents (spawn_sub_agent) and keep this thread lean \u2014 orchestrate, don\'t do.';
         }
         return appendNoticeToContent(content, notice, '_context_notice');
     } catch (_) { return content; }
@@ -245,7 +245,7 @@ function maybeSubSaturationHardStop(chat, streamingChatId) {
             chat.messages.push({
                 role: 'context',
                 _saturationHardStop: true,
-                content: '\u26d4 [MANDATORY \u2014 context ~' + _hsPct + '%: you are saturated. Write a short handover doc (document create, shared scope: what is done, what is left, exact next steps) and call report_to_parent NOW with status need_input. Do NO other work \u2014 if you have not reported within ' + _hsGrace + ' more turns the runtime will report on your behalf with your last message as the summary.]'
+                content: '\u26d4 [Required \u2014 context ~' + _hsPct + '%: you are saturated. Write a short handover doc (document create, shared scope: what is done, what is left, exact next steps) and call report_to_parent now with status need_input. Do no other work \u2014 if you have not reported within ' + _hsGrace + ' more turns the runtime will report on your behalf with your last message as the summary.]'
             });
             return 'injected';
         }
@@ -342,16 +342,16 @@ function getWidgetProgramReplayResult(chat, toolCallId, toolName) {
     var row = findPlaceholderRow(chat, toolCallId);
     if (toolName === 'widget_eval' || !row || !row._widgetEvalDispatched) return null;
     return JSON.stringify({ success: false, code: 'INDETERMINATE', outcome: 'indeterminate', replay_blocked: true,
-        error: 'This program dispatched a widget evaluation before interruption. It was NOT replayed; verify live state before a NEW call.' });
+        error: 'This program dispatched a widget evaluation before interruption. It was not replayed; verify live state before a new call.' });
 }
 
 function synthesizeNonReplayableResult(toolName) {
     return JSON.stringify({
         success: false,
-        error: '[' + toolName + ' was interrupted by an extension restart and was NOT re-executed'
+        error: '[' + toolName + ' was interrupted by an extension restart and was not re-executed'
             + ' (non-idempotent: re-running it would duplicate its side effects, e.g. spawn a'
             + ' second agent). If the action is still needed, check current state first'
-            + ' (e.g. agent_status for existing sub-agents) and only then issue a NEW call.]'
+            + ' (e.g. agent_status for existing sub-agents) and only then issue a new call.]'
     });
 }
 
@@ -418,7 +418,7 @@ function synthesizeIndeterminateMutationReplayResult(info) {
         outcome: 'indeterminate',
         tool: info.tool,
         method: info.method,
-        error: 'Prior ' + info.tool + ' ' + info.method + ' may have completed remotely, but the agent runtime restarted before its result became durable. The request was NOT automatically re-executed to avoid duplicate side effects.',
+        error: 'Prior ' + info.tool + ' ' + info.method + ' may have completed remotely, but the agent runtime restarted before its result became durable. The request was not automatically re-executed to avoid duplicate side effects.',
         next_action: 'Verify the remote state before deciding whether to issue a new request.'
     });
 }
@@ -1521,7 +1521,7 @@ async function runAgent(overrideChatId) {
             }
         }
 
-        // Progress-card nudge: update_action_state's WHEN TO CALL triggers ask for an
+        // Progress-card nudge: update_action_state's "When to call" triggers ask for an
         // update_action_state card once a run exceeds ~3 tool calls, but that
         // static system-prompt paragraph gets ignored on long runs (background
         // Action chats comply because startAction() injects an explicit "You
@@ -1575,7 +1575,7 @@ async function runAgent(overrideChatId) {
                 chat.messages.push({
                     role: 'context',
                     _progressNudge: true,
-                    content: '[Progress check: ' + _pnToolCalls + ' tool calls this turn and no update_action_state progress card yet. Per the WHEN TO CALL triggers in the update_action_state tool description, create one NOW — batch the update_action_state call ALONGSIDE your next tool call(s) in the same response (never spend a standalone response on it), passing the full tasks array with completed steps backfilled as done. If the work is finishing instead, include a final state:"done" update (with an output summary) together with your answer-card hook calls.]'
+                    content: '[Progress check: ' + _pnToolCalls + ' tool calls this turn and no update_action_state progress card yet. Per the "When to call" triggers in the update_action_state tool description, please create one now — batch the update_action_state call alongside your next tool call(s) in the same response (never spend a standalone response on it), passing the full tasks array with completed steps backfilled as done. If the work is finishing instead, include a final state:"done" update (with an output summary) together with your answer-card hook calls.]'
                 });
             }
         }

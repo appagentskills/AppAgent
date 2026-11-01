@@ -74,7 +74,7 @@ function _prMsgs() {
         { role: 'assistant', content: 'done' }];
 }
 function _skel(id, n) { return { id: id, _messagesEvicted: true, _payloadsEvicted: true, _msgCount: n }; }
-function _ticks() { return new Promise(function(r) { setTimeout(r, 0); }).then(function() { return new Promise(function(r) { setTimeout(r, 0); }); }); }
+function _ticks() { return freshTimeout(0).then(function() { return freshTimeout(0); }); }
 
 describe('C2-tools/020: skeleton-safe hook tools', function() {
     test('hydrated twin: set_tldr / set_links / set_caveat attach with no hydrate call', async function() {

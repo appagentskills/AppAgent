@@ -139,7 +139,7 @@
                      rendered by renderWorkersStrip() in 175-sub-agent-ui.js. -->
                 <div class="chat-actions-row" id="chat-actions-row"></div>
                 <div class="input-container">
-                    <textarea id="message-input" data-i18n-attr="aria-label" rows="1" placeholder="Send a message..." onkeydown="handleKeyDown(event)" oninput="autoResizeTextarea(this); updateContextIndicator();" aria-label="Message input"></textarea>
+                    <textarea id="message-input" data-i18n-attr="aria-label" rows="1" placeholder="Send a message..." onkeydown="handleKeyDown(event)" oninput="autoResizeTextarea(this)" aria-label="Message input"></textarea>
                     <div class="context-indicator" id="context-indicator" data-i18n-attr="aria-label" title="Summarize and start a new chat" onclick="summarizeAndStartNewChat()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();summarizeAndStartNewChat()}" style="cursor:pointer;" role="button" tabindex="0" aria-label="Summarize and start new chat">
                         <svg class="context-circle" viewBox="0 0 36 36">
                             <path class="context-bg" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"/>
@@ -151,8 +151,9 @@
                     <button id="retry-btn" data-i18n data-i18n-attr="aria-label" onclick="retryLastCall()" aria-label="Retry last action"><span class="btn-icon" id="retry-icon" aria-hidden="true"></span>Retry</button>
                     <button id="attach-btn" data-i18n-attr="title,aria-label" onclick="document.getElementById('image-file-input').click()" title="Attach file (image, PDF, CSV, text)" aria-label="Attach file"><span id="attach-icon" aria-hidden="true"></span></button>
                     <input type="file" id="image-file-input" accept="image/*,.pdf,application/pdf,.csv,.txt,.md,.json,.xml,.log,.yml,.yaml,text/*" multiple="multiple" style="display:none;" onchange="handleImageFileSelect(event)" />
-                    <button id="send-btn" data-i18n-attr="aria-label" onclick="sendMessage()" aria-label="Send message"><span id="send-icon" aria-hidden="true"></span></button>
+                    <button id="send-btn" disabled data-i18n-attr="aria-label,title" onclick="sendMessage()" aria-label="Send message"><span id="send-icon" aria-hidden="true"></span></button>
                 </div>
+                <div class="composer-draft-hint" id="message-draft-hint" aria-live="polite" hidden></div>
             </div>
         </main>
         <div class="skills-panel" id="skills-panel" style="display:none;">
@@ -292,7 +293,7 @@
                         <textarea id="home-message-input" rows="1" placeholder="Send a message..." onkeydown="handleHomeKeyDown(event)" oninput="autoResizeTextarea(this)" aria-label="Message input"></textarea>
                         <button id="home-attach-btn" onclick="document.getElementById('home-image-file-input').click()" title="Attach file (image, PDF, CSV, text)" aria-label="Attach file"><span class="btn-icon" id="home-attach-icon"></span></button>
                         <input type="file" id="home-image-file-input" accept="image/*,.pdf,application/pdf,.csv,.txt,.md,.json,.xml,.log,.yml,.yaml,text/*" multiple="multiple" style="display:none;" onchange="handleImageFileSelect(event)" />
-                        <button id="home-send-btn" onclick="sendHomeMessage()" aria-label="Send message"><span class="btn-icon" id="home-send-icon"></span></button>
+                        <button id="home-send-btn" disabled onclick="sendHomeMessage()" aria-label="Send message"><span class="btn-icon" id="home-send-icon"></span></button>
                     </div>
                     <div class="home-recent-prompts" id="home-recent-prompts"></div>
                 </div>

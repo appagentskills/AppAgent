@@ -597,6 +597,8 @@ chrome.runtime.onConnect.addListener(function(port) {
     });
     port.onDisconnect.addListener(function() {
         _unregisterPanel(port);
+        // Abort + revoke run_tests requested by this port (no one can receive the verdict).
+        try { if (typeof rtWorkerHostPortClosed === 'function') rtWorkerHostPortClosed(port); } catch (eRt) {}
     });
 });
 
@@ -1196,6 +1198,17 @@ function _handlePanelMessage(port, msg) {
                     if (_dmP && typeof _dmP.catch === 'function') _dmP.catch(function() {});
                 }
             } catch (eDm) {}
+            return;
+
+        case 'run-tests-exec':
+            // Page-path run_tests (Reload pre-check) delegated here so its sandbox
+            // frames run in the offscreen document, not throttled panel iframes.
+            if (typeof rtServeWorkerRequest === 'function') rtServeWorkerRequest(port, msg);
+            else { try { port.postMessage({ type: 'run-tests-result', requestId: msg.requestId, result: null }); } catch (eRt) {} }
+            return;
+
+        case 'run-tests-cancel':
+            if (typeof rtCancelWorkerRequest === 'function') rtCancelWorkerRequest(port, msg);
             return;
 
         case 'pull-debug-state':

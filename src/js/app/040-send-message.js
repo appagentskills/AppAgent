@@ -24,19 +24,7 @@ async function sendMessage() {
     // in has no active stream. Queueing in that case sends the message into the wrong chat.
     if (runningChatIds[currentChatId]) {
         // Build user message content with attachment labels (same as normal path)
-        var injImageCount = pendingImageAttachments.filter(function(a) { return !a.fileType || a.fileType === 'image'; }).length;
-        var injPdfCount = pendingImageAttachments.filter(function(a) { return a.fileType === 'pdf'; }).length;
-        var injFileCount = pendingImageAttachments.filter(function(a) { return a.fileType === 'file'; }).length;
-        var injDocCount = pendingImageAttachments.filter(function(a) { return a.fileType === 'document'; }).length;
-        var injAttachLabel = '';
-        if (injImageCount > 0 || injPdfCount > 0 || injFileCount > 0 || injDocCount > 0) {
-            var injParts = [];
-            if (injImageCount > 0) injParts.push(injImageCount + ' image(s)');
-            if (injPdfCount > 0) injParts.push(injPdfCount + ' PDF(s)');
-            if (injFileCount > 0) injParts.push(injFileCount + ' file(s)');
-            if (injDocCount > 0) injParts.push(injDocCount + ' document(s)');
-            injAttachLabel = '[User attached ' + injParts.join(' and ') + ']';
-        }
+        var injAttachLabel = buildAttachmentLabel(pendingImageAttachments);
         // Concatenate with any existing queued message for THIS chat — never overwrite.
         // Without this, sending a second message during the abort/restart window silently
         // dropped the first one (the per-chat entry was a flat replace).
@@ -65,8 +53,7 @@ async function sendMessage() {
         if (_newText) _nextEntry.hasUserText = true;
         pendingInjectionsByChatId[currentChatId] = _nextEntry;
         clearPendingImages();
-        input.value = '';
-        input.style.height = 'auto';
+        composerResetInput(input);
         // Clear the persisted draft too — mirrors the idle path below. Without
         // this, the draft saved by the input listener survives in chatPendingTexts
         // and the next restorePendingTextForContext (chat switch / reopen / boot)
@@ -281,11 +268,26 @@ async function sendMessage() {
         return;
     }
 
+    // Widget editing mode sends text only. Refuse attachments VISIBLY and keep
+    // the input + attachments intact, instead of leaving them silently behind.
+    // BEFORE the stale-injection clear below: a refused send must not drop a
+    // queued injection either (same rule as the skeleton guard, m4).
+    if (currentEditingWidget && pendingImageAttachments.length > 0) {
+        showSnackbar(t('Attachments are not supported while editing a widget. Remove them to send.'), 'warning');
+        return;
+    }
+
     // Clear any stale injection from a previous paused run — this new message
-    // supersedes it. m4: only AFTER the skeleton guard, so a refused send (or
-    // a chat switch mid-hydration) keeps the queued injection.
+    // supersedes it. m4: only AFTER the skeleton guard and the widget refusal,
+    // so a refused send (or a chat switch mid-hydration) keeps the queued
+    // injection.
     pendingInjection = null;
     pendingInjectionImages = null;
+
+    // Clear pending input since we're sending it. BEFORE the widget branch:
+    // a widget-mode send used to keep the sent text as a stale draft.
+    delete chatPendingTexts[getCurrentPendingContext()];
+    persistPendingTextsToStorage();
 
     // Check if we're in widget editing mode
     if (currentEditingWidget) {
@@ -296,24 +298,8 @@ async function sendMessage() {
     // Re-stick when the user sends a new message (single stick-to-bottom mechanism)
     stickToBottom = true;
 
-    // Clear pending input since we're sending it
-    delete chatPendingTexts[getCurrentPendingContext()];
-    persistPendingTextsToStorage();
-
     // Add user message (even if empty when attachments present, provide context)
-    var imageCount = pendingImageAttachments.filter(function(a) { return !a.fileType || a.fileType === 'image'; }).length;
-    var pdfCount = pendingImageAttachments.filter(function(a) { return a.fileType === 'pdf'; }).length;
-    var fileCount = pendingImageAttachments.filter(function(a) { return a.fileType === 'file'; }).length;
-    var docAttachments = pendingImageAttachments.filter(function(a) { return a.fileType === 'document'; });
-    var attachLabel = '';
-    if (imageCount > 0 || pdfCount > 0 || fileCount > 0 || docAttachments.length > 0) {
-        var parts = [];
-        if (imageCount > 0) parts.push(imageCount + ' image(s)');
-        if (pdfCount > 0) parts.push(pdfCount + ' PDF(s)');
-        if (fileCount > 0) parts.push(fileCount + ' file(s)');
-        if (docAttachments.length > 0) parts.push(docAttachments.length + ' document(s)');
-        attachLabel = '[User attached ' + parts.join(' and ') + ']';
-    }
+    var attachLabel = buildAttachmentLabel(pendingImageAttachments);
     var userMessageContent = message || attachLabel;
 
     // Inject placeholder results for any interrupted tool calls before adding user message
@@ -402,8 +388,9 @@ async function sendMessage() {
 
     renderMessages();
     renderChatList();
-    input.value = '';
-    input.style.height = 'auto';
+    composerResetInput(input);
+    // Keep typing flow after a Send click (Enter already keeps focus).
+    try { input.focus(); } catch (e) {}
     paused = false;
     // Clear the per-chat pause flag too — without this, runAgent's outer
     // `while (!isChatPaused(currentChatId))` gate trips immediately and the
@@ -449,8 +436,8 @@ async function sendWidgetMessage(message) {
     widget.conversation.push({ role: 'user', content: message });
     
     // Build widget context message for main agent
-    var widgetContext = '[WIDGET MODE] You are editing widget "' + widget.title + '" (ID: ' + widget.id + '). ' +
-        'First read html_widget action=read with widget_id="' + widget.id + '". Then save the SAME widget_id with expected_version from that read and a unique operation_id. Never create a second widget for this iteration. ' +
+    var widgetContext = '[Widget mode] You are editing widget "' + widget.title + '" (ID: ' + widget.id + '). ' +
+        'First read html_widget action=read with widget_id="' + widget.id + '". Then save the same widget_id with expected_version from that read and a unique operation_id. Never create a second widget for this iteration. ' +
         'Create a complete, self-contained HTML widget with styles and scripts. ' +
         'For ServiceNow API calls, use: await executeTool("servicenow_api", {method:"GET", table:"...", ...})\n\n' +
         'User request: ' + message;
@@ -458,8 +445,7 @@ async function sendWidgetMessage(message) {
     var chat = chats[currentChatId];
     chat.messages.push({ role: 'user', content: widgetContext, isWidgetRequest: true, widgetId: widget.id });
     
-    input.value = '';
-    input.style.height = 'auto';
+    composerResetInput(input);
     
     // Show widget as loading
     widget.isLoading = true;
@@ -503,13 +489,9 @@ async function sendWidgetMessage(message) {
     renderWidgetInChat(widget);
 }
 
+// Chat composer keydown — shared logic lives in ui/246-composer.js.
 function handleKeyDown(e) {
-    // Skip Enter while user is composing IME input (CJK languages send keyCode 229 / isComposing=true).
-    // Without this, pressing Enter to commit an IME candidate prematurely sends the message.
-    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
-        e.preventDefault();
-        sendMessage();
-    }
+    composerHandleKeyDown(e, 'chat');
 }
 
 // =============================================

@@ -932,20 +932,35 @@ describe('ui html_widget › fullscreen, pin and sidebar', function() {
     }, { tags: ['unit'] });
     function m2(x) { return x.m; }
 
-    test('pinned widget shows the filled pin state in fullscreen and sidebar', async function() {
+    // Real split-view button (core/082-split-view.js) injected into the WG scope,
+    // sharing its UI_ICONS / t / escapeHtml so the markup matches production.
+    async function withSplitView(x) {
+        var sc = x.m.__scope, stored = {};
+        var sv = await loadModules(['src/js/core/082-split-view.js'], { globals: {
+            currentChatId: 'c1', activeStreamingChatId: null, UI_ICONS: sc.UI_ICONS, t: sc.t, escapeHtml: sc.escapeHtml,
+            chrome: { storage: { local: { get: function(k, cb) { var o = {}; o[k] = stored[k]; cb(o); }, set: function(o, cb) { Object.assign(stored, o); if (cb) cb(); } },
+                onChanged: { addListener: function() {} } } },
+            resolveRootChatId: function(id) { return id; }, getWidgetById: function() { return null; }, console: console } });
+        sc.splitViewButtonHtml = sv.splitViewButtonHtml;
+        return sv;
+    }
+
+    test('pinned widget shows the filled pin state in fullscreen; sidebar row has no pin button', async function() {
         var x = await loadWidgets({ dashboard: { widget_a: { id: 'widget_a' } } });
         x.m.openWidgetFullscreen('widget_a');
         var pin = document.querySelector('#widget-fullscreen-overlay .widget-dashboard-btn');
         assert.ok(pin.classList.contains('on-dashboard')); assert.strictEqual(pin.title, 'Pinned \u2014 click to change');
         x.m.closeWidgetFullscreen();
+        await withSplitView(x);
         var dom = await U.mountDom({ html: '<div id="widget-sidebar-list"></div>' });
         x.m.renderWidgetSidebar();
-        var sp = dom.$('.widget-sidebar-btn.widget-dashboard-btn');
-        assert.ok(sp.classList.contains('on-dashboard')); assert.strictEqual(sp.title, 'Pinned \u2014 click to change');
+        assert.strictEqual(dom.$('.widget-sidebar-item .widget-dashboard-btn'), null, 'sidebar pin button replaced');
+        assert.ok(dom.$('.widget-sidebar-actions .widget-sidebar-btn.widget-split-btn'), 'split button present');
     }, { tags: ['unit'] });
 
     test('sidebar entry: empty state, escaped title, actions routing and stopPropagation', async function() {
         var x = await loadWidgets();
+        await withSplitView(x);
         var dom = await U.mountDom({ html: '<div id="widget-sidebar-list"></div>' });
         var saved = x.m.__scope.chats.c1.widgets; x.m.__scope.chats.c1.widgets = [];
         x.m.renderWidgetSidebar();
@@ -957,11 +972,13 @@ describe('ui html_widget › fullscreen, pin and sidebar', function() {
         assert.strictEqual(items[0].querySelector('.widget-sidebar-title').textContent, 'Sales <b>board</b>');
         assert.strictEqual(items[0].querySelector('.widget-sidebar-title b'), null);
         var btns = items[0].querySelectorAll('.widget-sidebar-actions button');
-        assert.deepStrictEqual(Array.prototype.map.call(btns, function(b) { return b.title; }), ['Open in new tab', 'Pin to dashboard\u2026', 'Fullscreen']);
+        assert.deepStrictEqual(Array.prototype.map.call(btns, function(b) { return b.title; }), ['Open in new tab', 'Split view', 'Fullscreen']);
+        assert.ok(btns[1].classList.contains('widget-split-btn') && !btns[1].classList.contains('is-active'));
+        assert.strictEqual(btns[1].getAttribute('data-widget-id'), 'widget_a');
         Array.prototype.forEach.call(btns, function(b) { assert.ok(U.a11y(b).hasName && b.querySelector('svg')); });
-        x.m.showWidgetPinMenu = U.recorder(); x.m.showWidgetInPanel = U.recorder(); x.m.openWidgetFullscreen = U.recorder(); x.m.scrollToWidget = U.recorder();
+        x.m.toggleWidgetSplitView = U.recorder(); x.m.showWidgetInPanel = U.recorder(); x.m.openWidgetFullscreen = U.recorder(); x.m.scrollToWidget = U.recorder();
         var r = U.fireInline(btns[1], 'click', x.m);
-        assert.strictEqual(x.m.showWidgetPinMenu.calls[0][0], 'widget_a'); assert.strictEqual(x.m.showWidgetPinMenu.calls[0][1], r.event);
+        assert.strictEqual(x.m.toggleWidgetSplitView.calls[0][0], 'widget_a'); assert.strictEqual(x.m.toggleWidgetSplitView.calls[0][1], r.event);
         assert.ok(U.fireInline(btns[0], 'click', x.m).stopped); assert.deepStrictEqual(x.m.showWidgetInPanel.calls[0], ['widget_a']);
         assert.ok(U.fireInline(btns[2], 'click', x.m).stopped); assert.deepStrictEqual(x.m.openWidgetFullscreen.calls[0], ['widget_a']);
         U.fireInline(items[0], 'click', x.m);

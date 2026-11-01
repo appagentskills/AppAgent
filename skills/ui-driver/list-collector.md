@@ -1,6 +1,6 @@
 # list-collector (glide_list) — select2 multi tag input
 
-⚠️ **Reality check:** On Service Portal / Employee Center (`/esc`) a "List Collector" (variable type **glide_list**) does **NOT** render as the classic slushbucket dual-list. There are **no Available/Selected panes and no →/← arrows** — those exist only in the platform back-end UI. On `/esc` it is a **select2 multi-select tag input**, same family as `select2.md`.
+⚠️ **Reality check:** On Service Portal / Employee Center (`/esc`) a "List Collector" (variable type **glide_list**) does **not** render as the classic slushbucket dual-list. There are **no Available/Selected panes and no →/← arrows** — those exist only in the platform back-end UI. On `/esc` it is a **select2 multi-select tag input**, same family as `select2.md`.
 
 **Verified on** a live Employee Center catalog item form (`/esc?id=sc_cat_item&sys_id=<item_sys_id>`) with a List Collector (`glide_list`) field.
 
@@ -41,9 +41,9 @@ async function addToListCollector(C, query){    // mechanically identical to add
 }
 ```
 
-- **Make `query` specific** so the wanted item is the **first** result — both `mouseup` and `Enter` commit the **highlighted top row**. Arrow-down first if you need a lower row. **The query matches the START of the reference's DISPLAY value (starts-with typeahead), not the back-end key** — a `sys_user` list finds "Abel Tuter" when you type the **leading** token ("Abel", "Abel Tut", or "System Administrator"), *not* the username "abel"/"admin", **and not a middle/last word**: typing the surname "Tuter" returns **No matches** (verified live). Always query from the **beginning** of the display name.
-- A one-shot `fill` may NOT trigger the async search — use `type` with a delay.
-- **Keep the query SHORT.** Per-character `type` over `iframe_tool` is slow (~28s measured for the 20-char "System Administrator"). Use the shortest uniquely-matching **leading** substring of the display name (e.g. "Abel" for "Abel Tuter" — **not** the surname "Tuter", which matches nothing under the starts-with typeahead) so your target is still the highlighted **top** row while minimizing typing time.
+- **Make `query` specific** so the wanted item is the **first** result — both `mouseup` and `Enter` commit the **highlighted top row**. Arrow-down first if you need a lower row. **The query matches the start of the reference's display value (starts-with typeahead), not the back-end key** — a `sys_user` list finds "Abel Tuter" when you type the **leading** token ("Abel", "Abel Tut", or "System Administrator"), *not* the username "abel"/"admin", **and not a middle/last word**: typing the surname "Tuter" returns **No matches** (verified live). Always query from the **beginning** of the display name.
+- A one-shot `fill` may not trigger the async search — use `type` with a delay.
+- **Keep the query short.** Per-character `type` over `iframe_tool` is slow (~28s measured for the 20-char "System Administrator"). Use the shortest uniquely-matching **leading** substring of the display name (e.g. "Abel" for "Abel Tuter" — **not** the surname "Tuter", which matches nothing under the starts-with typeahead) so your target is still the highlighted **top** row while minimizing typing time.
 
 ## Confirm / read / remove
 
@@ -55,10 +55,10 @@ async function addToListCollector(C, query){    // mechanically identical to add
 
 - **Not a slushbucket** — don't look for arrows / dual panes on `/esc`; they don't exist here.
 - **Type per-character** (`type`, delay ~50ms); one-shot `fill` may not fire the debounced server search.
-- **Cold first search CAN be slow — but it's variable, not guaranteed.** One verified run saw the first glide_list query sit in `#select2-drop li.select2-searching` ("Searching…") for **>8s**; a re-verification run on another instance saw the cold search resolve in **~0.3s** (the ~3.5s of per-char typing itself absorbed the server latency). Treat the **~15s poll as an upper bound, not an expectation**: keep waiting while `.select2-searching` is present; only fail fast on `.select2-no-results`. (The original 8s/40-iteration window timed out on a cold search and threw an opaque "list results never appeared".)
-- **A no-results search is ALSO slow to say so** — `.select2-no-results` took ~4–5s to render after typing (verified). Poll for it inside the same loop; don't assert "no results" immediately after typing. After a no-results search, dispatch `keydown` `Escape` on the select2 input to close the drop before driving chips or other fields.
+- **Cold first search can be slow — but it's variable, not guaranteed.** One verified run saw the first glide_list query sit in `#select2-drop li.select2-searching` ("Searching…") for **>8s**; a re-verification run on another instance saw the cold search resolve in **~0.3s** (the ~3.5s of per-char typing itself absorbed the server latency). Treat the **~15s poll as an upper bound, not an expectation**: keep waiting while `.select2-searching` is present; only fail fast on `.select2-no-results`. (The original 8s/40-iteration window timed out on a cold search and threw an opaque "list results never appeared".)
+- **A no-results search is also slow to say so** — `.select2-no-results` took ~4–5s to render after typing (verified). Poll for it inside the same loop; don't assert "no results" immediately after typing. After a no-results search, dispatch `keydown` `Escape` on the select2 input to close the drop before driving chips or other fields.
 - **Commit the highlighted top row** — make the query specific (or arrow-down first), or you add the wrong item.
-- **Starts-with typeahead — query the BEGINNING of the display name (verified live).** "Abel" → "Abel Tuter"; the surname "Tuter" → explicit **No matches**. The list matches the *start* of the display value, so leading tokens work and middle/last words don't (unless the instance is configured for contains-search). ⚠️ Earlier guidance here suggested a surname like "Tuter" — that was **wrong**; use a leading token like "Abel".
+- **Starts-with typeahead — query the beginning of the display name (verified live).** "Abel" → "Abel Tuter"; the surname "Tuter" → explicit **No matches**. The list matches the *start* of the display value, so leading tokens work and middle/last words don't (unless the instance is configured for contains-search). ⚠️ Earlier guidance here suggested a surname like "Tuter" — that was **wrong**; use a leading token like "Abel".
 - **Value is a hidden CSV text input**, not a `<select multiple>` — `select_option` does not apply.
 - **Autogen ids are unstable** (`s2id_autogen2`…) — always scope via `#s2id_sp_formfield_<varname>`.
 - **Validity:** on this widget `#submit-btn` is `ng-disabled="disableControls()"` (a processing flag) and stays enabled even when empty — **don't trust the button here**; read the hidden value / tag presence instead. (See the validity caveat in `SKILL.md`.)

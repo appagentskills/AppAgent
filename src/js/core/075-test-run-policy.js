@@ -192,7 +192,16 @@ var TestRunPolicy = (function() {
                     // Display-only progress: no authority, never settles the frame.
                     if (typeof config.onProgress === 'function') { try { config.onProgress(d); } catch (_) { /* display only */ } }
                 } else if (d.type === 'sandboxTestTimeout') {
-                    finish(new Error('Per-test timeout: aborted remaining tests and destroyed sandbox'));
+                    // Per-test timeout still revokes and destroys this exact frame
+                    // synchronously, but RESOLVES with the files completed so far
+                    // plus the timed-out file/test (same trust level as sandboxDone:
+                    // only this exact frame can send it). Consumers must treat it as
+                    // aborted; a legacy parser sees a length mismatch and fails closed.
+                    var cap = function(s) { return typeof s === 'string' ? s.slice(0, 500) : ''; };
+                    var partial = d.partial && typeof d.partial === 'object' && Array.isArray(d.partial.files) ? d.partial.files : [];
+                    // Sandbox guard denials recorded before the timeout are kept (never dropped).
+                    var partialDenied = d.partial && typeof d.partial === 'object' && Array.isArray(d.partial.denied_calls) ? d.partial.denied_calls : [];
+                    finish(null, { timed_out: { file: cap(d.file), test: cap(d.test) }, files: partial, aborted: true, denied_calls: partialDenied });
                 } else if (d.type === 'sandboxDone') {
                     // Even a forged early completion revokes and destroys this exact
                     // frame synchronously, before the result can be consumed.

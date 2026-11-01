@@ -19,7 +19,22 @@ function fakeDb() {
     var idb = { transaction: function() { return { objectStore: function(n) { return n === 'pending_wakes' ? wakes : sink; } }; } };
     return { data: data, openDatabase: function() { return Promise.resolve(idb); } };
 }
-async function flush() { for (var i = 0; i < 8; i++) await new Promise(function(r) { setTimeout(r, 0); }); }
+// Settle pending work WITHOUT real timers. The modules under test get a fake
+// setTimeout and the IDB fake resolves via microtasks, so no real timer is
+// ever needed. A chain of awaited setTimeout(0) calls (8 per flush, dozens
+// per test) is nested timer work: in the hidden test sandbox Chrome's
+// intensive throttling clamps chained timers to ~1/minute, which hung the
+// whole run at the 30s per-test abort. MessageChannel macrotasks are not
+// timer-throttled; fall back to microtasks where unavailable.
+function tick() {
+    return new Promise(function(r) {
+        if (typeof MessageChannel !== 'function') { Promise.resolve().then(r); return; }
+        var ch = new MessageChannel();
+        ch.port1.onmessage = function() { ch.port1.close(); r(); };
+        ch.port2.postMessage(0);
+    });
+}
+async function flush() { for (var i = 0; i < 8; i++) { await Promise.resolve(); await tick(); } }
 function count(rows, sub) { return rows.filter(function(r) { return r && r.role === 'user' && typeof r.content === 'string' && r.content.indexOf(sub) !== -1; }).length; }
 function mkEnv(shared) {
     shared = shared || {};

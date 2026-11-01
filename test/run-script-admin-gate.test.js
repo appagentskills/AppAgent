@@ -42,7 +42,7 @@ describe('servicenow_run_script admin gate', function() {
             function() { return jsonRes(403, {}); });
         var r = await f.m._rsCheckAdmin(URL, 'tok');
         assert.strictEqual(r.ok, false);
-        assert.ok(/HTTP 403/.test(r.error) && /NOT run/.test(r.error));
+        assert.ok(/HTTP 403/.test(r.error) && /not run/.test(r.error));
     });
     test('_liFetchDirectRoles queries inherited=false and dedupes', async function() {
         var f = await fixture([], function() { return jsonRes(200, { result: [{ 'role.name': 'admin' }, { 'role.name': 'itil' }, { 'role.name': 'admin' }] }); });

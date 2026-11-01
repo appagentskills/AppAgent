@@ -8,7 +8,8 @@
 // crushing the width to a few hundred pixels and making text unreadable.
 // New rule:
 //   - never upscale (scale <= 1)
-//   - cap width at maxWidth (default 1568 — Anthropic's vision long-edge limit)
+//   - cap width at maxWidth (default 1568; larger values give finer detail
+//     but cost more tokens)
 //   - when a downscale IS needed, resample ONCE at high quality via
 //     downscaleImageHighQuality (createImageBitmap resizeQuality:'high',
 //     Lanczos-class) — canvas drawImage bilinear was smearing small text
@@ -17,8 +18,9 @@
 //     SCREENSHOT_MIN_READABLE_WIDTH (1024, or the native width if smaller)
 //     even when the height allowance is exceeded — a somewhat-too-tall image
 //     beats an unreadable sliver.
-//   - hard 7900px long-edge clamp (Anthropic rejects >8000px) that WINS over
-//     the readability floor when they conflict.
+//   - hard 3000px long-edge clamp (SCREENSHOT_MAX_LONG_EDGE, the
+//     cross-provider safe cap) that WINS over the readability floor AND an
+//     explicit max_width.
 // fitScreenshotScale() and SCREENSHOT_MIN_READABLE_WIDTH are DEFINED in
 // tools/020-tool-execution.js (shared with resizeImageIfNeeded and bundled
 // into both the page and the SW/offscreen worker).
@@ -258,7 +260,10 @@ async function executeTakeScreenshot(args, options) {
     var target = args.target;
     var widgetId = args.widget_id;
     var selector = args.selector;
-    // 1568 = Anthropic vision long-edge limit. Captures arrive at full native
+    // Default 1568 (token-cheap). Larger max_width values give finer detail but
+    // cost more tokens. Whatever max_width is passed, fitScreenshotScale still
+    // clamps the long edge to SCREENSHOT_MAX_LONG_EDGE (3000px, the
+    // cross-provider safe cap). Captures arrive at full native
     // DPR (captureVisibleTab / html-to-image render at devicePixelRatio); when
     // a capture exceeds this cap it is downscaled ONCE at high quality via
     // downscaleImageHighQuality (createImageBitmap resizeQuality:'high') so
@@ -301,7 +306,8 @@ async function executeTakeScreenshot(args, options) {
 
             // Get actual image dimensions and resize if needed
             // captureVisibleTab captures at device pixel ratio, so a 1440px tab on 2x display = 2880px image
-            // Anthropic limits images to 2000px per dimension for many-image requests
+            // fitScreenshotScale caps the width at maxWidth and the long edge at
+            // SCREENSHOT_MAX_LONG_EDGE (3000px, the cross-provider safe cap)
             var ssImg = new Image();
             await new Promise(function(resolve, reject) { ssImg.onload = resolve; ssImg.onerror = reject; ssImg.src = ssBase64; });
             var ssWidth = ssImg.naturalWidth;
@@ -589,8 +595,11 @@ async function executeTakeScreenshot(args, options) {
                     if (args.grid) {
                         _wssBase64 = await overlayGrid(_wssBase64, _wssW, _wssH);
                     }
-                    // Compress if over 5MB API limit
-                    _wssBase64 = await compressBase64Image(_wssBase64);
+                    // Clamp the long edge to SCREENSHOT_MAX_LONG_EDGE (3000px, the
+                    // cross-provider safe cap; a 4K or DPR-2 tall widget capture can
+                    // exceed it) and compress over 4.5MB. Reported dimensions stay in
+                    // CSS px (grid coordinates), as before.
+                    _wssBase64 = (await resizeImageIfNeeded(_wssBase64)).base64;
                     captureDescription = 'widget ' + widgetId;
                     return {
                         success: true,
@@ -686,8 +695,10 @@ async function executeTakeScreenshot(args, options) {
             if (args.grid) {
                 cropBase64 = await overlayGrid(cropBase64, cropW, cropH);
             }
-            // Compress if over 5MB API limit
-            cropBase64 = await compressBase64Image(cropBase64);
+            // Clamp the long edge to SCREENSHOT_MAX_LONG_EDGE (3000px, the
+            // cross-provider safe cap) and compress over 4.5MB. Reported
+            // dimensions stay in CSS px (grid coordinates), as before.
+            cropBase64 = (await resizeImageIfNeeded(cropBase64)).base64;
             return {
                 success: true,
                 screenshot_id: elSsId,

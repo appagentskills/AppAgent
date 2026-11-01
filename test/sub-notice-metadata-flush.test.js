@@ -37,7 +37,7 @@ describe('sub-notice metadata (consumer side)', function() {
         var input = { value: 'hello', style: {} };
         var prev = { text: 'NOTICE', images: [], subNotices: [META] };
         var pend = { c1: prev };
-        var m = await loadModules(['src/js/app/040-send-message.js'], { lenient: true, globals: {
+        var m = await loadModules(['src/js/ui/246-composer.js', 'src/js/app/040-send-message.js'], { lenient: true, globals: {
             self: {}, window: fakeWindow(), chrome: fakeChrome(), console: _q,
             document: { getElementById: function(id) { return id === 'message-input' ? input : null; } },
             pendingImageAttachments: [], runningChatIds: { c1: true }, currentChatId: 'c1', pendingInjectionsByChatId: pend,

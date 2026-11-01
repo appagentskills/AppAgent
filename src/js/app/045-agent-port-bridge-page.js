@@ -362,7 +362,10 @@ function _openAgentBus() {
     _agentBusPort.onMessage.addListener(_handleAgentBusMessage);
     _hookLocalWorkspaceRelay();
     _agentBusPort.onDisconnect.addListener(function() {
+        var _lostBusPort = _agentBusPort;
         _agentBusPort = null;
+        // run_tests delegated to the SW over this port can never get a reply now: fail closed immediately.
+        try { if (typeof rtWorkerPortLost === 'function') rtWorkerPortLost(_lostBusPort); } catch (eRt) {}
         // RETRY-F2: an SW eviction disconnects the bus WITHOUT emitting a terminal
         // runFinished/runCrashed for in-flight chats, so the page-side runningChatIds
         // (and their _pendingRunAgents promises) are left stuck "running". The runAgent
@@ -1347,6 +1350,12 @@ function _handleAgentBusMessage(msg) {
             if (typeof _riResolveDebugState === 'function') _riResolveDebugState(msg);
             return;
 
+        case 'run-tests-progress':
+        case 'run-tests-result':
+            // Delegated run_tests (tools/160-run-tests.js rtRunViaWorker).
+            if (typeof rtHandleWorkerMessage === 'function') rtHandleWorkerMessage(msg);
+            return;
+
         case 'exec-tool':
             // Offscreen wants this panel to run a UI-required tool.
             // Use the existing executeTool (which is defined in
@@ -1414,7 +1423,7 @@ async function _handleExecToolFromOffscreen(msg) {
     // never permission to execute arbitrary widget code again.
     if (msg.name === 'widget_eval' && msg.widgetEvalRecoverOnly) {
         _postExecToolResult({ type: 'exec-tool-result', toolCallId: msg.toolCallId, result: { success: false, code: 'INDETERMINATE', outcome: 'indeterminate', replay_blocked: true,
-            error: 'Prior widget evaluation result is unavailable. NOT re-executed; verify state before a NEW call.' } });
+            error: 'Prior widget evaluation result is unavailable. It was not re-executed; verify state before a new call.' } });
         return;
     }
     _inflightToolCalls[msg.toolCallId] = {

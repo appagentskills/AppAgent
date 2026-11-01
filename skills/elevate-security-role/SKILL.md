@@ -107,7 +107,7 @@ await executeTool("servicenow_api", {
 ```
 
 ### ACL with Script (Scope Limitation!)
-**IMPORTANT**: If you're working in a scoped app and the table is in a different scope (e.g., Global), you **cannot** add scripts or conditions to ACLs via API. You'll get this error:
+**Important:** If you're working in a scoped app and the table is in a different scope (e.g., Global), you **cannot** add scripts or conditions to ACLs via API. You'll get this error:
 
 ```
 "Invalid 'Access Control' record even though the selected outside table is allowed. 

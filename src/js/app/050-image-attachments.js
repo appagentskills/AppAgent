@@ -15,11 +15,76 @@ function handleImageFileSelect(event) {
 }
 
 // S0B2-06: aggregate cap across one draft's pending attachments. The per-file
-// caps (10MB each) alone let several files together exceed the provider's
-// ~32MB request limit, which then failed at send time.
+// caps (10MB PDF/text, 4.5MB per image after resize + compression) alone let
+// several files together fail at send time.
+// One provider-neutral 30MB cap for every provider. Some provider APIs now
+// accept much larger requests, but the draft is posted page -> service worker
+// in ONE chrome.runtime port message ('send-message' in
+// app/040-send-message.js, alongside the chat snapshot) and Chrome caps a
+// runtime message at 64 MiB of JSON — and other providers' request limits are
+// lower anyway.
 var MAX_PENDING_ATTACHMENT_CHARS = 30 * 1024 * 1024;
+// Images are NOT capped on their raw file size: they are downscaled (never
+// upscaled) to the maximum accepted long edge, SCREENSHOT_MAX_LONG_EDGE
+// (3000px, the cross-provider safe cap in tools/020-tool-execution.js), and
+// compressed (compressBase64Image, same file) before they are attached. Larger
+// images cost more input tokens; the provider resamples on its side. The real,
+// provider-neutral limit is checked AFTER that step:
+//  - MAX_IMAGE_RAW_BYTES: sanity cap only, so a giant file cannot hang the
+//    FileReader/decode; well under Chrome's 64 MiB runtime-message limit.
+//  - MAX_IMAGE_ATTACHMENT_BYTES: the decoded size of the FINAL image, the same
+//    4.5MB default compressBase64Image targets (strictest per-image limit we
+//    route to, with margin).
+var MAX_IMAGE_RAW_BYTES = 50 * 1024 * 1024;
+var MAX_IMAGE_ATTACHMENT_BYTES = 4718592;
+// Below this much remaining draft budget, don't try to squeeze another image in.
+var MIN_IMAGE_FIT_BYTES = 150 * 1024;
+// Decoded byte size of a base64 data URL (or bare base64) without decoding it.
+function _dataUrlDecodedBytes(dataUrl) {
+    if (typeof dataUrl !== 'string') return 0;
+    var commaIdx = dataUrl.indexOf(',');
+    var b64 = commaIdx >= 0 ? dataUrl.substring(commaIdx + 1) : dataUrl;
+    var n = Math.floor(b64.length * 3 / 4);
+    if (b64.endsWith('==')) n -= 2;
+    else if (b64.endsWith('=')) n -= 1;
+    return Math.max(0, n);
+}
 function _attachmentChars(a) {
     return (a && typeof a.base64 === 'string' ? a.base64.length : 0) + (a && typeof a.content === 'string' ? a.content.length : 0);
+}
+
+function _isFittableImage(a) {
+    return !!a && !a.fileType && typeof a.base64 === 'string' && a.base64.indexOf('data:image/') === 0;
+}
+var _imageFitQueue = Promise.resolve();
+function _pendingListFor(contextKey) {
+    return getPendingImagesOwnerContext() === contextKey ? pendingImageAttachments : (chatPendingImages[contextKey] || []);
+}
+// Shrink every image of the draft to an equal share of the budget, then append.
+async function _rebalanceAndAppendImage(contextKey, attachment) {
+    var list = _pendingListFor(contextKey);
+    var images = [], otherChars = 0;
+    for (var i = 0; i < list.length; i++) {
+        if (_isFittableImage(list[i])) images.push(list[i]);
+        else otherChars += _attachmentChars(list[i]);
+    }
+    // base64 chars -> decoded bytes, minus slack for the data-URL header.
+    var shareChars = (MAX_PENDING_ATTACHMENT_CHARS - otherChars) / (images.length + 1);
+    var shareBytes = Math.min(MAX_IMAGE_ATTACHMENT_BYTES, Math.floor((shareChars - 64) * 3 / 4));
+    if (shareBytes < MIN_IMAGE_FIT_BYTES) throw new Error('no budget');
+    var changed = false;
+    for (var j = 0; j < images.length; j++) {
+        if (_dataUrlDecodedBytes(images[j].base64) > shareBytes) {
+            images[j].base64 = await compressBase64Image(images[j].base64, shareBytes);
+            changed = true;
+        }
+    }
+    var smaller = await compressBase64Image(attachment.base64, shareBytes);
+    if (changed) {
+        if (getPendingImagesOwnerContext() === contextKey) renderPendingImages();
+        if (typeof persistPendingImagesToSession === 'function') persistPendingImagesToSession();
+    }
+    appendPendingImageForContext(contextKey, Object.assign({}, attachment, { base64: smaller, _fitRetried: (attachment._fitRetried || 0) + 1 }));
 }
 
 // Complete an upload into its originating draft, not whichever composer is visible.
@@ -36,9 +101,26 @@ function appendPendingImageForContext(contextKey, attachment) {
     var total = _attachmentChars(attachment);
     for (var i = 0; i < list.length; i++) total += _attachmentChars(list[i]);
     if (total > MAX_PENDING_ATTACHMENT_CHARS) {
+        // Images: instead of skipping, rebalance. Every image in the draft
+        // (the new one included) is re-compressed to an equal share of the
+        // budget left after non-image attachments (compressBase64Image lowers
+        // JPEG quality, then dimensions). The old greedy approach (each image
+        // kept up to 4.5MB, only the newcomer squeezed into what was left)
+        // filled the draft after ~5 photos and skipped the rest of a batch.
+        // Rebalances run one at a time (_imageFitQueue): a multi-file batch
+        // completes concurrently and must not race on the same budget.
+        if (_isFittableImage(attachment) && (attachment._fitRetried || 0) < 3 && typeof compressBase64Image === 'function') {
+            _imageFitQueue = _imageFitQueue.then(function() {
+                return _rebalanceAndAppendImage(contextKey, attachment);
+            }).catch(function() {
+                if (typeof showSnackbar === 'function') showSnackbar(t('Attachment "{name}" skipped: attachments would exceed ~30 MB', { name: attachment.name || t('file') }), 'error');
+            });
+            return;
+        }
         if (typeof showSnackbar === 'function') showSnackbar(t('Attachment "{name}" skipped: attachments would exceed ~30 MB', { name: (attachment && attachment.name) || t('file') }), 'error');
         return;
     }
+    if (attachment && attachment._fitRetried) delete attachment._fitRetried;
     // Compare against the context that OWNS the live list, not the visible view:
     // on History/other panels getCurrentPendingContext() still names the last chat
     // even though the live list may be Home's draft.
@@ -134,9 +216,10 @@ function processImageFile(file) {
         return;
     }
 
-    // Limit file size to 10MB
-    if (file.size > 10 * 1024 * 1024) {
-        showSnackbar(t('Image too large (max 10MB)'), 'error');
+    // Raw sanity cap only (see MAX_IMAGE_RAW_BYTES): the real per-image limit
+    // is enforced after resize + compression below.
+    if (file.size > MAX_IMAGE_RAW_BYTES) {
+        showSnackbar(t('Image too large (max 50MB file; images are resized and compressed to under 4.5MB)'), 'error');
         return;
     }
 
@@ -144,8 +227,11 @@ function processImageFile(file) {
     reader.onload = function(e) {
         var img = new Image();
         img.onload = function() {
-            // Resize if too large (max 1200px on longest side for reasonable token usage)
-            var maxDim = 1200;
+            // Downscale only (never upscale) to the maximum accepted long edge:
+            // SCREENSHOT_MAX_LONG_EDGE (3000px, tools/020-tool-execution.js — the
+            // tools tier is concatenated before app/, so the global is defined).
+            // Same cap for every provider; larger images cost more tokens.
+            var maxDim = SCREENSHOT_MAX_LONG_EDGE;
             var width = img.width;
             var height = img.height;
 
@@ -171,8 +257,14 @@ function processImageFile(file) {
             canvas.height = 0;
             var name = file.name.replace(/\.[^.]+$/, '') || 'image';
 
-            // Compress if over 5MB API limit
-            compressBase64Image(base64).then(function(compressed) {
+            // Compress if over the 4.5MB per-image limit (a 3000px PNG can be
+            // well over it; compressBase64Image re-encodes it as JPEG), then
+            // check the FINAL size (compression gives up at a 640px width floor).
+            compressBase64Image(base64, MAX_IMAGE_ATTACHMENT_BYTES).then(function(compressed) {
+                if (_dataUrlDecodedBytes(compressed) > MAX_IMAGE_ATTACHMENT_BYTES) {
+                    showSnackbar(t('Image "{name}" is still over 4.5MB after compression', { name: file.name || name }), 'error');
+                    return;
+                }
                 appendPendingImageForContext(originContext, {
                     base64: compressed,
                     name: name,
@@ -199,8 +291,19 @@ function processImageFile(file) {
     reader.readAsDataURL(file);
 }
 
+// Paste is ours unless it targets a NON-composer editable element: other
+// inputs, textareas and contenteditable areas (settings, modals, widgets,
+// documents) keep their native paste. Non-editable targets (body, a focused
+// chip or button, a message bubble) still route images to the composer.
+function _isComposerPasteTarget(target) {
+    if (!target || target === document.body || target === document.documentElement || target === document) return true;
+    var ed = target.closest && target.closest('input,textarea,[contenteditable]:not([contenteditable="false"])');
+    return !ed || ed.id === 'message-input' || ed.id === 'home-message-input';
+}
+
 // Handle paste events for images and PDFs
 function handlePasteForImages(e) {
+    if (!_isComposerPasteTarget(e.target)) return;
     var items = e.clipboardData && e.clipboardData.items;
     if (!items) return;
 
@@ -219,6 +322,22 @@ function handlePasteForImages(e) {
     // But if ONLY file was pasted, prevent default
     if (hasFile && (!e.clipboardData.getData('text/plain'))) {
         e.preventDefault();
+    }
+
+    // Item 8: a very large text paste into a composer offers to attach it as
+    // a .txt file instead (ui/246 composerOfferPasteAsFile). Smaller pastes
+    // stay native. Also when the clipboard carries an image/PDF next to the
+    // text (e.g. copied from Office/a browser): the file is attached above and
+    // the large text still gets the offer instead of landing in the box.
+    if (typeof composerShouldOfferPasteAsFile === 'function') {
+        var ta = e.target && e.target.closest ? e.target.closest('textarea') : null;
+        if (ta && (ta.id === 'message-input' || ta.id === 'home-message-input')) {
+            var pasted = e.clipboardData.getData('text/plain');
+            if (composerShouldOfferPasteAsFile(pasted)) {
+                e.preventDefault();
+                composerOfferPasteAsFile(ta, pasted);
+            }
+        }
     }
 }
 
@@ -316,26 +435,26 @@ function renderPendingImages() {
     if (pendingImageAttachments.length > 0) {
         pendingImageAttachments.forEach(function(img, idx) {
             if (img.fileType === 'document') {
-                html += '<div class="pending-image-item pending-file-item" role="button" tabindex="0" data-kbd-click aria-label="' + escapeHtml(t('Open {title}', { title: img.name || '' })) + '" onclick="viewPendingImage(' + idx + ')">';
+                html += '<div class="pending-image-item pending-file-item" role="button" tabindex="0" data-kbd-click aria-label="' + escapeHtml(t('Open {title}', { title: img.name || '' })) + '" onclick="viewPendingImage(' + idx + ')" onkeydown="handlePendingChipKeydown(event, ' + idx + ')">';
                 html += '<div class="pending-file-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg><span class="pending-file-label">DOC</span></div>';
                 html += '<div class="pending-file-name">' + escapeHtml(img.name) + '</div>';
                 html += '<button class="pending-image-remove" onclick="event.stopPropagation();removePendingImage(' + idx + ')" title="' + removeLabel + '" aria-label="' + removeLabel + '">×</button>';
                 html += '</div>';
             } else if (img.fileType === 'pdf') {
-                html += '<div class="pending-image-item pending-pdf-item" role="button" tabindex="0" data-kbd-click aria-label="' + escapeHtml(t('Open {title}', { title: img.name || '' })) + '" onclick="viewPendingImage(' + idx + ')">';
+                html += '<div class="pending-image-item pending-pdf-item" role="button" tabindex="0" data-kbd-click aria-label="' + escapeHtml(t('Open {title}', { title: img.name || '' })) + '" onclick="viewPendingImage(' + idx + ')" onkeydown="handlePendingChipKeydown(event, ' + idx + ')">';
                 html += '<div class="pending-pdf-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg><span class="pending-pdf-label">PDF</span></div>';
                 html += '<div class="pending-pdf-name">' + escapeHtml(img.name) + '</div>';
                 html += '<button class="pending-image-remove" onclick="event.stopPropagation();removePendingImage(' + idx + ')" title="' + removeLabel + '" aria-label="' + removeLabel + '">×</button>';
                 html += '</div>';
             } else if (img.fileType === 'file') {
                 var fileExt = (img.name || '').split('.').pop().toUpperCase();
-                html += '<div class="pending-image-item pending-file-item" role="button" tabindex="0" data-kbd-click aria-label="' + escapeHtml(t('Open {title}', { title: img.name || '' })) + '" onclick="viewPendingImage(' + idx + ')">';
+                html += '<div class="pending-image-item pending-file-item" role="button" tabindex="0" data-kbd-click aria-label="' + escapeHtml(t('Open {title}', { title: img.name || '' })) + '" onclick="viewPendingImage(' + idx + ')" onkeydown="handlePendingChipKeydown(event, ' + idx + ')">';
                 html += '<div class="pending-file-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg><span class="pending-file-label">' + escapeHtml(fileExt) + '</span></div>';
                 html += '<div class="pending-file-name">' + escapeHtml(img.name) + '</div>';
                 html += '<button class="pending-image-remove" onclick="event.stopPropagation();removePendingImage(' + idx + ')" title="' + removeLabel + '" aria-label="' + removeLabel + '">×</button>';
                 html += '</div>';
             } else {
-                html += '<div class="pending-image-item" role="button" tabindex="0" data-kbd-click aria-label="' + escapeHtml(t('Open {title}', { title: img.name || '' })) + '" onclick="viewPendingImage(' + idx + ')">';
+                html += '<div class="pending-image-item" role="button" tabindex="0" data-kbd-click aria-label="' + escapeHtml(t('Open {title}', { title: img.name || '' })) + '" onclick="viewPendingImage(' + idx + ')" onkeydown="handlePendingChipKeydown(event, ' + idx + ')">';
                 html += '<img src="' + escapeHtml(img.base64) + '" alt="' + escapeHtml(img.name) + '" />';
                 html += '<button class="pending-image-remove" onclick="event.stopPropagation();removePendingImage(' + idx + ')" title="' + removeLabel + '" aria-label="' + removeLabel + '">×</button>';
                 html += '</div>';
@@ -371,12 +490,32 @@ function renderPendingImages() {
     // Update pending-draft indicators in sidebar
     updateHomePendingIndicator();
     renderChatList();
+    // Attachment added/removed/restored: Send may become (un)available.
+    if (typeof syncSendButton === 'function') syncSendButton();
 }
 
 // Remove a pending image by index
 function removePendingImage(index) {
     pendingImageAttachments.splice(index, 1);
     renderPendingImages();
+}
+
+// Delete/Backspace on a focused chip (or its × button) removes it, then keeps
+// keyboard focus in the tray: the chip now at this index, else the previous
+// one, else the composer.
+function handlePendingChipKeydown(e, index) {
+    if (e.key !== 'Delete' && e.key !== 'Backspace') return;
+    // A held key auto-repeats: remove only one chip per physical press.
+    if (e.repeat) { e.preventDefault(); return; }
+    e.preventDefault();
+    e.stopPropagation();
+    var container = e.currentTarget && e.currentTarget.parentNode;
+    removePendingImage(index);
+    var items = container ? container.querySelectorAll('.pending-image-item') : [];
+    var next = items.length ? items[Math.min(index, items.length - 1)] : null;
+    if (next) { next.focus(); return; }
+    var inp = document.getElementById(getCurrentPendingContext() === 'home' ? 'home-message-input' : 'message-input');
+    if (inp) inp.focus();
 }
 
 // View a pending image, PDF, or file in fullscreen modal

@@ -24,7 +24,7 @@ describe('documents page thumbnails + media viewer navigation', function() {
     function fe(name, size) { return { name: name, path: name, kind: 'file', size: size == null ? 100 : size }; }
     function row(name, size) { return { src: SRC, entry: fe(name, size) }; }
     function fakeFile(name, size, type) { return { name: name, size: size, type: type || '', slice: function() { return { arrayBuffer: async function() { return new ArrayBuffer(0); } }; } }; }
-    function tick() { return new Promise(function(r) { setTimeout(r, 0); }); }
+    function tick() { return freshTimeout(0); }
     function closeAll() { document.querySelectorAll('.wsf-overlay').forEach(function(o) { o._wsfClose ? o._wsfClose() : o.remove(); }); }
 
     test('image rows get a thumbnail host; other rows keep the plain icon', async function() {

@@ -17,7 +17,7 @@ describe('SW skills-refresh handler (worker/130-port-bridge.js)', function() {
             'return function(msg) { switch (msg.type) { ' + body + ' } };');
         return factory(loadSkillsFromStorage, loadActiveSkills, consoleStub);
     }
-    function flush() { return new Promise(function(r) { setTimeout(r, 0); }); }
+    function flush() { return freshTimeout(0); }
     function quietConsole(warns) { return { warn: function() { warns.push([].slice.call(arguments)); }, log: function() {}, error: function() {} }; }
 
     test('awaits loadSkillsFromStorage before loadActiveSkills', async function() {

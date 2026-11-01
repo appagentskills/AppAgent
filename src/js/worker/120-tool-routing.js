@@ -1706,7 +1706,7 @@ if (typeof requestProgrammaticToolApproval !== 'function') {
                     if (msg.status === 'allowed' || msg.status === 'session_allowed' || msg.status === 'always_allowed') {
                         return Object.assign({ allowed: true }, baseResult);
                     } else if (msg.status === 'denied') {
-                        return Object.assign({ allowed: false, error: displayName + ' was DENIED by user. STOP immediately — do NOT retry or work around this. Acknowledge the denial and ask the user how to proceed.' }, baseResult);
+                        return Object.assign({ allowed: false, error: displayName + ' was denied by the user. Stop this operation — don\'t retry it or work around it. Acknowledge the denial and ask the user how they\'d like to proceed.' }, baseResult);
                     }
                     break;
                 }
@@ -1829,10 +1829,10 @@ if (typeof requestProgrammaticToolApproval !== 'function') {
                     allowed: false,
                     expired: !!approved.expired,
                     reason: approved.expired ? 'approval_timeout' : 'approval_cancelled',
-                    error: displayName + ' approval request ' + (approved.expired ? 'expired' : 'was cancelled') + ' with no user response (' + (approved.cancelReason || 'no reason') + '). This is NOT a user denial — the user never saw the prompt; you may ask again / retry the call if it is still relevant.'
+                    error: displayName + ' approval request ' + (approved.expired ? 'expired' : 'was cancelled') + ' with no user response (' + (approved.cancelReason || 'no reason') + '). This is not a user denial — the user never saw the prompt; you may ask again / retry the call if it is still relevant.'
                 }, baseResult);
             }
-            return Object.assign({ allowed: false, error: displayName + ' was DENIED by user. STOP immediately — do NOT retry or work around this. Acknowledge the denial and ask the user how to proceed.' }, baseResult);
+            return Object.assign({ allowed: false, error: displayName + ' was denied by the user. Stop this operation — don\'t retry it or work around it. Acknowledge the denial and ask the user how they\'d like to proceed.' }, baseResult);
         } catch (e) {
             // RES-6: prompt aborted (panel disconnect etc.) — not a user verdict;
             // just release the pending-approval episode counter.

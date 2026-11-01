@@ -120,17 +120,17 @@ function buildSplitViewContext(chatId) {
     var rec = getSplitViewRecord(chatId);
     if (!rec) return '';
     if (rec.closed) {
-        return '\n\nSPLIT VIEW: CLOSED. The user closed the split widget pane' +
+        return '\n\nSplit view: closed. The user closed the split widget pane' +
             (rec.widgetId ? ' (it showed widget "' + (rec.title || rec.widgetId) + '", widget_id ' + rec.widgetId + ')' : '') +
             '. No widget is displayed in split view now; do not assume the user is looking at it. Reopen it with split_view only if the user asks or the work is interactive widget editing again.';
     }
     // No version here: WidgetStore is absent in the service worker (which
     // builds this row), so any version would be stale.
-    return '\n\nSPLIT VIEW — INTERACTIVE WIDGET EDITING: the chat screen is split and the widget "' + (rec.title || rec.widgetId) +
+    return '\n\nSplit view — interactive widget editing: the chat screen is split and the widget "' + (rec.title || rec.widgetId) +
         '" (widget_id: ' + rec.widgetId + '; latest version: see html_widget results) is displayed in the split pane next to the chat' +
         (rec.openedBy === 'user' ? ' (the user put it there with the Split view button)' : '') + '. ' +
         'The split view is meant for interactive editing of this displayed widget:\n' +
-        '- Keep working on THIS widget: every widget change the user asks for is an edit to it. Reuse widget_id ' + rec.widgetId +
+        '- Keep working on this widget: every widget change the user asks for is an edit to it. Reuse widget_id ' + rec.widgetId +
         ' — read it first (html_widget action=read) and save with expected_version — instead of creating a new inline widget. The pane refreshes automatically on every saved version.\n' +
         '- Only if the user clearly asks for a completely different widget, build that one; if that work is interactive too, pin it to the split pane with split_view action="replace" (its widget_id) instead of only rendering it inline.\n' +
         '- The user can close the pane at any time; you will be told when they do.';
@@ -143,11 +143,11 @@ function buildSplitViewContext(chatId) {
 // html_widget results and split_view status report the live version/hold.
 function buildSplitViewTailContext(chatId) {
     var rec = getSplitViewRecord(chatId);
-    if (!rec) return { sig: 'none', content: 'SPLIT VIEW: no widget is displayed in split view.' };
+    if (!rec) return { sig: 'none', content: 'Split view: no widget is displayed in split view.' };
     if (rec.closed) return { sig: 'closed|' + (rec.widgetId || ''), content: buildSplitViewContext(chatId).replace(/^\s+/, '') };
-    if (!rec.widgetId) return { sig: 'none', content: 'SPLIT VIEW: no widget is displayed in split view.' };
+    if (!rec.widgetId) return { sig: 'none', content: 'Split view: no widget is displayed in split view.' };
     var content = buildSplitViewContext(chatId).replace(/^\s+/, '');
-    content += '\n- While the user is typing in the pane, a saved update may be HELD behind a "New update" pill (split_view action=status reports pending_update).';
+    content += '\n- While the user is typing in the pane, a saved update may be held behind a "New update" pill (split_view action=status reports pending_update).';
     content += '\n- Prefer html_widget action="patch" with slots:{name: html} (elements marked data-slot="name") for small live updates: they apply in place without resetting the user\'s scroll/inputs.';
     return { sig: 'shown|' + rec.widgetId, content: content };
 }

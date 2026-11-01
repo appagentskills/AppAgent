@@ -66,7 +66,7 @@ If you ever need it: open via `#<varname> button.datepickericon`, popup is `.dat
 
 - **Blur is mandatory** — `fill` alone never commits (`updateOn:'blur'`). Always `dispatch_event blur` after.
 - **Strict 24-hour format** — locale/AM-PM rejected; model silently keeps the last valid value while the box shows your bad text. Verified: after a rejected string the hidden mirror **still holds the last committed value** (not empty) — a handy “model unchanged” assertion for negative tests; the `.sp-date-format-info` hint is readable via plain `get_properties` `textContent` (exact text seen: *“Date in format YYYY-MM-DD HH:mm:ss”*).
-- **`input.datepickerinput` is NOT field-specific** — multiple date fields on one form share it. Always scope within `#<varname>`.
+- **`input.datepickerinput` is not field-specific** — multiple date fields on one form share it. Always scope within `#<varname>`.
 - **Detect `has-error` safely** — `get_properties` on a no-match now returns `success:true` with `match_count:0` (it used to return `success:false` with **no** `match_count`, so the old `err.match_count === 0` read `undefined === 0` → **false** and falsely failed a valid commit). Treat "has error" as `err.match_count > 0`; the `gp` shim in `select2.md` still normalizes `match_count` for older builds.
 - **Page-load instability** — a page may briefly redirect or re-render on first load, and a parallel click can trigger a stray navigation. Re-navigate, `wait_for selector_visible: "#sp_formfield_<varname>"`, and interact **sequentially** (not parallel) with click actions.
 

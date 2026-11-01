@@ -744,6 +744,9 @@ async function init() {
         messageInput.value = chatPendingTexts[currentChatId];
         autoResizeTextarea(messageInput);
     }
+    // Paint the Send button state even when no draft was restored (empty
+    // composer → disabled), not only via autoResizeTextarea above.
+    if (typeof syncSendButton === 'function') syncSendButton();
 
     // Update context indicator after restoring input
     updateContextIndicator();

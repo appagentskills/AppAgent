@@ -184,7 +184,10 @@ function stubs() {
     };
 }
 
-async function flush() { await Promise.resolve(); await new Promise(function(r) { setTimeout(r, 0); }); }
+// Still a REAL setTimeout(0) (so source timers queued earlier fire first, as
+// some tests rely on), but scheduled from a fresh task via the harness
+// freshTimeout so repeated flushes never build a throttled nested-timer chain.
+async function flush() { await Promise.resolve(); await (typeof freshTimeout === 'function' ? freshTimeout(0) : new Promise(function(r) { setTimeout(r, 0); })); }
 
 module.exports = {
     WORKSPACE: UI_DEFAULT_WORKSPACE, DOM_PASSTHROUGH: UI_DOM_PASSTHROUGH,

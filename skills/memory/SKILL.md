@@ -24,7 +24,7 @@ Append a new entry when:
 - The solution is non-obvious or took investigation
 - It's something worth remembering for similar future tasks
 
-**Do NOT record a learning until the solution is confirmed working.**
+**Don't record a learning until the solution is confirmed working.**
 
 ### Entry Format
 

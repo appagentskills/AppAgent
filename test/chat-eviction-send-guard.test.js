@@ -52,6 +52,7 @@ async function _send(env) {
         + '    if (env.switchTo) currentChatId = env.switchTo;\n'
         + '    if (env.hydrate && !Array.isArray(chats[id].messages)) { chats[id].messages = (env.stored || []).slice(); delete chats[id]._messagesEvicted; }\n'
         + '}\n')
+        + _cutFns(await loadFile('src/js/ui/246-composer.js'), ['composerResetInput', 'buildAttachmentLabel']) + '\n'
         + _cutFns(src, ['sendMessage']) + '\n'
         + 'return sendMessage;';
     env.input = input; env.drafts = drafts;

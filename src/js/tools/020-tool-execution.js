@@ -47,11 +47,21 @@ async function _blobToBase64DataUrl(blob) {
 //   - allow height up to 2*maxWidth so tall pages keep full-width text
 //   - readability floor: never scale the width below
 //     SCREENSHOT_MIN_READABLE_WIDTH (1024, or an explicitly smaller maxWidth)
-//   - HARD CLAMP: the floor may leave the height unbounded, but the Anthropic
-//     API rejects images over 8000px on either edge — the clamp WINS over the
-//     floor when they conflict (a 948px-wide image beats an API rejection).
+//   - HARD CLAMP: the floor may leave the height unbounded, but providers
+//     reject oversized images — the clamp WINS over the floor when they
+//     conflict (a narrower image beats an API rejection).
+// SCREENSHOT_MAX_LONG_EDGE = 3000 (was 7900): the CROSS-PROVIDER SAFE CAP.
+// These tools are shared by every provider, so the cap is the most
+// conservative value that works everywhere:
+//   - Anthropic: 8000x8000px absolute max per image, but once a request holds
+//     more than 20 image/document blocks (screenshots in history count) each
+//     image must be <= 3000px on both dimensions — a 3000-7900px image that
+//     was fine early in a chat started failing past the 20th image.
+//   - OpenAI: images are downscaled server-side to fit 2048px anyway.
+// Providers resample large images on their side, so extra pixels past this
+// cap only cost bytes.
 var SCREENSHOT_MIN_READABLE_WIDTH = 1024;
-var SCREENSHOT_MAX_LONG_EDGE = 7900; // safety margin under the 8000px API hard limit
+var SCREENSHOT_MAX_LONG_EDGE = 3000; // cross-provider safe long-edge cap
 function fitScreenshotScale(w, h, maxWidth) {
     if (!w || !h) return 1;
     var maxHeight = maxWidth * 2;
@@ -76,7 +86,10 @@ function fitScreenshotScale(w, h, maxWidth) {
 // Re-encodes as JPEG with decreasing quality until under limit.
 // Returns the original base64 if already under limit.
 async function compressBase64Image(base64, maxBytes) {
-    maxBytes = maxBytes || 4718592; // 4.5MB default (safe margin under 5MB API limit)
+    // 4.5MB default: a provider-neutral margin under the strictest per-image
+    // byte limit we route to (5MB on some endpoints; others allow more). With the 3000px long-edge clamp
+    // (SCREENSHOT_MAX_LONG_EDGE) larger images are rare.
+    maxBytes = maxBytes || 4718592;
     var commaIdx = base64.indexOf(',');
     var b64Part = commaIdx >= 0 ? base64.substring(commaIdx + 1) : base64;
     var decodedSize = Math.floor(b64Part.length * 3 / 4);
@@ -144,9 +157,9 @@ async function compressBase64Image(base64, maxBytes) {
 // from crisper-than-reference to visibly smeared.
 // Downscale ONLY when strictly unavoidable, always with a single UNIFORM
 // scale (aspect ratio preserved) + high-quality smoothing:
-//   - long edge > SCREENSHOT_MAX_LONG_EDGE (7900px; the API hard-rejects
-//     images over 8000px on either edge)
-//   - payload over the ~5MB API limit -> compressBase64Image (JPEG quality
+//   - long edge > SCREENSHOT_MAX_LONG_EDGE (3000px, the cross-provider safe
+//     cap — see its definition above)
+//   - payload over 4.5MB -> compressBase64Image (JPEG quality
 //     ladder, then moderate dimension steps) — unchanged
 // An explicitly passed maxDim is still honored as a deliberate caller cap on
 // the LONG edge (no caller passes one today).
@@ -1200,7 +1213,7 @@ async function _rsCheckAdmin(instanceUrl, token, ctx) {
             method: 'GET', credentials: 'include',
             headers: { 'Accept': 'application/json', 'X-UserToken': token || '' }
         }, ctx, 30000);
-        if (!res.ok) return { ok: false, error: 'Admin-role check failed on ' + where + ' (HTTP ' + res.status + '); servicenow_run_script was NOT run. Use servicenow_api (Table API) instead.' };
+        if (!res.ok) return { ok: false, error: 'Admin-role check failed on ' + where + ' (HTTP ' + res.status + '); servicenow_run_script was not run. Use servicenow_api (Table API) instead.' };
         var data = await res.json();
         if (data && Array.isArray(data.result) && data.result.length) { _rsAdminOk[okKey] = true; return { ok: true }; }
         // No admin grant for gs.getUserID(): may be the `maint` login (no sys_user,
@@ -1215,7 +1228,7 @@ async function _rsCheckAdmin(instanceUrl, token, ctx) {
         }
         return { ok: false, error: denied };
     } catch (e) {
-        return { ok: false, error: 'Admin-role check failed on ' + where + ' (' + (e && e.message) + '); servicenow_run_script was NOT run. Use servicenow_api (Table API) instead.' };
+        return { ok: false, error: 'Admin-role check failed on ' + where + ' (' + (e && e.message) + '); servicenow_run_script was not run. Use servicenow_api (Table API) instead.' };
     }
 }
 
@@ -2137,7 +2150,8 @@ async function _executeToolInner(name, args, messageIndex, options) {
                             }
                         }
                     }
-                    // Resize if either dimension exceeds limit (Anthropic caps at 2000px for many-image requests)
+                    // Downscale only if the long edge exceeds SCREENSHOT_MAX_LONG_EDGE (3000px,
+                    // the cross-provider safe cap), then compress >4.5MB
                     var resized = await resizeImageIfNeeded(img.base64);
                     return {
                         role: 'screenshot',
@@ -3201,7 +3215,7 @@ async function wfFetchInTab(args, scripting, ghAuth) {
     if (r.binary || !wfIsTextContentType(r.content_type)) {
         return { success: false, binary: true, status: r.status, content_type: r.content_type, final_url: r.final_url, context: 'tab', tab_id: v.tabId, page_origin: r.page_origin,
             error: 'Response is binary (' + (r.content_type || 'unknown type') + '); tab_id (in-tab fetch) returns text bodies only.',
-            hint: 'Download it with web_fetch WITHOUT tab_id and with save_file:true (returns a file_id).' };
+            hint: 'Download it with web_fetch without tab_id and with save_file:true (returns a file_id).' };
     }
     var result = { success: true, status: r.status, content_type: r.content_type, final_url: r.final_url, context: 'tab', tab_id: v.tabId, world: v.world, page_origin: r.page_origin, cross_origin: crossOrigin };
     var isHtml = wfApplyTextBody(result, r.body, r.content_type);
@@ -3511,7 +3525,7 @@ function _wsCheckCrossChatConflict(file, chatId) {
             last_modified_ago: ago,
             last_modified_iso: when ? new Date(when).toISOString() : null,
             other_chat_running: false,
-            message: '\u26A0 This file has uncommitted changes with NO recorded owner, edited ' + (ago || 'just now') + ' \u2014 likely still in progress by an unknown agent. Pass {"force": true} to take over.' + WS_BRANCH_HINT
+            message: '\u26A0 This file has uncommitted changes with no recorded owner, edited ' + (ago || 'just now') + ' \u2014 likely still in progress by an unknown agent. Pass {"force": true} to take over.' + WS_BRANCH_HINT
         };
     }
     if (chatId && _wsSameChatLineage(lastChat, chatId)) return null;
@@ -3524,7 +3538,7 @@ function _wsCheckCrossChatConflict(file, chatId) {
     var hard = !!(stillRunning || recent);
     var headline;
     if (stillRunning) {
-        headline = '\u26A0 ANOTHER AGENT IS ACTIVELY RUNNING in chat "' + otherTitle + '" (' + lastChat + ')';
+        headline = '\u26A0 Another agent is actively running in chat "' + otherTitle + '" (' + lastChat + ')';
         if (ago) headline += ' \u2014 last edited ' + ago;
         headline += '. Coordinate with the other chat, or pass {"force": true} to override and clobber their work.' + WS_BRANCH_HINT;
     } else if (recent) {
@@ -3648,7 +3662,7 @@ function _wsForeignOwnership(f, chatId) {
     var ago = _wsFormatAgo(f.last_modified_at);
     var who = f.last_modified_by_chat_title ? ' "' + f.last_modified_by_chat_title + '"' : '';
     var msg = running
-        ? '\u26a0 WORK IN PROGRESS by another agent \u2014 chat' + who + ' (' + f.last_modified_by_chat_id + ') is STILL RUNNING and has uncommitted edits to this file' + (ago ? ' (' + ago + ')' : '') + '. Leave it alone: mutations are blocked unless you pass {"force": true}.'
+        ? '\u26a0 Work in progress by another agent \u2014 chat' + who + ' (' + f.last_modified_by_chat_id + ') is still running and has uncommitted edits to this file' + (ago ? ' (' + ago + ')' : '') + '. Leave it alone: mutations are blocked unless you pass {"force": true}.'
         : recent
         ? '\u26a0 RECENTLY EDITED ' + (ago || 'just now') + ' by another chat' + who + ' (' + f.last_modified_by_chat_id + ') \u2014 likely still in progress; mutations are blocked unless you pass {"force": true}.'
         : 'Uncommitted changes by another (now dormant) chat' + who + ' (' + f.last_modified_by_chat_id + ')' + (ago ? ' \u2014 last edited ' + ago : '') + '. Mutating this file will silently take over ownership.';
@@ -4681,7 +4695,7 @@ async function wsDiscard(wk, filePath, chatId, chatTitle, force, opts) {
             if (opts && opts.remoteCheck && f.sha) {
                 var _dRt = await _dGetRemoteTree();
                 if (!_dRt) {
-                    if (filePath) return { success: false, unverified: true, path: f.path, error: "Discard refused — couldn't verify remote (GitHub API error or truncated tree), so the possibly-stale base was NOT restored — " + _dHint + ': ' + f.path };
+                    if (filePath) return { success: false, unverified: true, path: f.path, error: "Discard refused — couldn't verify remote (GitHub API error or truncated tree), so the possibly-stale base was not restored — " + _dHint + ': ' + f.path };
                     _dUnverified.push(f.path);
                     continue;
                 }
@@ -4703,7 +4717,7 @@ async function wsDiscard(wk, filePath, chatId, chatTitle, force, opts) {
                     continue;
                 }
                 if (!_dRs) {
-                    if (filePath) return { success: false, remote_deleted: true, path: f.path, error: 'Discard refused — ' + f.path + ' no longer exists on the remote branch (deleted upstream), so its stale base was NOT restored. To drop your local copy use workspace delete on it; to keep your edits, leave it (sync reports it as a remote_deleted conflict).' };
+                    if (filePath) return { success: false, remote_deleted: true, path: f.path, error: 'Discard refused — ' + f.path + ' no longer exists on the remote branch (deleted upstream), so its stale base was not restored. To drop your local copy use workspace delete on it; to keep your edits, leave it (sync reports it as a remote_deleted conflict).' };
                     _dRemoteDeleted.push(f.path);
                     continue;
                 }
@@ -4714,7 +4728,7 @@ async function wsDiscard(wk, filePath, chatId, chatTitle, force, opts) {
                         _dRestore = _wsDecodeBlobBody(_dBlob.body);
                         _dNewSha = _dRs;
                     } else {
-                        var _dAheadMsg = 'remote ahead: ' + f.path + ' changed on the remote (' + String(_dRs).slice(0, 7) + ') and its content could not be fetched, so the stale local base was NOT restored — ' + _dHint + '.';
+                        var _dAheadMsg = 'remote ahead: ' + f.path + ' changed on the remote (' + String(_dRs).slice(0, 7) + ') and its content could not be fetched, so the stale local base was not restored — ' + _dHint + '.';
                         if (filePath) return { success: false, remote_ahead: true, path: f.path, error: 'Discard refused — ' + _dAheadMsg };
                         _dRemoteAhead.push(f.path);
                         continue;
@@ -4748,15 +4762,15 @@ async function wsDiscard(wk, filePath, chatId, chatTitle, force, opts) {
     var resp = { success: true, message: 'Discarded changes to ' + discarded.length + ' file(s)', discarded: discarded.length, files: discarded };
     if (_dRemoteAhead.length > 0) {
         resp.remote_ahead = _dRemoteAhead;
-        resp.message += ' (' + _dRemoteAhead.length + ' file(s) NOT discarded — remote ahead, ' + _dHint + ': ' + _dRemoteAhead.join(', ') + ')';
+        resp.message += ' (' + _dRemoteAhead.length + ' file(s) not discarded — remote ahead, ' + _dHint + ': ' + _dRemoteAhead.join(', ') + ')';
     }
     if (_dUnverified.length > 0) {
         resp.unverified = _dUnverified;
-        resp.message += ' (' + _dUnverified.length + " file(s) NOT discarded — couldn't verify remote, " + _dHint + ': ' + _dUnverified.join(', ') + ')';
+        resp.message += ' (' + _dUnverified.length + " file(s) not discarded — couldn't verify remote, " + _dHint + ': ' + _dUnverified.join(', ') + ')';
     }
     if (_dRemoteDeleted.length > 0) {
         resp.remote_deleted = _dRemoteDeleted;
-        resp.message += ' (' + _dRemoteDeleted.length + ' file(s) NOT discarded — no longer on the remote (use workspace delete to drop them): ' + _dRemoteDeleted.join(', ') + ')';
+        resp.message += ' (' + _dRemoteDeleted.length + ' file(s) not discarded — no longer on the remote (use workspace delete to drop them): ' + _dRemoteDeleted.join(', ') + ')';
     }
     if (_dRaced.length > 0) {
         resp.changed_concurrently = _dRaced;
@@ -4968,8 +4982,8 @@ async function wsBranch(wk, newBranch, moveDirty, chatId, chatTitle, force) {
     }
     if (_keptOnSource.length > 0) {
         res.changed_during_fork = _keptOnSource;
-        res.warning = _keptOnSource.length + ' file(s) changed in the source while forking and were NOT discarded there (the fork holds the earlier version): ' + _keptOnSource.join(', ') + '.';
-        res.message += ' WARNING: ' + res.warning;
+        res.warning = _keptOnSource.length + ' file(s) changed in the source while forking and were not discarded there (the fork holds the earlier version): ' + _keptOnSource.join(', ') + '.';
+        res.message += ' Warning: ' + res.warning;
     }
     return res;
 }
@@ -5185,15 +5199,15 @@ async function wsMove(wk, targetWk, paths, force, chatId, chatTitle, internalAut
     }
     if (changedDuringMove.length > 0) {
         result.changed_during_move = changedDuringMove;
-        var _cdw = changedDuringMove.length + ' source file(s) changed while moving and were NOT discarded from the source (it keeps the newer edit; the target may hold the earlier version): ' + changedDuringMove.join(', ') + '.';
+        var _cdw = changedDuringMove.length + ' source file(s) changed while moving and were not discarded from the source (it keeps the newer edit; the target may hold the earlier version): ' + changedDuringMove.join(', ') + '.';
         result.warning = (result.warning ? result.warning + ' ' : '') + _cdw;
-        result.message += ' WARNING: ' + _cdw;
+        result.message += ' Warning: ' + _cdw;
     }
     if (targetChanged.length > 0) {
         result.target_changed = targetChanged;
-        var _tcw = targetChanged.length + ' target file(s) changed concurrently and were NOT overwritten (source left as is): ' + targetChanged.join(', ') + '.';
+        var _tcw = targetChanged.length + ' target file(s) changed concurrently and were not overwritten (source left as is): ' + targetChanged.join(', ') + '.';
         result.warning = (result.warning ? result.warning + ' ' : '') + _tcw;
-        result.message += ' WARNING: ' + _tcw;
+        result.message += ' Warning: ' + _tcw;
     }
     return result;
 }
@@ -5508,7 +5522,7 @@ async function wsStatus(wk, includeIgnored, chatId, includePrs) {
                 else if (_fOwn.recently_modified) foreignRecentCount++;
                 foreignCount++;
             } else {
-                entry.message = 'Work in progress by THIS agent (chat/agent ' + f.last_modified_by_chat_id + ')' + _wAgo + ' \u2014 uncommitted local changes, not yet pushed.';
+                entry.message = 'Work in progress by this agent (chat/agent ' + f.last_modified_by_chat_id + ')' + _wAgo + ' \u2014 uncommitted local changes, not yet pushed.';
             }
         } else {
             entry.message = 'Work in progress \u2014 uncommitted local changes (the editing agent was not recorded for this file).';
@@ -5752,7 +5766,7 @@ async function wsDiff(repo, filePath, includeIgnored, chatId) {
     if (_dForeign.length > 0) {
         var _dRunning = _dForeign.filter(function(d) { return d.other_chat_running; }).length;
         result.foreign_warning = _dRunning > 0
-            ? '\u26a0 ' + _dRunning + ' of ' + _dForeign.length + ' diffed file(s) have uncommitted changes from another chat that is STILL RUNNING \u2014 do not mutate them (blocked unless {"force": true}).'
+            ? '\u26a0 ' + _dRunning + ' of ' + _dForeign.length + ' diffed file(s) have uncommitted changes from another chat that is still running \u2014 do not mutate them (blocked unless {"force": true}).'
             : _dForeign.length + ' diffed file(s) have uncommitted changes from other (now dormant) chats \u2014 mutating them silently takes over ownership.';
     }
     if (_syncErr) result.sync_warning = 'Remote sync failed — diffs may be against stale base';
@@ -5976,7 +5990,7 @@ async function wsMaybeAutoDeleteMerged(wk, meta) {
         try { gcWorkspaceBlobs(); } catch (e) {}
         try { AgentEvents.emit('workspaceMutated', { action: 'auto_delete_merged', repo: wk, branch: branch, base: baseBranch, base_workspace: baseWk, pr: mergedPr.number, moved_dirty: movedDirty, pin_flipped: pinFlipped, synced: baseSynced }); } catch (e) {}
         var delResult = { deleted: true, workspace: wk, branch: branch, base_branch: baseBranch, base_workspace: baseWk, pr_number: mergedPr.number, pr_url: mergedPr.html_url, moved_dirty: movedDirty, pin_flipped: pinFlipped, synced: baseSynced };
-        if (!baseSynced) delResult.sync_warning = 'The base workspace "' + baseWk + '" could not be fully synced with the remote — pull it before building (the pin was NOT flipped onto it).';
+        if (!baseSynced) delResult.sync_warning = 'The base workspace "' + baseWk + '" could not be fully synced with the remote — pull it before building (the pin was not flipped onto it).';
         return delResult;
     } catch (e) {
         return null;
@@ -6143,7 +6157,7 @@ async function _wsDeleteWorkspaceGuarded(wk, chatId, force) {
     if (scan.hardConflicts.length) return _wsDeleteConflictError(wk, scan.hardConflicts);
     if (scan.dirtyPaths.length && !force) {
         return { success: false, dirty: scan.dirtyPaths,
-            error: 'Workspace ' + wk + ' was NOT deleted: ' + scan.dirtyPaths.length + ' file(s) became dirty during the delete: ' + scan.dirtyPaths.join(', ') + '. Pass force:true to discard them.' };
+            error: 'Workspace ' + wk + ' was not deleted: ' + scan.dirtyPaths.length + ' file(s) became dirty during the delete: ' + scan.dirtyPaths.join(', ') + '. Pass force:true to discard them.' };
     }
     var dirtyPaths = scan.dirtyPaths;
     // Collect file-store registrations BEFORE the rows are gone.
@@ -6174,7 +6188,7 @@ async function _wsDeleteWorkspaceGuarded(wk, chatId, force) {
             return _wsDeleteConflictError(wk, late.map(function(p) { return { path: p, chat: Object.prototype.hasOwnProperty.call(txOwners, p) ? txOwners[p] : null }; }));
         }
         return { success: false, dirty: late,
-            error: 'Workspace ' + wk + ' was NOT deleted: ' + late.length + ' file(s) became dirty during the delete: ' + late.join(', ') + '. Pass force:true to discard them.' };
+            error: 'Workspace ' + wk + ' was not deleted: ' + late.length + ' file(s) became dirty during the delete: ' + late.join(', ') + '. Pass force:true to discard them.' };
     }
     try { gcWorkspaceBlobs(); } catch (e) {}
     if (typeof unregisterFile === 'function') {
@@ -7233,7 +7247,7 @@ async function wsPush(wk, args, chatId, chatTitle) {
     // itself, and any push whose PR base would DEFAULT to the dead branch.
     if (syncResult.branchGone && !_lazyFork) {
         if (args.branch_name === meta.branch) {
-            return { success: false, error: 'The cloned branch "' + meta.branch + '" no longer exists on the remote (deleted after its PR merged?). Re-clone the repo, or push to a NEW branch_name.' };
+            return { success: false, error: 'The cloned branch "' + meta.branch + '" no longer exists on the remote (deleted after its PR merged?). Re-clone the repo, or push to a new branch_name.' };
         }
         // Without an explicit override the PR base DEFAULTS to the dead cloned
         // branch (meta.source_branch is never assigned), so the push is doomed
@@ -7271,7 +7285,7 @@ async function wsPush(wk, args, chatId, chatTitle) {
         var _openPrCheck = await githubApi('GET', '/repos/' + githubRepo + '/pulls?state=open&head=' + encodeURIComponent(_ownerForCheck + ':' + args.branch_name));
         var _hasOpenPrForBranch = !!(_openPrCheck && _openPrCheck.ok && Array.isArray(_openPrCheck.body) && _openPrCheck.body.length > 0);
         if (!_hasOpenPrForBranch) {
-            return { success: false, error: 'branch_name "' + args.branch_name + '" is the same as the base branch "' + baseBranch + '" and has no open PR to append to. To open a NEW PR, choose a different branch_name (a PR cannot be opened from a branch onto itself).' };
+            return { success: false, error: 'branch_name "' + args.branch_name + '" is the same as the base branch "' + baseBranch + '" and has no open PR to append to. To open a new PR, choose a different branch_name (a PR cannot be opened from a branch onto itself).' };
         }
         // An open PR exists for this branch → valid append. Fall through: the
         // branch-exists / PR-reuse logic below fast-forwards it and reuses the PR.
@@ -7423,9 +7437,9 @@ async function wsPush(wk, args, chatId, chatTitle) {
             // expected an append onto a live PR — never silently default the
             // title and proceed with the reset; hard-fail BEFORE any remote
             // mutation so the agent confirms the intent by passing pr_title.
-            return { success: false, error: 'branch "' + args.branch_name + '" exists remotely but has no open PR (its previous PR was merged or closed); pushing would force-reset it onto the current "' + baseBranch + '" head and open a NEW PR. Pass pr_title (and confirm you intend to reset it) to recreate, or pick a new branch_name. Nothing was pushed.' };
+            return { success: false, error: 'branch "' + args.branch_name + '" exists remotely but has no open PR (its previous PR was merged or closed); pushing would force-reset it onto the current "' + baseBranch + '" head and open a new PR. Pass pr_title (and confirm you intend to reset it) to recreate, or pick a new branch_name. Nothing was pushed.' };
         } else {
-            return { success: false, error: 'pr_title is required: no open PR exists for branch "' + args.branch_name + '" to append to (' + (branchExists ? 'the branch exists but its PR was merged/closed' : 'the branch does not exist yet') + '), so this push opens a NEW PR.' };
+            return { success: false, error: 'pr_title is required: no open PR exists for branch "' + args.branch_name + '" to append to (' + (branchExists ? 'the branch exists but its PR was merged/closed' : 'the branch does not exist yet') + '), so this push opens a new PR.' };
         }
     }
 
@@ -7753,7 +7767,7 @@ async function wsPush(wk, args, chatId, chatTitle) {
                     message: '\u26a0 "' + f.path + '" was committed to PR #' + prNumber + ' but its uncommitted changes belong to ANOTHER chat "' + (entry.last_modified_by_chat_title || '(untitled chat)') + '" (' + entry.last_modified_by_chat_id + ')' + (entry.last_modified_ago ? ' \u2014 last edited ' + entry.last_modified_ago : '') + '. If that was unintended, revert it with a follow-up commit and scope future pushes with files:[...].'
                 });
             } else {
-                entry.message = 'Edited by THIS chat (chat/agent ' + f.last_modified_by_chat_id + ')' + (entry.last_modified_ago ? ' (' + entry.last_modified_ago + ')' : '') + '.';
+                entry.message = 'Edited by this chat (chat/agent ' + f.last_modified_by_chat_id + ')' + (entry.last_modified_ago ? ' (' + entry.last_modified_ago + ')' : '') + '.';
             }
         } else if (f.pushed_pr) {
             entry.message = 'No ownership stamp \u2014 released by an earlier push to PR #' + f.pushed_pr.number + (f.pushed_pr.chatId ? ' by chat ' + f.pushed_pr.chatId : '') + '.';
@@ -7770,7 +7784,7 @@ async function wsPush(wk, args, chatId, chatTitle) {
                 other_pr_branch: _prevPr.branch || null,
                 other_pr_url: _prevPr.url || null,
                 other_pr_chat_id: _prevPr.chatId || null,
-                message: '\u26a0 "' + f.path + '" already belongs to a DIFFERENT PR #' + _prevPr.number + ' (branch "' + _prevPr.branch + '"' + (_prevPr.chatId ? ', pushed by chat ' + _prevPr.chatId : '') + ') \u2014 its changes were now ALSO committed to PR #' + prNumber + '. If that was unintended, revert it here with a follow-up commit and let PR #' + _prevPr.number + ' carry it.'
+                message: '\u26a0 "' + f.path + '" already belongs to a different PR #' + _prevPr.number + ' (branch "' + _prevPr.branch + '"' + (_prevPr.chatId ? ', pushed by chat ' + _prevPr.chatId : '') + ') \u2014 its changes were now also committed to PR #' + prNumber + '. If that was unintended, revert it here with a follow-up commit and let PR #' + _prevPr.number + ' carry it.'
             });
         }
         return entry;
@@ -7980,10 +7994,10 @@ async function wsPush(wk, args, chatId, chatTitle) {
             : ('Opened PR #' + prNumber + ' with ' + dirtyFiles.length + ' file(s)' + (_filesSkipped ? '; ' + _filesSkipped + ' other dirty file(s) left out per args.files' : '')))
             + (_filesSkippedPaths.length ? (' (skipped: ' + _filesSkippedPaths.map(function(s) { return s.path; }).join(', ') + ')') : '')
             + (_filesIgnoredClean.length ? ('; ' + _filesIgnoredClean.length + ' requested file(s) were clean and ignored: ' + _filesIgnoredClean.join(', ')) : '')
-            + (staleBranchRecreated ? (' \u26a0 STALE BRANCH RECREATED: the branch had no open PR' + (_previousPrNumber ? ' (its previous PR #' + _previousPrNumber + ' was ' + (_previousPrMerged ? 'MERGED' : 'closed') + ' mid-task)' : '') + ', it was reset onto the current base head and ' + (prReused ? 'closed PR #' + prNumber + ' was reopened' : 'a NEW PR was opened') + '; this PR contains ONLY the files pushed now') : '')
+            + (staleBranchRecreated ? (' \u26a0 Stale branch recreated: the branch had no open PR' + (_previousPrNumber ? ' (its previous PR #' + _previousPrNumber + ' was ' + (_previousPrMerged ? 'merged' : 'closed') + ' mid-task)' : '') + ', it was reset onto the current base head and ' + (prReused ? 'closed PR #' + prNumber + ' was reopened' : 'a new PR was opened') + '; this PR contains only the files pushed now') : '')
             + (_excludedForeign.length ? ('; ' + _excludedForeign.length + ' foreign in-progress file(s) excluded from the commit — see excluded_foreign_files') : '')
             + (_pushCrossChatWarnings.length ? ('; \u26a0 ' + _pushCrossChatWarnings.length + ' cross-chat warning(s) — committed file(s) belonging to another chat or another PR, see cross_chat_warnings') : '')
-            + (_changedDuringPush.length ? ('; \u26a0 ' + _changedDuringPush.length + ' file(s) changed locally DURING the push and were kept as-is (the newer edits are NOT in this commit) — see changed_during_push') : '')
+            + (_changedDuringPush.length ? ('; \u26a0 ' + _changedDuringPush.length + ' file(s) changed locally during the push and were kept as-is (the newer edits are not in this commit) — see changed_during_push') : '')
     };
 }
 
@@ -8250,7 +8264,7 @@ async function wsDeploy(wk, srcPath, destSubdir, opts) {
     if (staleSkipped) result.stale_skipped = staleSkipped;
     if (staleError) result.stale_cleanup_error = staleError;
     if (hydrateFailed.length) {
-        result.warning = hydrateFailed.length + ' file(s) under "' + prefix + '" failed hydration and were NOT deployed: ' + hydrateFailed.slice(0, 10).join(', ') + (hydrateFailed.length > 10 ? ', …' : '');
+        result.warning = hydrateFailed.length + ' file(s) under "' + prefix + '" failed hydration and were not deployed: ' + hydrateFailed.slice(0, 10).join(', ') + (hydrateFailed.length > 10 ? ', …' : '');
         result.hydrate_failed = hydrateFailed;
     }
     return result;

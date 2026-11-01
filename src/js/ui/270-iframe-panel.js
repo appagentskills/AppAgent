@@ -42,9 +42,18 @@ var RELOAD_PREFLIGHT_FILES = Object.freeze([
     'test/js-eval-sandbox-lifecycle.test.js', 'test/harness.test.js',
     'test/reload-preflight.test.js'
 ]);
-// ONE run_tests call covers every suite (was one call per file): 120s per suite,
-// capped at the tool's 600s maximum; the page-side wait is slightly longer.
-var RELOAD_PREFLIGHT_TIMEOUT_MS = Math.min(600000, 120000 * RELOAD_PREFLIGHT_FILES.length);
+// The five tooling suites keep their strict rows. EVERY other test/*.test.js runs too
+// (one "Full test suite" row): any failing test blocks Reload until the user has seen
+// the failures and explicitly chooses Force build.
+var RELOAD_TEST_FILE_RE = /^test\/[^/]+\.test\.js$/; // same top-level discovery as run_tests
+// One run_tests call per batch, each bounded by the tool's 600s maximum. Measured
+// 2026-10-31: 293 files / 4187 tests in 142s in ONE call, so today's suite is one
+// batch; a growing suite splits into more calls instead of hitting the cap.
+// run_tests shards each call into parallel sandboxes: a per-test timeout aborts
+// only its shard (that file 'aborted', the rest of the shard 'not_run'), so each
+// row is judged on its own entry while the run-level success gate still blocks.
+var RELOAD_PREFLIGHT_BATCH_FILES = 300;
+var RELOAD_PREFLIGHT_TIMEOUT_MS = 600000;
 var RELOAD_PREFLIGHT_WAIT_MS = RELOAD_PREFLIGHT_TIMEOUT_MS + 15000;
 var RELOAD_PREFLIGHT_PASS_KEY = 'appagentReloadPreflightPass'; // fingerprint of the last PASSING preflight
 var RELOAD_TIMINGS_KEY = 'appagentLastReloadTimings';
@@ -131,9 +140,37 @@ function _reloadStorageSet(items) {
     } catch (e) { console.warn('[reload] storage write failed: ' + (e && e.message || e)); }
 }
 // Same workspace, same exact sources (fingerprint) and same suite list as the last PASS.
-function _reloadPassMatches(saved, workspace, fingerprint) {
+function _reloadPassMatches(saved, workspace, fingerprint, files) {
     return !!(saved && typeof saved === 'object' && typeof fingerprint === 'string' && saved.fingerprint === fingerprint &&
-        saved.workspace === workspace && saved.files === RELOAD_PREFLIGHT_FILES.join('\n'));
+        saved.workspace === workspace && saved.files === (files || RELOAD_PREFLIGHT_FILES).join('\n'));
+}
+// Every other top-level test/*.test.js in the workspace (sorted; tooling suites excluded).
+async function _reloadTestFiles(workspace) {
+    var all = await getAllWorkspaceFiles(workspace);
+    if (!Array.isArray(all)) throw new Error('Cannot list workspace tests');
+    return all.filter(function(f) { return f && !f.deleted && typeof f.path === 'string' && RELOAD_TEST_FILE_RE.test(f.path) && RELOAD_PREFLIGHT_FILES.indexOf(f.path) < 0; })
+        .map(function(f) { return f.path; }).sort();
+}
+// "Full test suite" row: the worst member state (display only; the gate uses every file's state).
+function _reloadFullSuiteState(states) {
+    if (states.some(function(s) { return s === 'running' || s === 'pending'; })) return 'running';
+    if (states.some(function(s) { return s === 'fail'; })) return 'fail';
+    if (states.some(function(s) { return s === 'error'; })) return 'error';
+    return states.every(function(s) { return s === 'pass'; }) ? 'pass' : 'skipped';
+}
+// Totals, the failing files and each failing test (file › test — first message line).
+function _reloadFullSuiteDetail(files, states, counts, entries, details, from) {
+    var c = [0, 0, 0], bad = [], lines = [];
+    for (var i = from; i < files.length; i++) {
+        if (counts[i]) { c[0] += counts[i][0]; c[1] += counts[i][1]; c[2] += counts[i][2]; }
+        if (states[i] !== 'fail' && states[i] !== 'error') continue;
+        bad.push(files[i]);
+        var fails = entries[i] && Array.isArray(entries[i].failures) ? entries[i].failures : [];
+        if (fails.length) fails.forEach(function(x) { lines.push(files[i] + ' › ' + String(x && x.name || '?') + ' — ' + String(x && (x.message || x.error) || '').split('\n')[0].slice(0, 200)); });
+        else lines.push(files[i] + ' — ' + String(details[i] || '').split('\n').filter(function(l) { return l.trim() && !/^\d+ passed; /.test(l); })[0] || files[i]);
+    }
+    var head = c[0] + ' passed; ' + c[1] + ' failed; ' + c[2] + ' skipped (unchecked)';
+    return [head].concat(bad.length ? [t('Failing test files: {files}', { files: bad.join(', ') })] : [], lines).join('\n').slice(0, 12000);
 }
 function _reloadSuiteResult(result, file) {
     var f = result && Array.isArray(result.files) && result.files.length === 1 && result.files[0];
@@ -168,7 +205,8 @@ function _reloadDetailLine(line) {
 // envelope (its own entry + the shared isolation/denial/abort/error fields) and
 // is judged by the unchanged single-file _reloadSuiteResult. A missing entry or an
 // inconsistent envelope is an explicit failure: nothing passes on a bad envelope.
-function _reloadSuiteRows(result, files) {
+function _reloadSuiteRows(result, files, strictCount) {
+    if (strictCount === undefined) strictCount = files.length;
     var list = result && Array.isArray(result.files) ? result.files : null, s = result && result.summary;
     var envelopeOk = !!(list && s && list.length === files.length && s.files === list.length && list.every(function(f) {
         return f && ['passed', 'failed', 'skipped'].every(function(k) { return Number.isSafeInteger(f[k]) && f[k] >= 0; });
@@ -183,16 +221,32 @@ function _reloadSuiteRows(result, files) {
         envelopeOk = Object.keys(sum).every(function(k) { return s[k] === sum[k]; }) && s.total === sum.passed + sum.failed + sum.skipped;
     }
     var why = (result && result.error) || 'Required supported assertions or verified isolation missing';
-    return files.map(function(file) {
+    // The run failed before any suite ran (run_tests pre-dispatch envelope): show
+    // the real cause once on the first row instead of repeating it per suite.
+    var preDispatch = !!(list && s && typeof s === 'object' && list.length === 0 && files.length && result.success !== true);
+    return files.map(function(file, idx) {
+        if (preDispatch) return { state: 'error', detail: (idx === 0 ? 'Test run failed before any suite ran\n' + why : 'Not run: the test run failed before any suite ran (cause on the first row)').slice(0, 6000) };
         if (!list || !s || typeof s !== 'object') return { state: 'error', detail: ('Malformed or incomplete test result\n' + why).slice(0, 6000) };
         var mine = list.filter(function(f) { return f && f.file === file; });
         if (mine.length !== 1) return { state: 'error', detail: ((mine.length ? 'Suite reported more than once' : 'Not reported by the test run (it stopped before this suite)') + '\n' + why).slice(0, 6000) };
         var f = mine[0];
-        return _reloadSuiteResult({
-            success: envelopeOk && f.status === 'pass', error: result.error, aborted: result.aborted,
+        if (files.indexOf(file) >= strictCount) {
+            // Full-suite file: blocks on any failure, error, abort, denied call or unverified
+            // isolation; tag-filter/no-layout skips are not failures here.
+            var safe = envelopeOk && !f.aborted && f.status !== 'aborted' && f.status !== 'not_run' && result.isolation && result.isolation.ok === true && result.isolation.host_verified === true &&
+                Array.isArray(result.denied_calls) && result.denied_calls.length === 0;
+            var ok = safe && f.status === 'pass' && !f.failed && !f.error;
+            var d = f.passed + ' passed; ' + f.failed + ' failed; ' + f.skipped + ' skipped (unchecked)';
+            if (!ok) d += '\n' + (f.error || (f.failed ? '' : why)) + (f.failures && f.failures.length ? '\n' + JSON.stringify(f.failures) : '');
+            return { state: ok ? 'pass' : (f.failed || f.status === 'fail') ? 'fail' : 'error', detail: d.slice(0, 6000), entry: f };
+        }
+        var strictRow = _reloadSuiteResult({
+            success: envelopeOk && f.status === 'pass' && !f.aborted, error: result.error, aborted: !!f.aborted || f.status === 'aborted' || f.status === 'not_run',
             isolation: result.isolation, denied_calls: result.denied_calls, files: [f],
             summary: { files: 1, total: f.passed + f.failed + f.skipped, passed: f.passed, failed: f.failed, skipped: f.skipped, no_assertions: f.no_assertions || 0 }
         }, file);
+        strictRow.entry = f;
+        return strictRow;
     });
 }
 
@@ -216,8 +270,9 @@ function _reloadChecklist(controller) {
     var progress = node('progress', 'reload-preflight-progress', '', body); progress.max = RELOAD_PREFLIGHT_FILES.length; progress.value = 0; progress.setAttribute('aria-label', t('Suites complete'));
     var labels = [t('Policy checks'), t('Test runner'), t('Sandbox lifecycle'), t('Test harness'), t('Reload checks')];
     var summaries = [];
-    var rows = RELOAD_PREFLIGHT_FILES.map(function(file, index) {
-        var row = node('div', 'reload-preflight-row', '', body);
+    function makeRow(file, index, before) {
+        var row = node('div', 'reload-preflight-row', '', before && body.insertBefore ? null : body);
+        if (before && body.insertBefore) body.insertBefore(row, before);
         var label = node('label', 'reload-preflight-label', '', row), box = node('input', 'reload-preflight-check', '', label);
         box.type = 'checkbox'; box.disabled = true; box.setAttribute('aria-label', t('{label}: {state}', { label: labels[index], state: t('Pending') }));
         var spinner = node('span', 'reload-preflight-spinner', '', label); spinner.setAttribute('aria-hidden', 'true');
@@ -232,7 +287,8 @@ function _reloadChecklist(controller) {
         var detail = node('pre', 'reload-preflight-detail', '', details); detail.hidden = true;
         row.dataset.state = 'pending';
         return { row: row, box: box, state: state, counts: counts, message: message, detail: detail, complete: false };
-    });
+    }
+    var rows = RELOAD_PREFLIGHT_FILES.map(function(file, index) { return makeRow(file, index); });
     var technical = node('details', 'reload-preflight-details reload-preflight-technical', '', body);
     summaries.push(node('summary', '', t('Coverage and workspace'), technical));
     var workspace = node('p', 'reload-preflight-workspace', t('Workspace: preparing…'), technical);
@@ -288,6 +344,12 @@ function _reloadChecklist(controller) {
     return {
         decision: decision,
         cancelled: function() { return choice === 'cancel'; },
+        // Adds the "Full test suite" row once the workspace's other test files are known.
+        addRow: function(label, file) {
+            labels.push(label); rows.push(makeRow(file, labels.length - 1, technical));
+            progress.max = rows.length; updateProgress();
+            return rows.length - 1;
+        },
         update: function(index, state, detail) {
             var r = rows[index];
             r.row.dataset.state = state; r.box.checked = state === 'pass';
@@ -314,7 +376,7 @@ function _reloadChecklist(controller) {
         },
         status: function(text) {
             if (text.indexOf('Workspace: ') === 0) { workspace.textContent = t('Workspace: {workspace}', { workspace: text.slice('Workspace: '.length) }); status.textContent = t('Checking supported assertions before building.'); }
-            else if (text.indexOf('All five supported suites passed') === 0) { title.textContent = t('All checks passed'); status.textContent = t('Building the checked workspace…'); }
+            else if (text.indexOf('All five supported suites passed') === 0 || text.indexOf('All supported suites passed') === 0) { title.textContent = t('All checks passed'); status.textContent = t('Building the checked workspace…'); }
             else status.textContent = text;
         },
         failure: function(text, settled) { title.textContent = t('Checks need attention'); status.textContent = text; force.hidden = false; force.disabled = !settled; cancel.focus(); },
@@ -349,11 +411,24 @@ async function _runReloadPreflight() {
     var controller = new AbortController(), ui = _reloadChecklist(controller);
     var workspace, fingerprint, pending = null, settled = true, running = false, failed = false, files = RELOAD_PREFLIGHT_FILES.slice();
     var states = files.map(function() { return 'pending'; });
-    function set(i, state, detail) { states[i] = state; ui.update(i, state, detail); }
+    var strict = RELOAD_PREFLIGHT_FILES.length, fullRow = -1, counts = [], entries = [], details = [], provisional = null;
+    // Tooling suites own rows 0..4; every other test file folds into the "Full test suite" row.
+    function set(i, state, detail) {
+        states[i] = state; details[i] = detail;
+        var m = /^(\d+) passed; (\d+) failed; (\d+) skipped/.exec(String(detail || ''));
+        counts[i] = m ? [+m[1], +m[2], +m[3]] : counts[i];
+        if (i < strict) ui.update(i, state, detail);
+        else if (fullRow >= 0) ui.update(fullRow, _reloadFullSuiteState(states.slice(strict)), _reloadFullSuiteDetail(files, states, counts, entries, details, strict));
+    }
     try {
         workspace = await _reloadWait(_reloadWorkspace(), controller.signal, 15000);
         ui.status('Workspace: ' + workspace);
         fingerprint = await _reloadWait(_reloadFingerprint(workspace), controller.signal, 15000);
+        var extra = await _reloadWait(_reloadTestFiles(workspace), controller.signal, 15000);
+        if (extra.length) {
+            files = files.concat(extra); extra.forEach(function() { states.push('pending'); });
+            fullRow = ui.addRow(t('Full test suite'), extra.length + ' × test/*.test.js');
+        }
         // Same exact sources as the last PASSING preflight: those tests already passed.
         // The record only decides whether the suites may be SKIPPED: a slow/failed
         // read counts as "no pass record" (run them). A cancel still cancels.
@@ -363,35 +438,38 @@ async function _runReloadPreflight() {
             if (controller.signal.aborted) throw e;
             console.warn('[reload] pass record unavailable (' + (e && e.message || e) + '); running the suites');
         }
-        if (_reloadPassMatches(lastPass, workspace, fingerprint)) {
+        if (_reloadPassMatches(lastPass, workspace, fingerprint, files)) {
             files.forEach(function(_, i) { set(i, 'skipped', t('Preflight skipped (unchanged since last pass)')); });
+            if (fullRow >= 0) ui.update(fullRow, 'skipped', t('Preflight skipped (unchanged since last pass)'));
             ui.status(t('Preflight skipped (unchanged since last pass) — building {workspace}', { workspace: workspace }));
             return { proceed: true, workspace: workspace, skipped: true };
         }
         if (controller.signal.aborted) throw new Error('Reload cancelled');
-        // ONE run_tests call for every suite (was one per file); rows map from its entries.
+        // One run_tests call per batch (tooling suites first); rows map from its entries.
         files.forEach(function(_, i) { set(i, 'running', t('Running supported assertions…')); });
-        running = true; settled = false;
-        // Live progress: the single run_tests call streams per-suite events, so the
-        // counter/bar advance as each suite finishes instead of jumping from 0 to
-        // N at the end. Provisional only: the envelope below re-judges every row.
-        var provisional = files.map(function() { return false; });
-        var onSuiteProgress = function(ev) {
-            _reloadApplyProgress(ev, files, states, function(i, st, detail) { provisional[i] = true; set(i, st, detail); }, ui, running && !settled && !controller.signal.aborted);
+        // Live progress: each call streams per-suite events, so the counter/bar
+        // advance as suites finish. Provisional only: each envelope re-judges its rows.
+        provisional = files.map(function() { return false; });
+        var runBatch = async function(offset) {
+            var batch = files.slice(offset, offset + RELOAD_PREFLIGHT_BATCH_FILES);
+            running = true; settled = false;
+            var onSuiteProgress = function(ev) {
+                _reloadApplyProgress(ev, batch, states.slice(offset, offset + batch.length), function(i, st, detail) { provisional[offset + i] = true; set(offset + i, st, detail); }, ui, running && !settled && !controller.signal.aborted);
+            };
+            pending = Promise.resolve().then(function() {
+                if (controller.signal.aborted) throw new Error('Reload cancelled before dispatch');
+                return executeTool('run_tests', { files: batch.slice(), tags: ['unit', 'canary'], workspace: workspace, timeout_ms: RELOAD_PREFLIGHT_TIMEOUT_MS }, null, { _runTestsAbortSignal: controller.signal, _runTestsOnProgress: onSuiteProgress });
+            }).finally(function() { settled = true; });
+            var result = await _reloadWait(pending, controller.signal, RELOAD_PREFLIGHT_WAIT_MS);
+            running = false;
+            _reloadSuiteRows(result, batch, Math.max(0, strict - offset)).forEach(function(row, i) { entries[offset + i] = row.entry || null; set(offset + i, row.state, row.detail); });
+            // Rows can all pass only on a consistent envelope; still require the run's own verdict.
+            if (!batch.some(function(_, i) { return states[offset + i] !== 'pass'; }) && !(result && result.success === true)) {
+                batch.forEach(function(_, i) { set(offset + i, 'error', t('Test run did not report success') + '\n' + (result && result.error || '')); });
+            }
         };
-        pending = Promise.resolve().then(function() {
-            if (controller.signal.aborted) throw new Error('Reload cancelled before dispatch');
-            return executeTool('run_tests', { files: files.slice(), tags: ['unit', 'canary'], workspace: workspace, timeout_ms: RELOAD_PREFLIGHT_TIMEOUT_MS }, null, { _runTestsAbortSignal: controller.signal, _runTestsOnProgress: onSuiteProgress });
-        }).finally(function() { settled = true; });
-        var result = await _reloadWait(pending, controller.signal, RELOAD_PREFLIGHT_WAIT_MS);
-        running = false;
-        _reloadSuiteRows(result, files).forEach(function(row, i) { set(i, row.state, row.detail); });
+        for (var offset = 0; offset < files.length; offset += RELOAD_PREFLIGHT_BATCH_FILES) await runBatch(offset);
         failed = states.some(function(st) { return st !== 'pass'; });
-        // Rows can all pass only on a consistent envelope; still require the run's own verdict.
-        if (!failed && !(result && result.success === true)) {
-            files.forEach(function(_, i) { set(i, 'error', t('Test run did not report success') + '\n' + (result && result.error || '')); });
-            failed = true;
-        }
         if (!failed) {
             var current = await _reloadWait(_reloadFingerprint(workspace), controller.signal, 15000);
             if (current !== fingerprint || await _reloadWait(_reloadWorkspace(), controller.signal, 15000) !== workspace) {
@@ -400,9 +478,9 @@ async function _runReloadPreflight() {
             }
             // Remember this pass: an unchanged workspace skips the preflight next time.
             var pass = {};
-            pass[RELOAD_PREFLIGHT_PASS_KEY] = { fingerprint: fingerprint, workspace: workspace, files: RELOAD_PREFLIGHT_FILES.join('\n'), at: Date.now() };
+            pass[RELOAD_PREFLIGHT_PASS_KEY] = { fingerprint: fingerprint, workspace: workspace, files: files.join('\n'), at: Date.now() };
             _reloadStorageSet(pass);
-            ui.status('All five supported suites passed — building ' + workspace);
+            ui.status('All supported suites passed — building ' + workspace);
             return { proceed: true, workspace: workspace };
         }
     } catch (e) {
@@ -423,7 +501,10 @@ async function _runReloadPreflight() {
     }
     if (ui.cancelled()) { ui.close(); return { proceed: false }; }
     files.forEach(function(_, i) { if (states[i] === 'pending') set(i, 'skipped', 'Not run'); });
-    ui.failure((typeof failed === 'string' ? failed : t('Required checks did not pass.')) + ' ' +
+    // Name the failing test files so a blocked Reload is never silent about why.
+    var badFiles = files.filter(function(_, i) { return states[i] === 'fail' || states[i] === 'error'; });
+    var badText = badFiles.length ? ' ' + t('Failing test files: {files}', { files: badFiles.slice(0, 10).join(', ') + (badFiles.length > 10 ? ', …' : '') }) : '';
+    ui.failure((typeof failed === 'string' ? failed : t('Required checks did not pass.')) + badText + ' ' +
         (settled ? t('Cancel or explicitly Force build (tests only; artifact/security checks still apply).') : t('Host cleanup did not settle; Force is unavailable.')), settled && !!workspace);
     try { return { proceed: (await ui.decision) === 'force', workspace: workspace }; }
     finally { ui.close(); }

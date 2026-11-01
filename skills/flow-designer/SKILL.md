@@ -7,7 +7,7 @@ description: A recipe for creating flows in ServiceNow Flow Designer via UI auto
 
 Create ServiceNow flows by driving the Flow Designer UI with `iframe_tool`. No usable REST API exists for flow creation.
 
-> **`tab_id` is REQUIRED** on every `iframe_tool` browser action and on `take_screenshot` `target: "browser"`. Open the designer with `navigate` + `tab_id: "new"` (or use an instance tab id from `list_instances` `instances[].activeTabs[].id`) and pass the returned `tab_id` to every later click/fill/`get_visible_text`/screenshot.
+> **`tab_id` is required** on every `iframe_tool` browser action and on `take_screenshot` `target: "browser"`. Open the designer with `navigate` + `tab_id: "new"` (or use an instance tab id from `list_instances` `instances[].activeTabs[].id`) and pass the returned `tab_id` to every later click/fill/`get_visible_text`/screenshot.
 
 > **API first — UI only where there is no API path.** Use the UI only for the flow-authoring steps themselves. Everything around them — looking up tables/users/groups, creating test records that trigger the flow, checking executions (`sys_flow_context`), approvals (`sysapproval_approver`) and resulting records — goes through `servicenow_api`. Impersonate with `iframe_tool` action `impersonate` (REST-based), never the UI menu.
 
@@ -23,9 +23,9 @@ Use the direct URLs to skip the home page entirely.
 ## Gotchas
 
 - **`get_dom` is useless here** — returns ~50KB of Angular bootstrap JS, not rendered UI. Use `get_visible_text` instead.
-- **Select2 combobox fields** (Table picker): TWO inputs — a readonly focuser (`#s2id_autogenN`) and the actual search input (`#s2id_autogenN_search`). Fill the `_search` one. `N` varies — discover via `get_visible_text`.
+- **Select2 combobox fields** (Table picker): two inputs — a readonly focuser (`#s2id_autogenN`) and the actual search input (`#s2id_autogenN_search`). Fill the `_search` one. `N` varies — discover via `get_visible_text`.
 - **Trigger category items** — don't click `li.selected` directly, it won't work. Use the search input (`#action-picker-search-input`), then `dispatch_event` click on the result buttons (e.g., `button[aria-label='Category Record: Created']`).
-- **Application scope field** is `#scope`, NOT `#application`.
+- **Application scope field** is `#scope`, not `#application`.
 - **Data pills** (record references) can't be dragged. Use the search/text field and select from autocomplete instead.
 
 ## Recipe: Record-Triggered Flow
@@ -51,7 +51,7 @@ Same as above, plus after the trigger:
 |---------|----------|-------|
 | Flow name | `#name` | input |
 | Description | `#description` | textarea |
-| Application scope | `#scope` | select — NOT `#application` |
+| Application scope | `#scope` | select — not `#application` |
 | Submit button | `#flow_properties_submit_btn` | Active after filling name |
 | Cancel button | `#flow_properties_cancel_btn` | |
 | Add trigger link | `#flow_trigger_text_toggle` | |
