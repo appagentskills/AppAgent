@@ -579,7 +579,7 @@ async function executeRuntimeInspect(args) {
         if (typeof _reloadRebuildsFromWorkspace === 'function') devMode = !!(await _reloadRebuildsFromWorkspace());
     } catch (e) { devMode = false; }
     if (!devMode) {
-        return { success: false, error: 'runtime_inspect is available only in extension dev mode (extension-dev skill active AND deploy folder connected in Settings > GitHub).' };
+        return { success: false, error: 'runtime_inspect is available only in extension dev mode (extension-dev skill active and deploy folder connected in Settings > GitHub).' };
     }
     try {
         switch (args.action) {

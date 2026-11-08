@@ -84,6 +84,9 @@ Object.defineProperty(window, 'stickToBottom', {
 // see the clamp-escape INVARIANT above — never produces a phantom
 // scroll-up).
 function handleChatScroll(el) {
+    // Native scroll-bar drags may not fire pointermove: a scroll while the
+    // pointer is held keeps the hold alive (re-arms the safety timeout).
+    if (_agPointerHeld) _agArmPointerHeldTimer();
     var top = el.scrollTop;
     var last = (el._agLastScrollTop !== undefined) ? el._agLastScrollTop : top;
     el._agLastScrollTop = top;
@@ -111,10 +114,215 @@ function handleChatScroll(el) {
         // Downward scrolls that stop farther above the bottom keep the
         // current state.
     } else if (top < last - 1) {
-        stickToBottom = false;  // user moved up, away from the bottom → release
+        // SCROLL-INTENT: release only on a REAL user scroll-up. Programmatic
+        // upward shifts nobody asked for — focus() scrolling a rebuilt
+        // prompt field / tool panel into view, scrollIntoView from sticky
+        // headers, layout shifts — used to take this arm too, silently
+        // dropping the follow flag mid-run (auto-scroll "randomly" stopped
+        // until the next send). A user scroll is always preceded by an input
+        // gesture (wheel / touch / pointer on the scrollbar / key); a big
+        // jump (> one viewport, e.g. search / sidebar navigation) is
+        // deliberate navigation and also releases.
+        if (_agHasUserScrollIntent() || distFromBottom > el.clientHeight) {
+            stickToBottom = false;  // user moved up, away from the bottom → release
+        }
     }
     // Sub-pixel jitter (top within 1px of last, above the bottom) keeps the
     // current state.
+    updateScrollToBottomButton();
+}
+
+// ── User scroll intent ───────────────────────────────────────────────────────
+// Timestamp of the last input gesture that can scroll the chat. Scroll events
+// within SCROLL_INTENT_MS of it (or while a pointer is held — scrollbar drag,
+// selection drag, middle-click autoscroll) count as user scrolls.
+var SCROLL_INTENT_MS = 1000;
+var _agUserScrollIntentAt = 0;
+var _agPointerHeld = false;
+var SCROLL_INTENT_KEYS = { ArrowUp: 1, ArrowDown: 1, PageUp: 1, PageDown: 1, Home: 1, End: 1, ' ': 1 };
+// A held pointer whose pointerup never arrives (released outside the window,
+// capture lost, tab hidden) must not pin "user intent" forever: auto-clear
+// after this long without a pointermove.
+var POINTER_HELD_MAX_MS = 10000;
+var _agPointerHeldTimer = null;
+// Input types that do NOT consume Space/Arrow/Home/End as text editing —
+// keys on these still count as scroll intent.
+var _AG_NON_TEXT_INPUTS = { checkbox: 1, radio: 1, button: 1, submit: 1, reset: 1, color: 1, file: 1, image: 1 };
+function _agMarkUserScrollIntent() { _agUserScrollIntentAt = Date.now(); }
+function _agHasUserScrollIntent() {
+    return _agPointerHeld || (Date.now() - _agUserScrollIntentAt) < SCROLL_INTENT_MS;
+}
+// S1: Space / arrows / Home / End typed into an editable field (composer,
+// inputs, contenteditable docs) edit text — they don't scroll the chat.
+function _agIsEditableTarget(t) {
+    if (!t) return false;
+    if (t.isContentEditable) return true;
+    var tag = String(t.tagName || '').toUpperCase();
+    if (tag === 'TEXTAREA' || tag === 'SELECT') return true;
+    if (tag === 'INPUT') return !_AG_NON_TEXT_INPUTS[String(t.type || 'text').toLowerCase()];
+    return false;
+}
+// Keys scroll the focused element's scroller or the document: only targets
+// that are the document/body or inside #messages (and not editable) can
+// scroll the chat — PageUp on a sidebar button must not open the window.
+function _agIsChatKeyTarget(t) {
+    if (_agIsEditableTarget(t)) return false;
+    if (!t || (typeof document !== 'undefined' && (t === document || t === document.body || t === document.documentElement))) return true;
+    var tag = String(t.tagName || '').toUpperCase();
+    return tag === 'BODY' || tag === 'HTML' || _agIsInChatScroller(t);
+}
+// S2: only gestures on/inside #messages (incl. its scroll bar, whose
+// pointerdown targets #messages itself) can scroll the chat.
+function _agIsInChatScroller(t) {
+    if (!t || typeof document === 'undefined') return false;
+    var c = document.getElementById('messages');
+    if (!c) return false;
+    return t === c || (typeof c.contains === 'function' && c.contains(t));
+}
+function _agClearPointerHeld() {
+    _agPointerHeld = false;
+    if (_agPointerHeldTimer) { clearTimeout(_agPointerHeldTimer); _agPointerHeldTimer = null; }
+}
+function _agArmPointerHeldTimer() {
+    if (_agPointerHeldTimer) clearTimeout(_agPointerHeldTimer);
+    _agPointerHeldTimer = setTimeout(function() { _agPointerHeldTimer = null; _agPointerHeld = false; }, POINTER_HELD_MAX_MS);
+}
+if (typeof document !== 'undefined' && document && typeof document.addEventListener === 'function') {
+    ['wheel', 'touchmove'].forEach(function(t) {
+        document.addEventListener(t, function(e) {
+            if (e && _agIsInChatScroller(e.target)) _agMarkUserScrollIntent();
+        }, { capture: true, passive: true });
+    });
+    // Only keys that can scroll — ordinary typing in the composer must not
+    // open the release window (a layout shift while typing would drop follow).
+    document.addEventListener('keydown', function(e) {
+        if (e && SCROLL_INTENT_KEYS[e.key] && _agIsChatKeyTarget(e.target)) _agMarkUserScrollIntent();
+    }, { capture: true, passive: true });
+    document.addEventListener('pointerdown', function(e) {
+        if (!e || !_agIsInChatScroller(e.target)) return;
+        _agPointerHeld = true;
+        _agMarkUserScrollIntent();
+        _agArmPointerHeldTimer();
+    }, { capture: true, passive: true });
+    document.addEventListener('pointermove', function() {
+        if (_agPointerHeld) _agArmPointerHeldTimer();
+    }, { capture: true, passive: true });
+    ['pointerup', 'pointercancel', 'lostpointercapture'].forEach(function(t) {
+        document.addEventListener(t, function() {
+            if (!_agPointerHeld) return;
+            _agClearPointerHeld();
+            _agMarkUserScrollIntent();
+        }, { capture: true, passive: true });
+    });
+    document.addEventListener('visibilitychange', function() {
+        if (document.visibilityState === 'hidden') _agClearPointerHeld();
+    });
+}
+if (typeof window !== 'undefined' && window && typeof window.addEventListener === 'function') {
+    // Pointer released outside the window never delivers pointerup.
+    window.addEventListener('blur', _agClearPointerHeld);
+    // S5: a viewport resize changes the distance to the bottom.
+    window.addEventListener('resize', function() { updateScrollToBottomButton(); });
+}
+
+// ── Scroll-to-bottom button (#scroll-to-bottom-btn, body.html) ──────────────
+// Visible only while the viewed chat is NOT following and sits more than
+// SCROLL_BTN_THRESHOLD px above its bottom; hidden at the bottom.
+var SCROLL_BTN_THRESHOLD = 40;
+function updateScrollToBottomButton() {
+    if (typeof document === 'undefined') return;
+    var btn = document.getElementById('scroll-to-bottom-btn');
+    var c = document.getElementById('messages');
+    if (!btn || !c) return;
+    var dist = c.scrollHeight - c.scrollTop - c.clientHeight;
+    // The live streaming box scrolls on its own: being scrolled up inside it
+    // also counts as "away from the bottom".
+    var s = c.querySelector ? c.querySelector('.streaming-answer') : null;
+    if (s) dist = Math.max(dist, s.scrollHeight - s.scrollTop - s.clientHeight);
+    _agSetScrollBtnVisible(btn, !stickToBottom && dist > SCROLL_BTN_THRESHOLD);
+}
+function _agSetScrollBtnVisible(btn, show) {
+    btn.classList.toggle('visible', show);
+    btn.setAttribute('aria-hidden', show ? 'false' : 'true');
+    btn.tabIndex = show ? 0 : -1;
+}
+
+// S3: deliberate navigation to a spot in the chat (search hit, tool-call /
+// version jump, scrollToWidget) — stop following so the next streaming pin
+// doesn't yank the user back down. Pass the navigation target: targets
+// outside #messages (overlay views) leave the chat's follow state alone.
+function releaseChatFollow(target) {
+    if (typeof document === 'undefined') return false;
+    var c = document.getElementById('messages');
+    if (target && c && typeof c.contains === 'function' && !c.contains(target)) return false;
+    stickToBottom = false;
+    updateScrollToBottomButton();
+    return true;
+}
+
+// Button click: re-engage follow and glide to the bottom. The glide's scroll
+// events only move DOWN (never release); a streaming tick mid-glide simply
+// lands the instant pin at the same bottom.
+function scrollChatToBottom() {
+    var c = document.getElementById('messages');
+    if (!c) return;
+    stickToBottom = true;
+    var s = c.querySelector('.streaming-answer');
+    if (s) pinToBottom(s);
+    if (typeof c.scrollTo === 'function') c.scrollTo({ top: c.scrollHeight, behavior: 'smooth' });
+    else pinToBottom(c);
+    updateScrollToBottomButton();
+    // S8: the button just hid (tabIndex -1) — don't leave focus on it.
+    var btn = document.getElementById('scroll-to-bottom-btn');
+    if (btn && document.activeElement === btn) {
+        var inp = document.getElementById('message-input');
+        if (inp && typeof inp.focus === 'function') inp.focus({ preventScroll: true });
+        else if (typeof btn.blur === 'function') btn.blur();
+    }
+}
+
+// S7: debounced per-chat scroll-position save. The chat id and position are
+// captured when the save is SCHEDULED (reading currentChatId when the timer
+// fired filed the old chat's position under a chat opened in between); a
+// pending save for another chat is flushed first, never dropped.
+var CHAT_SCROLL_SAVE_MS = 200;
+var _agScrollSave = null;
+var _agScrollSaveTimer = null;
+function flushChatScrollSave() {
+    if (_agScrollSaveTimer) { clearTimeout(_agScrollSaveTimer); _agScrollSaveTimer = null; }
+    var p = _agScrollSave;
+    _agScrollSave = null;
+    if (p && typeof appStorage !== 'undefined' && appStorage) appStorage.setItem('scrollPos_' + p.id, p.top);
+}
+function scheduleChatScrollSave(chatId, top) {
+    if (!chatId) return;
+    if (_agScrollSave && _agScrollSave.id !== chatId) flushChatScrollSave();
+    _agScrollSave = { id: chatId, top: top };
+    if (_agScrollSaveTimer) clearTimeout(_agScrollSaveTimer);
+    _agScrollSaveTimer = setTimeout(flushChatScrollSave, CHAT_SCROLL_SAVE_MS);
+}
+// Chat deletion: drop a pending save so it can't recreate the removed key.
+function cancelChatScrollSave(chatId) {
+    if (_agScrollSave && _agScrollSave.id === chatId) {
+        _agScrollSave = null;
+        if (_agScrollSaveTimer) { clearTimeout(_agScrollSaveTimer); _agScrollSaveTimer = null; }
+    }
+}
+
+// Chat switch: scroll state is per chat. The newly opened chat starts
+// following (lands at its bottom once renderMessages pins), and the shared
+// #messages element forgets the PREVIOUS chat's last scrollTop so the first
+// scroll event of the new chat is never compared against it.
+function resetChatScrollForSwitch(chatId) {
+    flushChatScrollSave(); // S7: persist the previous chat's position now
+    stickToBottomByChatId[chatId || '_'] = true;
+    var c = (typeof document !== 'undefined') ? document.getElementById('messages') : null;
+    if (c) c._agLastScrollTop = undefined;
+    // S4: this runs BEFORE currentChatId switches, so updateScrollToBottomButton
+    // would read the PREVIOUS chat's flag. The new chat starts following →
+    // hide directly; renderMessages refreshes once the new chat is current.
+    var btn = (typeof document !== 'undefined') ? document.getElementById('scroll-to-bottom-btn') : null;
+    if (btn) _agSetScrollBtnVisible(btn, false);
 }
 
 // Pin an element to its bottom with an instant write (no smooth glide — rapid
@@ -165,6 +373,7 @@ function ensureChatGrowthObservers() {
     container._agGrowthObserved = true;
     _agGrowthRO = new ResizeObserver(function() {
         if (stickToBottom) scrollToBottomIfAllowed();
+        else updateScrollToBottomButton(); // S5: growth moves the bottom away
     });
     _agChildMO = new MutationObserver(function() { _agObserveChildren(container); });
     _agChildMO.observe(container, { childList: true });
@@ -321,8 +530,9 @@ function scrollToBottomIfAllowed() {
         // pinning first would leave the pin short by that growth.
         var streamingEl = container.querySelector('.streaming-answer');
         if (streamingEl) updateStreamingContainerHeight();
-        if (!stickToBottom) return; // user scrolled up — never fight them
+        if (!stickToBottom) { updateScrollToBottomButton(); return; } // user scrolled up — never fight them
         pinToBottom(container);
         if (streamingEl) pinToBottom(streamingEl);
+        updateScrollToBottomButton();
     });
 }

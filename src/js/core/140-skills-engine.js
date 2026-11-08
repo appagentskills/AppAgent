@@ -381,7 +381,7 @@ function _skillLargeResult(chatId, result, totalLines) {
     setLastLargeResponse(chatId, result); // CONC-FIX: per-chat, not shared global; LEAK-FIX: bounded (evicts oldest past cap)
     if (!result || typeof result !== 'object' || Array.isArray(result)) return result;
     var out = Object.assign({}, result);
-    out._notice = 'Large response (' + totalLines + ' lines). Full data is returned here (when >16 KB it is cached: use cached_content_outline / cached_content_search / cached_content_read) AND stored in the `lastLargeResponse` variable for js_eval (filter, map, count, extract fields).';
+    out._notice = 'Large response (' + totalLines + ' lines). Full data is returned here (when >16 KB it is cached: use cached_content_outline / cached_content_search / cached_content_read) and stored in the `lastLargeResponse` variable for js_eval (filter, map, count, extract fields).';
     return out;
 }
 

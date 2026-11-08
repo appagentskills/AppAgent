@@ -62,6 +62,12 @@ Platform.sendNotification = function(opts) {
     try {
         var title = (opts && opts.title) || 'AppAgent';
         var message = (opts && opts.message) || '';
+        // Prefer background.js's helper: it also records opts.chatId so the
+        // notification click navigates the open UI to that chat.
+        if (typeof self.appagentCreateNotification === 'function') {
+            self.appagentCreateNotification(title, message, (opts && opts.chatId) || '');
+            return;
+        }
         // 'appagent-' id prefix is REQUIRED: background.js's notifications.onClicked
         // handler only focuses/opens the panel for ids starting with 'appagent-'.
         // An auto-generated id would make the notification click a silent no-op.

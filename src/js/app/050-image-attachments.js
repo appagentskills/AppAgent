@@ -329,15 +329,27 @@ function handlePasteForImages(e) {
     // stay native. Also when the clipboard carries an image/PDF next to the
     // text (e.g. copied from Office/a browser): the file is attached above and
     // the large text still gets the offer instead of landing in the box.
-    if (typeof composerShouldOfferPasteAsFile === 'function') {
-        var ta = e.target && e.target.closest ? e.target.closest('textarea') : null;
-        if (ta && (ta.id === 'message-input' || ta.id === 'home-message-input')) {
-            var pasted = e.clipboardData.getData('text/plain');
-            if (composerShouldOfferPasteAsFile(pasted)) {
-                e.preventDefault();
-                composerOfferPasteAsFile(ta, pasted);
-            }
-        }
+    var ta = e.target && e.target.closest ? e.target.closest('textarea') : null;
+    if (!ta || (ta.id !== 'message-input' && ta.id !== 'home-message-input')) return;
+    var pasted = e.clipboardData.getData('text/plain');
+    // Rich-text paste (web page, Google Doc, Outlook, Slack): keep hyperlink
+    // URLs as Markdown [text](url) instead of only the anchor text
+    // (ui/246 composerHtmlToTextWithLinks). null = no link to rescue, so the
+    // native paste below stays untouched. Skipped when there is no plain text
+    // (e.g. a linked image copied on its own — the file path above owns it).
+    var linked = null;
+    if (pasted && typeof composerHtmlToTextWithLinks === 'function') {
+        try { linked = composerHtmlToTextWithLinks(e.clipboardData.getData('text/html'), pasted); } catch (err) { linked = null; }
+    }
+    var text = linked != null ? linked : pasted;
+    if (typeof composerShouldOfferPasteAsFile === 'function' && composerShouldOfferPasteAsFile(text)) {
+        e.preventDefault();
+        composerOfferPasteAsFile(ta, text);
+        return;
+    }
+    if (linked != null && typeof composerPasteText === 'function') {
+        e.preventDefault();
+        composerPasteText(ta, linked);
     }
 }
 

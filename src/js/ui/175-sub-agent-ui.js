@@ -1067,6 +1067,13 @@ function _subNoticeCardHtml(name, agentId, status, summary, kind, opts) {
                 + (rawErr ? '<div class="sub-notice-collapse-full">' + escapeHtml(summary) + '</div>'
                           : '<div class="sub-notice-collapse-full markdown-body" style="white-space:normal">' + rendered + '</div>')
                 + '</details></div>';
+        } else if (kind === 'final' && _subNoticeIsExpandable(summary, opts && opts.headline)) {
+            // REPORT-CHEVRON: a multi-line / longer-than-headline report
+            // collapses behind its one-line headline + a chevron toggle
+            // (instead of the old clamped/truncated text). Full markdown is
+            // always in the DOM; [hidden] + .is-open drive the state.
+            body = _subNoticeExpandHtml(agentId, (opts && opts.headline) || _subNoticeHeadline(summary), summary,
+                '<div class="sub-notice-body markdown-body">' + rendered + '</div>');
         } else {
             body = '<div class="sub-notice-body markdown-body">' + rendered + '</div>';
         }
@@ -1095,6 +1102,68 @@ function _subNoticeCardHtml(name, agentId, status, summary, kind, opts) {
             '<span class="sub-report-name">' + escapeHtml(name) + '</span>' +
             badge + viewBtn +
         '</div>' + body + foot + '</div>';
+}
+
+// REPORT-CHEVRON helpers. Headline = first non-empty line, block markers
+// and inline emphasis stripped (plain text, CSS-ellipsized to one line).
+function _subNoticeHeadline(summary) {
+    var lines = String(summary || '').split('\n');
+    for (var i = 0; i < lines.length; i++) {
+        var l = lines[i].replace(/^\s*(?:#{1,6}\s+|[-*>]\s+|\d+\.\s+)/, '').replace(/[*_`]+/g, '').trim();
+        if (l) return l;
+    }
+    return '';
+}
+// Expandable when the full text says more than its headline.
+function _subNoticeIsExpandable(summary, headline) {
+    var s = String(summary || '').trim();
+    var h = String(headline || _subNoticeHeadline(s)).trim();
+    return !!(s && h && s !== h);
+}
+function _subNoticeHashKey(s) {
+    var h = 5381; s = String(s || '');
+    for (var i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+    return (h >>> 0).toString(36);
+}
+// Collapsible wrapper: headline row (whole row clickable) + chevron button
+// (aria-expanded / aria-controls) + the full body in a [hidden] panel. The
+// open state is remembered per report in _subPanelPref so transcript
+// repaints keep it. Clicks route through _handleSubAgentUiClick.
+function _subNoticeExpandHtml(agentId, headline, summary, fullHtml) {
+    var key = 'notice:' + String(agentId || '') + ':' + _subNoticeHashKey(summary);
+    var open = !!(typeof _subPanelPref !== 'undefined' && _subPanelPref && _subPanelPref[key]);
+    var panelId = 'sub-notice-full-' + key.replace(/[^A-Za-z0-9_-]/g, '_');
+    var label = open ? t('Collapse report') : t('Show full report');
+    var chev = (typeof UI_ICONS !== 'undefined' && UI_ICONS && UI_ICONS.chevronDown) ? UI_ICONS.chevronDown : '\u25BE';
+    return '<div class="sub-notice-expand' + (open ? ' is-open' : '') + '" data-sub-notice-key="' + escapeHtml(key) + '">' +
+        '<div class="sub-notice-headline-row" data-sub-notice-toggle="1">' +
+            '<span class="sub-notice-headline">' + escapeHtml(headline) + '</span>' +
+            '<button type="button" class="sub-notice-chevron" data-sub-notice-toggle="1" aria-expanded="' + (open ? 'true' : 'false') + '" aria-controls="' + escapeHtml(panelId) + '" title="' + escapeHtml(label) + '" aria-label="' + escapeHtml(label) + '">' +
+                '<span class="sub-notice-chevron-icon" aria-hidden="true">' + chev + '</span></button>' +
+        '</div>' +
+        '<div class="sub-notice-full" id="' + escapeHtml(panelId) + '"' + (open ? '' : ' hidden') + '>' + fullHtml + '</div>' +
+    '</div>';
+}
+// Toggle one expander (called from the delegated click handler).
+function _toggleSubNoticeExpand(el) {
+    var box = el && el.closest ? el.closest('.sub-notice-expand') : null;
+    if (!box) return false;
+    var open = !box.classList.contains('is-open');
+    box.classList.toggle('is-open', open);
+    var panel = box.querySelector('.sub-notice-full');
+    if (panel) panel.hidden = !open;
+    var btn = box.querySelector('.sub-notice-chevron');
+    if (btn) {
+        var label = open ? t('Collapse report') : t('Show full report');
+        btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+        btn.setAttribute('aria-label', label);
+        btn.setAttribute('title', label);
+    }
+    var key = box.getAttribute('data-sub-notice-key');
+    if (key && typeof _subPanelPref !== 'undefined' && _subPanelPref) {
+        if (open) _subPanelPref[key] = true; else delete _subPanelPref[key];
+    }
+    return true;
 }
 
 // Eye icon for the notice card's "View agent" button.
@@ -1129,8 +1198,14 @@ function renderSubAgentMessage(msg, index) {
     // model-visible notices (_subNoticeCardHtml: status icon + name + badge +
     // View agent), headline only, with a muted "not woken" hint.
     if (msg.kind === 'passive_report') {
-        return _subNoticeCardHtml(name, msg.subAgentId, String(msg.status || 'done'), String(msg.text || ''), 'final',
-            { hint: t('Parent not woken (wake_parent:false) \u2014 open the agent for the full report'), rowIndex: index });
+        // REPORT-CHEVRON: rows carry the full report in fullText (core/097);
+        // the headline (`text`) shows collapsed, the chevron reveals the
+        // rest. Legacy rows (no fullText) render the headline as before.
+        var _pFull = String(msg.fullText || '').trim();
+        var _pHead = String(msg.text || '');
+        return _subNoticeCardHtml(name, msg.subAgentId, String(msg.status || 'done'), _pFull || _pHead, 'final',
+            { hint: t('Parent not woken (wake_parent:false) \u2014 open the agent for the full report'), rowIndex: index,
+              headline: _pFull ? _pHead.replace(/\u2026$/, '') : '' });
     }
     var text = String(msg.text || '');
     var body = '';
@@ -2651,6 +2726,15 @@ function renderWorkersStrip() {
                     }
                     // "Chat view" link inside an expanded worker card —
                     // opens the sub's inline chat card in the global modal.
+                    // REPORT-CHEVRON: report card expand/collapse.
+                    if (hitEl.getAttribute('data-sub-notice-toggle')) {
+                        // Let text selection in the headline stand.
+                        var _sel = (typeof window !== 'undefined' && window.getSelection) ? window.getSelection() : null;
+                        if (hitEl.tagName === 'BUTTON' || !_sel || !String(_sel).length) {
+                            if (_toggleSubNoticeExpand(hitEl)) evt.preventDefault();
+                        }
+                        return;
+                    }
                     var wkModal = hitEl.getAttribute('data-worker-modal');
                     if (wkModal) {
                         openWorkerChatModal(wkModal);

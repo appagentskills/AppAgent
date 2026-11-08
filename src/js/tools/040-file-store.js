@@ -151,11 +151,22 @@ function resolveWorkspaceFile(fileId, ptr) {
 // folder records get their data URL generated on demand here.
 async function getFileAsync(fileId) {
     if (!fileId) return null;
-    if (!fileIndex.has(fileId)) {
+    var shadowed = fileIndex.has(fileId);
+    if (!shadowed) {
         var st = await _ufsResolveStored(fileId);
         if (st) return await _ufsToLegacyShape(st);
     }
     var f = await _legacyGetFileAsync(fileId);
+    // LOST-IDS: a location pointer shadows the store (fileIndex.has above).
+    // get_file {attach:true} on a stored blob registers a 'chat' pointer to
+    // the attach message; once that chat is retired / evicted / dropped from
+    // this realm the pointer resolves to null although the bytes are still
+    // in the store. A handed-out id must keep resolving by direct lookup.
+    if ((!f || f.data == null) && shadowed) {
+        var st2 = null;
+        try { st2 = await _ufsResolveStored(fileId); } catch (e) { st2 = null; }
+        if (st2) return await _ufsToLegacyShape(st2);
+    }
     if (f && typeof f.data === 'string' && f.data.indexOf('data:') === 0) {
         var fixed = fixDataUrlMime(f.data);
         if (fixed !== f.data) f = Object.assign({}, f, { data: fixed, mime: dataUrlMime(fixed) });
@@ -577,6 +588,11 @@ var UFS_LIMITS = {
     maxRecords: 2000,                 // blob records (LRU beyond this)
     ttlMs: 7 * 24 * 3600 * 1000,      // blob unused for 7 days -> evicted
     cleanupEveryMs: 10 * 60 * 1000,
+    graceMs: 30 * 60 * 1000,          // blob younger than this is never evicted (see NEW-IDS)
+    // F1: unpinned blobs get max(floor, cap - pinned) — pinned media alone over
+    // the cap must not wipe every unpinned blob.
+    minUnpinnedBytes: 50 * 1024 * 1024,
+    minUnpinnedRecords: 200,
     touchEveryMs: 60 * 1000
 };
 // Test seam: { idb: {get, put, del, all}, now, readFolderFile }
@@ -772,7 +788,7 @@ function _ufsRegister(spec) {
     var p = spec.pointer;
     if (p && p.type === 'memory') { spec = { id: id, data: p.data, name: p.name || spec.name, mime: p.mime || spec.mime, width: p.width, height: p.height }; p = null; }
     var isFolder = p && (p.kind === 'folder' || p.type === 'folder');
-    if (p && !isFolder) { fileIndex.set(id, p); return { id: id, done: Promise.resolve(id) }; }
+    if (p && !isFolder) { fileIndex.set(id, p); _ufsPersistChatCopy(id, p); return { id: id, done: Promise.resolve(id) }; }
     var now = _ufsNow(), rec, head = null;
     if (isFolder) {
         var fname = p.name || spec.name || String(p.path || '').split('/').pop();
@@ -792,12 +808,39 @@ function _ufsRegister(spec) {
         }
         try { await _ufsBackend().put(rec); if (_ufsMem.get(id) === rec) _ufsMem.delete(id); }
         catch (e) { /* no IDB here: keep the in-realm copy */ }
-        _ufsPending.delete(id);
+        if (_ufsPending.get(id) === done) _ufsPending.delete(id); // F5: only our own entry
         _ufsMaybeCleanup();
         return id;
     })();
     _ufsPending.set(id, done);
     return { id: id, done: done };
+}
+// LOST-IDS: a 'chat' pointer (js_eval _images, take_screenshot, get_file
+// attach, user image uploads) points at bytes that live ONLY in that chat's
+// message. Retiring / deleting a sub-agent chat then drops the only copy and
+// the handed-out id dies. Mirror the message's data URL into the store
+// (fire-and-forget, skipped when the store already has the id) so the id
+// keeps resolving via the getFileAsync/resolveFile store fallback.
+function _ufsPersistChatCopy(id, p) {
+    try {
+        if (!p || p.type !== 'chat' || typeof chats === 'undefined' || !chats) return;
+        var c = chats[p.chatId], m = c && c.messages && c.messages[p.msgIndex];
+        if (!m || (m.file_id || m.screenshot_id) !== id) return;
+        var data = m.base64;
+        if (typeof data !== 'string' || data.indexOf('data:') !== 0) return;
+        var name = m.name || null, mime = dataUrlMime(data) || m.mimeType || null, w = m.width || null, h = m.height || null;
+        _ufsGetRecord(id).then(function(rec) {
+            if (rec) return;
+            var blob = _ufsToBlobSync(data, mime).blob;
+            if (blob.size > UFS_LIMITS.maxFileBytes) return;
+            var now = _ufsNow();
+            var r = { id: id, kind: 'blob', blob: blob, name: name, mime: _ufsPickMime(null, mime, name), size: blob.size, width: w, height: h, source: 'chat', createdAt: now, lastAccess: now };
+            // F5: a newer write for the same id may have replaced our pending
+            // entry — only clear it if it is still ours.
+            var done = Promise.resolve(_ufsBackend().put(r)).catch(function() {}).then(function() { if (_ufsPending.get(id) === done) _ufsPending.delete(id); return id; });
+            _ufsPending.set(id, done);
+        }).catch(function() {});
+    } catch (e) {}
 }
 async function registerFileAsync(spec) { var r = _ufsRegister(spec); await r.done; return r.id; }
 async function registerFileReady(fileId) { var p = _ufsPending.get(fileId); if (p) { try { await p; } catch (e) {} } return fileId; }
@@ -835,10 +878,17 @@ async function _ufsResolveStored(fileId) {
 // Order: unified store (blob / folder pointer), then location pointers.
 async function resolveFile(fileId) {
     if (!fileId) return null;
-    if (!fileIndex.has(fileId)) { var st = await _ufsResolveStored(fileId); if (st) return st; }
+    var shadowed = fileIndex.has(fileId);
+    if (!shadowed) { var st = await _ufsResolveStored(fileId); if (st) return st; }
     var f;
     try { f = await _legacyGetFileAsync(fileId); } catch (e) { f = null; }
-    if (!f || f.data == null) return null;
+    if (!f || f.data == null) {
+        if (!shadowed) return null;
+        // LOST-IDS: stale location pointer — fall back to the store (see getFileAsync).
+        var st2 = null;
+        try { st2 = await _ufsResolveStored(fileId); } catch (e) { st2 = null; }
+        return st2 || null;
+    }
     var c = _ufsToBlobSync(f.data, f.mime);
     var mime = _ufsPickMime(c.head ? sniffMime(c.head) : null, dataUrlMime(f.data) || f.mime, f.name);
     var blob = c.blob.type === mime ? c.blob : c.blob.slice(0, c.blob.size, mime);
@@ -885,19 +935,74 @@ async function _ufsToLegacyShape(r) {
 }
 
 // ─── lifecycle ───
+// LOST-BINARY-IDS: file ids referenced by a saved widget (any retained
+// version, incl. dashboard copies) or a smart document are PINNED: neither
+// the TTL nor the byte/record caps evict them. Without this a widget holding
+// ~26 multi-MB videos + 16 MP PNGs (web_fetch save_file blobs) pushed the
+// store past maxTotalBytes and LRU silently deleted ids the widget still
+// renders ("File not found"). Test seam: _ufsDeps.referencedIds() -> ids.
+var UFS_ID_RE = /file_\d+_\d+/g;
+function _ufsCollectIds(v, set, depth) {
+    if (v == null || (depth || 0) > 8) return;
+    if (typeof v === 'string') { var m = v.match(UFS_ID_RE); if (m) m.forEach(function(id) { set.add(id); }); return; }
+    if (typeof v !== 'object' || (typeof Blob !== 'undefined' && v instanceof Blob)) return;
+    for (var k in v) { if (Object.prototype.hasOwnProperty.call(v, k)) _ufsCollectIds(v[k], set, (depth || 0) + 1); }
+}
+async function _ufsReferencedIds() {
+    var set = new Set();
+    if (_ufsDeps.referencedIds) { (await _ufsDeps.referencedIds() || []).forEach(function(id) { set.add(id); }); return set; }
+    // F2: no app DB in this realm → references unknown → fail safe (skip eviction).
+    // Intentional: realms without openDatabase (and no referencedIds seam)
+    // NEVER evict — cleanup must run in a realm that can see the references.
+    if (typeof openDatabase !== 'function') return undefined;
+    var db = await openDatabase();
+    var names = [typeof widgetStoreName !== 'undefined' ? widgetStoreName : 'widgets',
+        typeof dashboardWidgetsStoreName !== 'undefined' ? dashboardWidgetsStoreName : 'dashboardWidgets',
+        typeof documentsStoreName !== 'undefined' ? documentsStoreName : 'documents'];
+    for (var i = 0; i < names.length; i++) {
+        if (!db.objectStoreNames.contains(names[i])) continue;
+        var rows = await new Promise(function(res, rej) {
+            var rq = db.transaction(names[i], 'readonly').objectStore(names[i]).getAll();
+            rq.onsuccess = function() { res(rq.result || []); }; rq.onerror = function() { rej(rq.error); };
+        });
+        rows.forEach(function(r) { _ufsCollectIds(r, set, 0); });
+    }
+    return set;
+}
 // Evicts BLOB records only: TTL on lastAccess, then LRU down to the total-
-// bytes / record caps. Folder pointer records and the folders themselves
-// (Agent Files, connected folders) are never touched.
+// bytes / record caps. Folder pointer records, the folders themselves
+// (Agent Files, connected folders) and ids referenced by saved widgets /
+// documents are never touched. If the reference scan fails, nothing is
+// evicted this round (fail safe: a later cleanup retries).
+// NEW-IDS: blobs created within graceMs are never evicted either. Pinned
+// widget media can exceed maxTotalBytes on its own (371 MB observed), and
+// then the LRU loop evicted EVERY unpinned blob — including one registered
+// milliseconds earlier whose widget/doc reference was not saved yet. A fresh
+// realm (Reload / SW restart, _ufsLastCleanup = 0) runs cleanup right after
+// its first put, so the first id after a reload (file_1_<ts>) vanished.
 async function fileStoreCleanup() {
     var all = await _ufsBackend().all();
-    var now = _ufsNow(), victims = [], total = 0;
+    var refs;
+    try { refs = await _ufsReferencedIds(); } catch (e) { refs = undefined; }
+    if (refs === undefined) return { deleted: [], kept: (all || []).length, total_bytes: 0, skipped: 'reference scan failed' };
+    if (!refs || typeof refs.has !== 'function') return { deleted: [], kept: (all || []).length, total_bytes: 0, skipped: 'reference scan unavailable' };
+    var now = _ufsNow(), victims = [], unpinnedBytes = 0, pinnedBytes = 0, pinned = [], fresh = 0;
     var blobs = (all || []).filter(function(r) { return r && r.kind !== 'folder'; });
     var alive = [];
-    blobs.forEach(function(r) { if (now - (r.lastAccess || r.createdAt || 0) > UFS_LIMITS.ttlMs) victims.push(r.id); else { alive.push(r); total += r.size || 0; } });
+    blobs.forEach(function(r) {
+        if (refs.has(r.id)) { pinned.push(r.id); pinnedBytes += r.size || 0; return; }
+        if (now - (r.createdAt || 0) < UFS_LIMITS.graceMs) { fresh++; unpinnedBytes += r.size || 0; return; }
+        if (now - (r.lastAccess || r.createdAt || 0) > UFS_LIMITS.ttlMs) victims.push(r.id); else { alive.push(r); unpinnedBytes += r.size || 0; }
+    });
+    // F1: pinned blobs can't be evicted, so they don't eat the unpinned
+    // budget below a floor (pinned media alone over the cap used to evict
+    // every unpinned blob older than graceMs).
+    var byteBudget = Math.max(UFS_LIMITS.minUnpinnedBytes || 0, UFS_LIMITS.maxTotalBytes - pinnedBytes);
+    var recBudget = Math.max(UFS_LIMITS.minUnpinnedRecords || 0, UFS_LIMITS.maxRecords - pinned.length);
     alive.sort(function(a, b) { return (a.lastAccess || 0) - (b.lastAccess || 0); });
-    while (alive.length && (total > UFS_LIMITS.maxTotalBytes || alive.length > UFS_LIMITS.maxRecords)) { var v = alive.shift(); total -= v.size || 0; victims.push(v.id); }
+    while (alive.length && (unpinnedBytes > byteBudget || alive.length + fresh > recBudget)) { var v = alive.shift(); unpinnedBytes -= v.size || 0; victims.push(v.id); }
     for (var i = 0; i < victims.length; i++) { try { await _ufsBackend().del(victims[i]); } catch (e) {} _ufsMem.delete(victims[i]); }
-    return { deleted: victims, kept: alive.length, total_bytes: total };
+    return { deleted: victims, kept: alive.length + pinned.length + fresh, pinned: pinned.length, fresh: fresh, total_bytes: pinnedBytes + unpinnedBytes };
 }
 function _ufsMaybeCleanup() {
     var now = _ufsNow();

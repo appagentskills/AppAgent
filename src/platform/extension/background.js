@@ -1591,22 +1591,81 @@ self.snGetTokenForInstance = snGetTokenForInstance;
 
 // --- Notifications ---
 
+// notificationId -> chatId, so a click can navigate the already-open UI to the
+// chat the notification is about. In-memory + mirrored to storage.session (the
+// SW may be evicted between the toast and the click).
+var _notifChatIds = {};
+function _notifStorageKey(id) { return 'notifChat:' + id; }
+function appagentCreateNotification(title, message, chatId) {
+    // 'appagent-' prefix is REQUIRED (onClicked below filters on it). Random
+    // suffix: two notifications in the same millisecond would share an id and
+    // Chrome silently REPLACES the first (concurrent chats can finish together).
+    var id = 'appagent-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7);
+    if (chatId) {
+        _notifChatIds[id] = chatId;
+        try { var o = {}; o[_notifStorageKey(id)] = chatId; chrome.storage.session.set(o); } catch (e) {}
+    }
+    chrome.notifications.create(id, {
+        type: 'basic',
+        iconUrl: 'icons/AppAgentIconStarOnly_128.png',
+        title: title || 'AppAgent',
+        message: message || ''
+    });
+    return id;
+}
+self.appagentCreateNotification = appagentCreateNotification;
+
+function _takeNotificationChatId(notificationId, cb) {
+    var mem = _notifChatIds[notificationId];
+    delete _notifChatIds[notificationId];
+    var key = _notifStorageKey(notificationId);
+    try {
+        chrome.storage.session.get(key, function(d) {
+            try { chrome.storage.session.remove(key); } catch (e) {}
+            cb(mem || (d && d[key]) || null);
+        });
+    } catch (e) { cb(mem || null); }
+}
+
+// Tell the already-loaded extension page(s) which chat to open. Focusing an
+// existing tab does not reload it, so without this message the UI just stays
+// on whatever chat it was showing. tabId targets one full-page tab; tabId null
+// targets the side panel. Pages handle it in ui/220-notification-system.js.
+function _postOpenChatFromNotification(chatId, tabId) {
+    if (!chatId) return;
+    try {
+        var p = chrome.runtime.sendMessage({ type: 'open-chat-from-notification', chatId: chatId, tabId: tabId });
+        if (p && typeof p.catch === 'function') p.catch(function() {}); // no listener (no page open)
+    } catch (e) {}
+}
+
 chrome.notifications.onClicked.addListener(function(notificationId) {
-    // Focus the AppAgent tab or open side panel when notification is clicked
+    // Focus the AppAgent tab or open side panel when notification is clicked,
+    // then navigate it to the notification's chat.
     if (notificationId.startsWith('appagent-')) {
-        chrome.tabs.query({ url: chrome.runtime.getURL('app.html*') }, function(tabs) {
-            if (tabs.length > 0) {
-                chrome.tabs.update(tabs[0].id, { active: true });
-                chrome.windows.update(tabs[0].windowId, { focused: true });
-            } else {
-                // No full-page tab open — try to open side panel on the focused window
-                chrome.windows.getCurrent(function(win) {
-                    chrome.sidePanel.open({ windowId: win.id }).catch(function() {});
-                });
-            }
+        _takeNotificationChatId(notificationId, function(chatId) {
+            chrome.tabs.query({ url: chrome.runtime.getURL('app.html*') }, function(tabs) {
+                if (tabs.length > 0) {
+                    chrome.tabs.update(tabs[0].id, { active: true });
+                    chrome.windows.update(tabs[0].windowId, { focused: true });
+                    _postOpenChatFromNotification(chatId, tabs[0].id);
+                } else {
+                    // No full-page tab open — try to open side panel on the focused window
+                    chrome.windows.getCurrent(function(win) {
+                        chrome.sidePanel.open({ windowId: win.id }).catch(function() {});
+                    });
+                    _postOpenChatFromNotification(chatId, null);
+                }
+            });
         });
         chrome.notifications.clear(notificationId);
     }
+});
+
+chrome.notifications.onClosed.addListener(function(notificationId) {
+    if (!notificationId || !_notifChatIds[notificationId]) return;
+    delete _notifChatIds[notificationId];
+    try { chrome.storage.session.remove(_notifStorageKey(notificationId)); } catch (e) {}
 });
 
 // --- Message relay ---
@@ -1636,14 +1695,8 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
 
     // Show browser notification (from app when agent finishes in background)
     if (message.type === 'show-notification') {
-        // Random suffix: two notifications in the same millisecond would share an
-        // id and Chrome silently REPLACES the first (concurrent chats can finish together).
-        chrome.notifications.create('appagent-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7), {
-            type: 'basic',
-            iconUrl: 'icons/AppAgentIconStarOnly_128.png',
-            title: message.title || 'AppAgent',
-            message: message.message || ''
-        });
+        // chatId is kept so the click can open that chat (onClicked above).
+        appagentCreateNotification(message.title, message.message, message.chatId || '');
         return;
     }
 
@@ -1676,6 +1729,9 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
             return false;
         }
         p.args = decision.args;
+        // Liveness for chat-less test frames: an admitted inner call is activity
+        // of THIS invocation (request id), stamped again when it settles below.
+        swNoteSandboxActivity(p.sandboxRequestId);
         var execPromise;
         try {
             execPromise = executeTool(p.name, p.args, p.messageIndex, {
@@ -1741,8 +1797,10 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
                     delete result._screenshotMessage;
                 }
             } catch (persistErr) { /* persistence is best-effort; still return the captured result */ }
+            swNoteSandboxActivity(p.sandboxRequestId);
             sendResponse({ ok: true, result: result });
         }).catch(function(err) {
+            swNoteSandboxActivity(p.sandboxRequestId);
             sendResponse({ ok: false, error: err && err.message ? err.message : String(err) });
         });
         return true;
@@ -1790,6 +1848,21 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
             chrome.alarms.create(sleepAlarmName, { when: Date.now() + reqMs });
         }
         return true; // keep the response channel open for the async resolve
+    }
+
+    // Offscreen test frame relays a display-only sandboxTestProgress event.
+    // Same trusted-sender rule as sw-exec-tool; only a LIVE test invocation
+    // (hook registered by callOffscreenHelper) accepts it. It resets that
+    // invocation's inactivity clock and feeds the run_tests progress hook.
+    if (message.type === 'sw-sandbox-progress') {
+        if (!sender || sender.id !== chrome.runtime.id || sender.url !== chrome.runtime.getURL('offscreen.html')) {
+            sendResponse({ ok: false, error: 'Untrusted sandbox progress sender' });
+            return false;
+        }
+        var pp = message.payload || {};
+        var progress = swSanitizeTestProgress(pp.progress);
+        sendResponse({ ok: true, result: { accepted: !!progress && swNoteSandboxActivity(pp.sandboxRequestId, progress) } });
+        return false;
     }
 
     // Side panel requests browser action -> forward to content script in active tab
@@ -7337,6 +7410,33 @@ function swTestPolicyStartupError() {
     return null;
 }
 
+// Per-invocation activity hooks for TEST frames, keyed by the host-minted
+// sandbox request id (never a chat id: worker-served run_tests shards are
+// chat-less). callOffscreenHelper registers the js_eval caller's _onActivity
+// while the invocation is live; the sw-exec-tool relay and the
+// sw-sandbox-progress relay stamp it. Display/liveness only: a hook grants no
+// authority, and an unknown/finished id is simply ignored.
+var _swSandboxActivityHooks = Object.create(null);
+function swNoteSandboxActivity(requestId, progress) {
+    var hook = typeof requestId === 'string' && Object.prototype.hasOwnProperty.call(_swSandboxActivityHooks, requestId)
+        ? _swSandboxActivityHooks[requestId] : null;
+    if (typeof hook !== 'function') return false;
+    try { hook(progress || null); } catch (e) { /* liveness/display only */ }
+    return true;
+}
+// Plain-data copy of a sandboxTestProgress event: only the display fields the
+// run_tests sanitizer (rtShardProgressEvent/rtProgressEvent) understands.
+function swSanitizeTestProgress(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    var out = { type: 'sandboxTestProgress' };
+    if (typeof raw.index === 'number' && isFinite(raw.index)) out.index = raw.index;
+    if (typeof raw.file === 'string') out.file = raw.file.slice(0, 500);
+    if (raw.phase === 'start' || raw.phase === 'done') out.phase = raw.phase;
+    if (typeof raw.status === 'string') out.status = raw.status.slice(0, 50);
+    ['passed', 'failed', 'skipped'].forEach(function(k) { if (typeof raw[k] === 'number' && isFinite(raw[k])) out[k] = raw[k]; });
+    return out;
+}
+
 // Called by the SW runtime (sw-bundle.js, worker/010-platform-stub.js)
 // any time the agent loop needs DOM (js_eval, skills sandbox, image).
 // timeoutMs gates readiness, not execution. Sandbox callers may additionally
@@ -7352,18 +7452,22 @@ async function callOffscreenHelper(type, payload, timeoutMs, signal) {
         if (policyError) { reject(policyError); return; }
         var requestId = isSandbox ? 'sandbox_' + crypto.randomUUID() : null;
         var testKey = payload && payload._testRunContext || null;
+        var onActivity = payload && typeof payload._onActivity === 'function' ? payload._onActivity : null;
         var wirePayload = Object.assign({}, payload);
         delete wirePayload._testRunContext;
+        delete wirePayload._onActivity;
         delete wirePayload.testRunPolicy;
         if (requestId) {
             TestRunPolicy.registry.bind(requestId, testKey);
             if (testKey) wirePayload.testRunPolicy = TestRunPolicy.registry.descriptor(testKey);
             wirePayload.sandboxRequestId = requestId;
+            // Test frames only: general js_eval keeps its chat-keyed watchdog.
+            if (testKey && onActivity) _swSandboxActivityHooks[requestId] = onActivity;
         }
         function finish(error, result) {
             if (settled) return;
             settled = true;
-            if (requestId) TestRunPolicy.registry.unbind(requestId);
+            if (requestId) { TestRunPolicy.registry.unbind(requestId); delete _swSandboxActivityHooks[requestId]; }
             if (signal) signal.removeEventListener('abort', onAbort);
             if (error) reject(error);
             else resolve(result);

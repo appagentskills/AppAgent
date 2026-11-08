@@ -815,6 +815,7 @@ function _wsfRevealToolCall(msgIdx, tcIdx) {
     for (var d = tcEl.parentElement; d; d = d.parentElement) if (d.tagName === 'DETAILS') d.open = true; // compact group
     if (typeof collapseOtherTools === 'function') collapseOtherTools(tcEl);
     tcEl.open = true;
+    if (typeof releaseChatFollow === 'function') releaseChatFollow(tcEl);
     tcEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
     tcEl.classList.add('highlight-flash');
     setTimeout(function() { tcEl.classList.remove('highlight-flash'); }, 2000);

@@ -328,6 +328,18 @@
                     registry: TestRunPolicy.registry, context: context,
                     code: String(payload.code || ''), document: document, window: window,
                     signal: controller.signal,
+                    // Display-only progress relay (sandboxTestProgress) to the SW,
+                    // keyed by the host request id. It resets that invocation's
+                    // inactivity watchdog (chat-less Reload preflight shards) and
+                    // feeds the run_tests progress hook. Plain fields only; the SW
+                    // re-sanitizes and drops it unless this invocation is live.
+                    onProgress: function(d) {
+                        if (controller.signal.aborted) return;
+                        var ev = { index: d.index, file: d.file, phase: d.phase, status: d.status, passed: d.passed, failed: d.failed, skipped: d.skipped };
+                        try {
+                            Promise.resolve(chrome.runtime.sendMessage({ type: 'sw-sandbox-progress', payload: { sandboxRequestId: id, progress: ev } })).catch(function() {});
+                        } catch (_) { /* display/liveness only */ }
+                    },
                     dispatch: function(name, args, callId) {
                         if (name === '__sandbox_sleep') return swSleep(args.ms, payload.chatId, function() { return controller.signal.aborted; }).then(function() { return { __sleep_ok: true }; });
                         return chrome.runtime.sendMessage({ type: 'sw-exec-tool', payload: {

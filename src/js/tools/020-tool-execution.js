@@ -1860,20 +1860,37 @@ async function _executeToolInner(name, args, messageIndex, options) {
                     else options._testRunSignal.addEventListener('abort', _testAbort, { once: true });
                 }
                 var swEvalResult;
+                // Test frames get a PER-CALL activity clock, not one keyed by chatId:
+                // worker-served runs (Reload preflight via rtServeWorkerRequest) are
+                // chat-less, so _sandboxActivity[chatId] could never move and every
+                // shard longer than 5 minutes was killed while still working. The
+                // background transport stamps it (by its own sandbox request id) on
+                // every relayed inner tool call and on every relayed progress event,
+                // which is also forwarded to the host-only _testRunOnProgress hook.
+                var _testLast = 0;
+                var _swHelperPayload = {
+                    code: _testKey ? args.code : sanitizedCodeSw,
+                    _testRunContext: _testKey || null,
+                    chatId: chatId,
+                    messageIndex: messageIndex,
+                    // Plumb the js_eval toolCallId down so display calls from
+                    // inside the sandbox can eager-render attached to this
+                    // tool's result slot. See executeDisplay's eager-render path.
+                    parentToolCallId: options && options.toolCallId,
+                    globals: { lastLargeResponse: (chatId && lastLargeResponseByChatId[chatId]) || null } // CONC-FIX: this chat's own slot, not the shared global
+                };
+                if (_testKey) {
+                    _swHelperPayload._onActivity = function(progress) {
+                        _testLast = Date.now();
+                        if (progress && typeof options._testRunOnProgress === 'function') {
+                            try { options._testRunOnProgress(progress); } catch (_pe) { /* display only */ }
+                        }
+                    };
+                }
                 if (chatId) _sandboxEvalCount[chatId] = (_sandboxEvalCount[chatId] || 0) + 1; // PR383-F1
                 try {
                     swEvalResult = await Promise.race([
-                        Platform.callOffscreenHelper('helper-js-eval', {
-                            code: _testKey ? args.code : sanitizedCodeSw,
-                            _testRunContext: _testKey || null,
-                            chatId: chatId,
-                            messageIndex: messageIndex,
-                            // Plumb the js_eval toolCallId down so display calls from
-                            // inside the sandbox can eager-render attached to this
-                            // tool's result slot. See executeDisplay's eager-render path.
-                            parentToolCallId: options && options.toolCallId,
-                            globals: { lastLargeResponse: (chatId && lastLargeResponseByChatId[chatId]) || null } // CONC-FIX: this chat's own slot, not the shared global
-                        }, 5 * 60 * 1000, _swEvalAbort.signal),
+                        Platform.callOffscreenHelper('helper-js-eval', _swHelperPayload, 5 * 60 * 1000, _swEvalAbort.signal),
                         new Promise(function(_, rej) {
                             var _swLast = Date.now();
                             _swEvalTimer = setInterval(function() {
@@ -1889,6 +1906,7 @@ async function _executeToolInner(name, args, messageIndex, options) {
                                 }
                                 var _act = chatId && _sandboxActivity[chatId];
                                 if (_act && _act > _swLast) _swLast = _act;
+                                if (_testLast > _swLast) _swLast = _testLast;
                                 if (Date.now() - _swLast >= 5 * 60 * 1000) {
                                     rej(new Error('js_eval timed out after 5 minutes of inactivity (no tool calls or completion)'));
                                     // H18: a sync-looping eval freezes the offscreen document;
@@ -3664,7 +3682,7 @@ function _wsForeignOwnership(f, chatId) {
     var msg = running
         ? '\u26a0 Work in progress by another agent \u2014 chat' + who + ' (' + f.last_modified_by_chat_id + ') is still running and has uncommitted edits to this file' + (ago ? ' (' + ago + ')' : '') + '. Leave it alone: mutations are blocked unless you pass {"force": true}.'
         : recent
-        ? '\u26a0 RECENTLY EDITED ' + (ago || 'just now') + ' by another chat' + who + ' (' + f.last_modified_by_chat_id + ') \u2014 likely still in progress; mutations are blocked unless you pass {"force": true}.'
+        ? '\u26a0 Recently edited ' + (ago || 'just now') + ' by another chat' + who + ' (' + f.last_modified_by_chat_id + ') \u2014 likely still in progress; mutations are blocked unless you pass {"force": true}.'
         : 'Uncommitted changes by another (now dormant) chat' + who + ' (' + f.last_modified_by_chat_id + ')' + (ago ? ' \u2014 last edited ' + ago : '') + '. Mutating this file will silently take over ownership.';
     return {
         path: f.path,
@@ -5899,7 +5917,7 @@ async function wsMaybeAutoDeleteMerged(wk, meta) {
                     base_branch: baseBranch,
                     pr_number: mergedPr.number,
                     conflicts: (moveRes && moveRes.conflicts) || [],
-                    warning: 'Branch "' + branch + '" was merged (PR #' + mergedPr.number + ') but the workspace was KEPT: its dirty file(s) could not be moved to "' + baseWk + '"' + (moveRes && moveRes.conflicts && moveRes.conflicts.length ? ' (conflicting paths: ' + moveRes.conflicts.join(', ') + ')' : (moveRes && moveRes.error ? ' (' + moveRes.error + ')' : '')) + '. Resolve the conflicts, then re-sync.'
+                    warning: 'Branch "' + branch + '" was merged (PR #' + mergedPr.number + ') but the workspace was kept: its dirty file(s) could not be moved to "' + baseWk + '"' + (moveRes && moveRes.conflicts && moveRes.conflicts.length ? ' (conflicting paths: ' + moveRes.conflicts.join(', ') + ')' : (moveRes && moveRes.error ? ' (' + moveRes.error + ')' : '')) + '. Resolve the conflicts, then re-sync.'
                 };
             }
             movedDirty = moveRes.moved || [];
@@ -5930,7 +5948,7 @@ async function wsMaybeAutoDeleteMerged(wk, meta) {
         }
         function _wsLateDirtyKept(paths) {
             return { deleted: false, kept: true, workspace: wk, branch: branch, base_branch: baseBranch, pr_number: mergedPr.number, late_dirty: paths, conflicts: [],
-                warning: 'Branch "' + branch + '" was merged (PR #' + mergedPr.number + ') but the workspace was KEPT: ' + paths.length + ' file(s) were modified during the merge cleanup and were not moved to "' + baseWk + '": ' + paths.join(', ') + '. Move or push them, then re-sync.' };
+                warning: 'Branch "' + branch + '" was merged (PR #' + mergedPr.number + ') but the workspace was kept: ' + paths.length + ' file(s) were modified during the merge cleanup and were not moved to "' + baseWk + '": ' + paths.join(', ') + '. Move or push them, then re-sync.' };
         }
         var _late1 = await _wsLateDirty();
         if (_late1.length > 0) return _wsLateDirtyKept(_late1);
@@ -7759,12 +7777,12 @@ async function wsPush(wk, args, chatId, chatTitle) {
             if (_pOwn) {
                 entry.foreign_chat = true;
                 entry.other_chat_running = _pOwn.other_chat_running;
-                entry.message = 'Edited by ANOTHER chat "' + (entry.last_modified_by_chat_title || '(untitled chat)') + '" (' + entry.last_modified_by_chat_id + ')' + (entry.last_modified_ago ? ' \u2014 last edited ' + entry.last_modified_ago : '') + '.';
+                entry.message = 'Edited by another chat "' + (entry.last_modified_by_chat_title || '(untitled chat)') + '" (' + entry.last_modified_by_chat_id + ')' + (entry.last_modified_ago ? ' \u2014 last edited ' + entry.last_modified_ago : '') + '.';
                 _pushCrossChatWarnings.push({
                     path: f.path,
                     owner_chat_id: entry.last_modified_by_chat_id,
                     owner_chat_title: entry.last_modified_by_chat_title,
-                    message: '\u26a0 "' + f.path + '" was committed to PR #' + prNumber + ' but its uncommitted changes belong to ANOTHER chat "' + (entry.last_modified_by_chat_title || '(untitled chat)') + '" (' + entry.last_modified_by_chat_id + ')' + (entry.last_modified_ago ? ' \u2014 last edited ' + entry.last_modified_ago : '') + '. If that was unintended, revert it with a follow-up commit and scope future pushes with files:[...].'
+                    message: '\u26a0 "' + f.path + '" was committed to PR #' + prNumber + ' but its uncommitted changes belong to another chat "' + (entry.last_modified_by_chat_title || '(untitled chat)') + '" (' + entry.last_modified_by_chat_id + ')' + (entry.last_modified_ago ? ' \u2014 last edited ' + entry.last_modified_ago : '') + '. If that was unintended, revert it with a follow-up commit and scope future pushes with files:[...].'
                 });
             } else {
                 entry.message = 'Edited by this chat (chat/agent ' + f.last_modified_by_chat_id + ')' + (entry.last_modified_ago ? ' (' + entry.last_modified_ago + ')' : '') + '.';

@@ -11,7 +11,7 @@ var FILES = ['src/js/core/055-emoji-shortcodes.js', 'src/js/core/060-ui-constant
 var CSS = ['src/css/00-tokens.css', 'src/css/03-chat.css', 'src/css/05-tools.css'];
 // typeof-probed (lenient) globals renderMessages/formatContent touch; anything
 // else unstubbed fails loadUi/assertUnstubbed.
-var ALLOW = ['smartDocuments', '_isChatInSilentHook', 'currentEditingWidget', 'getDisplayHtmlForMessage', 'isChatRunning', 'AgentEvents'];
+var ALLOW = ['smartDocuments', '_isChatInSilentHook', 'currentEditingWidget', 'getDisplayHtmlForMessage', 'isChatRunning', 'AgentEvents', 'updateScrollToBottomButton'];
 var HOSTILE = '<img src=x onerror="window.__pwn=1"><script>window.__pwn=2</script>';
 
 function noop() { return ''; }
@@ -116,7 +116,8 @@ describe('ui message cards › code blocks (formatContent)', function() {
         assert.strictEqual(dom.$('b'), null); assert.match(dom.$('pre code').textContent, /var a = "<b>x<\/b>";/);
         var exp = dom.$('.code-block-expand-btn'), cp = dom.$('.code-copy-btn');
         assert.strictEqual(exp.getAttribute('title'), 'Expand'); assert.strictEqual(exp.textContent, '⤢');
-        assert.strictEqual(U.a11y(exp).hasName, true); assert.strictEqual(U.a11y(cp).name, 'Copy');
+        assert.strictEqual(U.a11y(exp).hasName, true); assert.strictEqual(U.a11y(cp).name, 'Copy code'); assert.strictEqual(cp.getAttribute('title'), 'Copy');
+        assert.strictEqual(cp.getAttribute('type'), 'button'); assert.ok(cp.querySelector('svg'), 'clipboard icon');
         assert.ok(dom.$('.sh-keyword'), 'syntax highlight span');
     }, { tags: ['unit'] });
     test('expand button toggles collapsed <-> expanded and stops propagation', async function() {
@@ -129,14 +130,162 @@ describe('ui message cards › code blocks (formatContent)', function() {
         U.fireInline(btn, 'click', m);
         assert.ok(pre.classList.contains('collapsed')); assert.strictEqual(w.classList.contains('expanded'), false); assert.strictEqual(btn.title, 'Expand');
     }, { tags: ['unit'] });
-    test('copy button copies RAW code and reports success / failure via snackbar', async function() {
+    test('copy button copies RAW code, shows an inline Copied state that reverts, and reports failure', async function() {
         var snack = U.recorder(), m = await load({ showSnackbar: snack });
         var dom = await U.mountDom({ html: m.formatContent('```\n<raw> & "q"\n```') });
-        var clip = m.__scope.navigator.clipboard;
+        var clip = m.__scope.navigator.clipboard, cp = dom.$('.code-copy-btn'), origHtml = cp.innerHTML;
+        U.fireInline(cp, 'click', m); await U.flush();
+        assert.deepStrictEqual(clip.writes, ['<raw> & "q"\n']);
+        assert.deepStrictEqual(snack.calls, [], 'inline confirmation replaces the success snackbar');
+        assert.ok(cp.classList.contains('copied'), 'copied class');
+        assert.strictEqual(cp.querySelector('.code-copy-label').textContent, 'Copied');
+        assert.strictEqual(cp.getAttribute('aria-label'), 'Copied');
+        await new Promise(function(r) { setTimeout(r, 1700); });
+        assert.strictEqual(cp.classList.contains('copied'), false, 'reverted');
+        assert.strictEqual(cp.innerHTML, origHtml); assert.strictEqual(cp.getAttribute('aria-label'), 'Copy code');
+        clip.mode = 'fail'; U.fireInline(cp, 'click', m); await U.flush();
+        // execCommand fallback has no user activation in the sandbox -> reports failure.
+        assert.deepStrictEqual(snack.calls[0], ['Copy failed', 'error']);
+    }, { tags: ['unit'], timeout: 5000 });
+    test('copy button is rendered for every fenced block kind: no language, odd info strings, unterminated (streaming)', async function() {
+        var m = await load();
+        var cases = ['```\nplain text\n```', '```c++\nint a;\n```', '```json \n{"a":1}\n```', 'Streaming:\n```python\nprint(1)\n'];
+        cases.forEach(function(src) {
+            var b = U.frag(m.formatContent(src));
+            assert.strictEqual(b.querySelectorAll('.code-block-wrapper > .code-copy-btn').length, 1, 'copy button for ' + JSON.stringify(src));
+            assert.strictEqual(b.textContent.indexOf('```'), -1, 'fence markers consumed for ' + JSON.stringify(src));
+        });
+        assert.strictEqual(U.frag(m.formatContent('```c++\nint a;\n```')).querySelector('pre code').textContent, 'int a;\n');
+    }, { tags: ['unit'] });
+    test('blockquote copy: plain text without > markers or HTML (single, multi-line, inline formatting, nested)', async function() {
+        var snack = U.recorder(), m = await load({ showSnackbar: snack });
+        var cases = [
+            ['> just one line', 'just one line'],
+            ['> line one\n> line two\n>\n> second para', 'line one\nline two\n\nsecond para'],
+            ['> **bold** and `code` and [link](https://e.com)', 'bold and code and link'],
+            ['> outer\n> > inner', 'outer\n\n> inner']
+        ];
+        for (var i = 0; i < cases.length; i++) {
+            var dom = await U.mountDom({ html: m.formatContent(cases[i][0]) });
+            var btns = dom.$$('.md-quote-wrapper > .quote-copy-btn');
+            assert.strictEqual(btns.length, 1, 'one button for ' + cases[i][0]);
+            assert.strictEqual(btns[0].getAttribute('aria-label'), 'Copy quote');
+            var clip = m.__scope.navigator.clipboard; clip.writes.length = 0;
+            U.fireInline(btns[0], 'click', m); await U.flush();
+            assert.deepStrictEqual(clip.writes, [cases[i][1]], 'copied text for ' + cases[i][0]);
+            assert.ok(btns[0].classList.contains('copied'), 'Copied state');
+            U.cleanupAll();
+        }
+        var f = U.frag(m.formatContent('> **bold** and `code` and [link](https://e.com)'));
+        assert.ok(f.querySelector('blockquote strong') && f.querySelector('blockquote code.inline-code') && f.querySelector('blockquote a[href="https://e.com"]'), 'inline formatting still renders');
+        assert.deepStrictEqual(snack.calls, []);
+    }, { tags: ['unit'], timeout: 5000 });
+    // Quote rich copy: a fake ClipboardItem/Blob + clipboard.write recorder.
+    function richClip(m, mode) {
+        var clip = m.__scope.navigator.clipboard, rec = { items: [], mode: mode || 'ok' };
+        m.__scope.window.ClipboardItem = function(data) { this.data = data; };
+        m.__scope.window.Blob = function(parts, o) { this.text = parts.join(''); this.type = o && o.type; };
+        clip.write = function(arr) {
+            rec.items.push({ html: arr[0].data['text/html'].text, plain: arr[0].data['text/plain'].text, htmlType: arr[0].data['text/html'].type });
+            return rec.mode === 'ok' ? Promise.resolve() : Promise.reject(new Error('denied'));
+        };
+        clip.writes.length = 0;
+        return rec;
+    }
+    var RICH_SRC = '> **Plan** for [docs](https://e.com/a) and `npm  test` ~~old~~ now:\n> \tindented with tab\n>     four spaces\n> line two\n>\n> - item one\n>   - nested\n> - item two\n>\n> 3. third\n> 4. fourth\n>\n> > inner **quote**';
+    var RICH_PLAIN = 'Plan for docs and npm  test old now:\n\tindented with tab\n    four spaces\nline two\n\n- item one\n  - nested\n- item two\n\n3. third\n4. fourth\n\n> inner quote';
+    test('blockquote render keeps tabs, leading indentation and single line breaks (pre-wrap)', async function() {
+        var m = await load(), dom = await U.mountDom({ html: '<div class="message-content">' + m.formatContent('> \ttab line\n>     four\n> a  b\tc\n> last') + '</div>', css: CSS.concat(['src/css/07-markdown.css']) });
+        var p = dom.$('.md-blockquote .md-paragraph');
+        assert.strictEqual(p.textContent, '\ttab line    foura  b\tclast', 'whitespace kept in the DOM');
+        assert.strictEqual(p.querySelectorAll('br').length, 3, 'single line breaks kept');
+        assert.strictEqual(U.css(p, 'white-space'), 'pre-wrap');
+        // Outside quotes nothing changes.
+        assert.strictEqual(U.frag(m.formatContent('\tplain  text')).textContent, 'plain  text');
+    }, { tags: ['unit'] });
+    test('blockquote rich copy: text/html + text/plain in one ClipboardItem (bold/italic/strike/link/code, tabs, indentation, lists, nested quote)', async function() {
+        var snack = U.recorder(), m = await load({ showSnackbar: snack }), rec = richClip(m);
+        var dom = await U.mountDom({ html: m.formatContent(RICH_SRC) });
+        var btn = dom.$('.md-quote-wrapper > .quote-copy-btn');
+        U.fireInline(btn, 'click', m); await U.flush();
+        assert.strictEqual(rec.items.length, 1, 'one clipboard.write');
+        assert.deepStrictEqual(m.__scope.navigator.clipboard.writes, [], 'no writeText when write() succeeds');
+        var it = rec.items[0];
+        assert.strictEqual(it.htmlType, 'text/html');
+        assert.strictEqual(it.plain, RICH_PLAIN, 'plain flavour: ' + JSON.stringify(it.plain) + ' html: ' + it.html);
+        var h = it.html;
+        assert.ok(/<b>Plan<\/b>/.test(h) && /<s>old<\/s>/.test(h), 'bold/strike: ' + h);
+        // formatContent has no single-* italic; the serializer still maps <em>/<i>.
+        var em = document.createElement('blockquote'); em.innerHTML = '<span class="md-paragraph"><em>it</em> <i data-x="1" class="k">al</i></span>';
+        assert.strictEqual(m._quoteRichHtml(em), '<meta charset="utf-8"><div><p style="margin:0 0 1em"><i>it</i>&nbsp;<i>al</i></p></div>');
+        assert.strictEqual(m._quotePlainText(em), 'it al');
+        assert.ok(/<a href="https:\/\/e\.com\/a">docs<\/a>/.test(h), 'absolute link');
+        assert.ok(/<code style="font-family:[^"]*monospace;">npm&nbsp;&nbsp;test<\/code>/.test(h), 'monospace inline code');
+        assert.ok(h.indexOf('&emsp;&emsp;indented with tab') >= 0, 'tab -> em spaces');
+        assert.ok(h.indexOf('&nbsp;&nbsp;&nbsp;&nbsp;four spaces') >= 0, 'leading spaces -> nbsp');
+        assert.ok(/<br>/.test(h) && /<p style="margin:0 0 1em">/.test(h), 'br + paragraphs');
+        assert.ok(/<ul><li>item one<ul><li>nested<\/li><\/ul><\/li><li>item two<\/li><\/ul>/.test(h), 'nested ul: ' + h);
+        assert.ok(/<ol start="3"><li>third<\/li><li>fourth<\/li><\/ol>/.test(h), 'ol start');
+        assert.ok(/<blockquote style="[^"]*"><p[^>]*>inner <b>quote<\/b><\/p><\/blockquote>/.test(h), 'nested quote');
+        assert.ok(!/class=|data-|<button|<svg|onclick|md-/.test(h), 'no app classes/attrs/controls');
+        assert.ok(btn.classList.contains('copied'), 'Copied state');
+        assert.deepStrictEqual(snack.calls, []);
+    }, { tags: ['unit'], timeout: 5000 });
+    test('blockquote rich copy: task items, code block inside a quote, hostile text escaped', async function() {
+        var m = await load(), rec = richClip(m);
+        var dom = await U.mountDom({ html: m.formatContent('> - [x] done\n> - [ ] todo\n>\n> ```\n> a\t<b>\n> ```\n>\n> &lt;x&gt; <img src=x onerror=1>') });
+        U.fireInline(dom.$('.quote-copy-btn'), 'click', m); await U.flush();
+        var it = rec.items[0];
+        assert.ok(/^- \[x\] done\n- \[ \] todo/.test(it.plain), 'task markers: ' + JSON.stringify(it.plain));
+        assert.ok(it.plain.indexOf('a\t<b>') >= 0, 'raw code kept: ' + JSON.stringify(it.plain));
+        assert.ok(/<pre style="[^"]*monospace;white-space:pre-wrap[^"]*">[^<]*a\t&lt;b&gt;/.test(it.html), 'code block as pre: ' + it.html);
+        assert.ok(it.html.indexOf('&#9745; done') >= 0 && it.html.indexOf('&#9744; todo') >= 0, 'checkbox glyphs');
+        assert.ok(!/<img|onerror=1"|<x>/.test(it.html), 'escaped: ' + it.html);
+    }, { tags: ['unit'], timeout: 5000 });
+    test('blockquote rich copy fallbacks: write() rejected -> writeText(plain); no ClipboardItem -> writeText; all fail -> Copy failed', async function() {
+        var snack = U.recorder(), m = await load({ showSnackbar: snack }), rec = richClip(m, 'fail');
+        var dom = await U.mountDom({ html: m.formatContent('> **a**\n> \tb') });
+        var clip = m.__scope.navigator.clipboard, btn = dom.$('.quote-copy-btn');
+        U.fireInline(btn, 'click', m); await U.flush(); await U.flush();
+        assert.strictEqual(rec.items.length, 1, 'write attempted');
+        assert.deepStrictEqual(clip.writes, ['a\n\tb'], 'fell back to writeText(plain)');
+        assert.ok(btn.classList.contains('copied'), 'Copied state after fallback');
+        // No ClipboardItem at all -> straight to writeText.
+        m.__scope.window.ClipboardItem = undefined; clip.writes.length = 0; rec.items.length = 0;
+        U.fireInline(btn, 'click', m); await U.flush();
+        assert.strictEqual(rec.items.length, 0); assert.deepStrictEqual(clip.writes, ['a\n\tb']);
+        // Everything rejects -> execCommand (no user activation in the sandbox) -> Copy failed.
+        m.__scope.window.ClipboardItem = function(d) { this.data = d; }; clip.mode = 'fail'; clip.writes.length = 0;
+        U.fireInline(btn, 'click', m); await U.flush(); await U.flush();
+        assert.deepStrictEqual(clip.writes, ['a\n\tb']);
+        assert.deepStrictEqual(snack.calls, [['Copy failed', 'error']]);
+    }, { tags: ['unit'], timeout: 5000 });
+    test('code blocks keep copying raw plain text even when clipboard.write is available', async function() {
+        var m = await load(), rec = richClip(m);
+        var dom = await U.mountDom({ html: m.formatContent('```\n\t<raw> **x**\n```') });
         U.fireInline(dom.$('.code-copy-btn'), 'click', m); await U.flush();
-        assert.deepStrictEqual(clip.writes, ['<raw> & "q"\n']); assert.deepStrictEqual(snack.calls, [['Copied to clipboard', 'success', undefined, { transient: true }]]);
-        clip.mode = 'fail'; U.fireInline(dom.$('.code-copy-btn'), 'click', m); await U.flush();
-        assert.deepStrictEqual(snack.calls[1], ['Copy failed', 'error']);
+        assert.strictEqual(rec.items.length, 0, 'no rich write for code');
+        assert.deepStrictEqual(m.__scope.navigator.clipboard.writes, ['\t<raw> **x**\n']);
+    }, { tags: ['unit'], timeout: 5000 });
+    test('blockquote CSS: readable text color, primary accent bar, room for the copy button', async function() {
+        var m = await load(), dom = await U.mountDom({ html: '<div class="message-content">' + m.formatContent('> quote') + '</div><span id="tp" style="color: var(--text-primary); border-left: 3px solid var(--primary)">x</span>', css: CSS.concat(['src/css/07-markdown.css']) });
+        var bq = dom.$('.md-blockquote'), probe = dom.$('#tp');
+        assert.strictEqual(U.css(bq, 'color'), U.css(probe, 'color'), 'text uses --text-primary');
+        assert.strictEqual(U.css(bq, 'border-left-color'), U.css(probe, 'border-left-color'), 'accent bar uses --primary');
+        assert.strictEqual(U.css(bq, 'padding-right'), '40px');
+        assert.strictEqual(U.css(bq, 'font-style'), 'normal');
+        assert.strictEqual(U.css(bq, 'border-left-width'), U.css(probe, 'border-left-width'), '3px accent bar');
+        assert.strictEqual(U.css(dom.$('.quote-copy-btn'), 'right'), '6px');
+        assert.strictEqual(U.css(dom.$('.quote-copy-btn'), 'opacity'), '0');
+        assert.strictEqual(U.css(dom.$('.md-quote-wrapper'), 'position'), 'relative');
+    }, { tags: ['unit'] });
+    test('toolbar CSS: top-right, hidden until hover/focus, room reserved on the right', async function() {
+        var m = await load(), dom = await U.mountDom({ html: m.formatContent('```\nx\n```'), css: CSS.concat(['src/css/07-markdown.css']) });
+        var cp = dom.$('.code-copy-btn'), exp = dom.$('.code-block-expand-btn');
+        assert.strictEqual(U.css(cp, 'position'), 'absolute'); assert.strictEqual(U.css(cp, 'top'), '6px'); assert.strictEqual(U.css(cp, 'right'), '38px');
+        assert.strictEqual(U.css(exp, 'right'), '6px');
+        assert.strictEqual(U.css(cp, 'opacity'), '0', 'subtle until hover/focus');
+        assert.strictEqual(U.css(dom.$('pre.code-block'), 'padding-right'), '76px');
     }, { tags: ['unit'] });
     test('hostile markdown: no live tags, javascript: links not linkified, quote-breaking href escaped', async function() {
         var m = await load(), b = U.frag(m.formatContent(HOSTILE + ' [x](javascript:alert(1)) [y](https://ok.com/"onmouseover="z)'));

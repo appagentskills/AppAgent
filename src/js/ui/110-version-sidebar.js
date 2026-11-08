@@ -198,6 +198,7 @@ function scrollToMessage(messageIndex) {
             if (contentEl) scrollTarget = contentEl;
         }
         
+        if (typeof releaseChatFollow === 'function') releaseChatFollow(scrollTarget);
         scrollTarget.scrollIntoView({ behavior: 'smooth', block: 'center' });
         scrollTarget.classList.add('highlight-flash');
         setTimeout(function() { scrollTarget.classList.remove('highlight-flash'); }, 2000);

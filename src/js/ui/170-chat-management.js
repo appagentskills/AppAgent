@@ -1059,6 +1059,9 @@ function selectChat(chatId, options) {
         // An interrupted chat (e.g. page reloaded mid-stream) gets Continue from
         // the CHAT-CONTROLS derive below, once this chat is the displayed one.
     }
+    // SCROLL-SWITCH: scroll state is per chat — a real switch lands the new
+    // chat at its bottom (following), never at the previous chat's scrollTop.
+    if (chatId !== currentChatId && typeof resetChatScrollForSwitch === 'function') resetChatScrollForSwitch(chatId);
     currentChatId = chatId;
     appStorage.setItem('lastChatId', chatId);
     // CHAT-CONTROLS SSOT: paint Pause/Resume/Retry/Continue for the chat that is
@@ -1492,6 +1495,7 @@ async function deleteChat(chatId, e) {
     try { if (typeof pendingWidgetRegenerationByChatId !== 'undefined' && pendingWidgetRegenerationByChatId) delete pendingWidgetRegenerationByChatId[chatId]; } catch (ePw) {}
     // NEW-T21-1: the #messages scroll listener (ui/010-skills-ui.js) persists
     // appStorage 'scrollPos_<id>' and nothing else removes it, so drop it here.
+    try { if (typeof cancelChatScrollSave === 'function') cancelChatScrollSave(chatId); } catch (eCs) {}
     try { appStorage.removeItem('scrollPos_' + chatId); } catch (eSp) {}
     // Expanded-state maps (core/030-config.js) are keyed by chatId+':'+…
     try {

@@ -51,7 +51,7 @@ var TOOL_DEFINITION = {
         sources: { type: "object", additionalProperties: { type: "string" }, description: "Offline alternative to files: {path: sourceText} analysed as the targets (same as D.run({files:{...}})). Combine with corpus for deterministic lookups." },
         prose: { type: "string", description: "Your deroulement draft. Only single-backticked tokens are checked: `fn()`, `fn:123`, `.class`, `#id`, `path/file.js:10`." },
         workspace: { type: "string", description: "Workspace key for live lookups, e.g. owner/AppAgent::main. Default: the current workspace." },
-        corpus: { type: "object", additionalProperties: { type: "string" }, description: "{path: sourceText}: when given it is the ONLY code base searched (offline, deterministic). Put test files here, not in files." },
+        corpus: { type: "object", additionalProperties: { type: "string" }, description: "{path: sourceText}: when given it is the only code base searched (offline, deterministic). Put test files here, not in files." },
         diff: { type: "string", description: "Unified diff limiting the changed-function analysis. Default: the live workspace diff of each file." },
         functions: { type: "array", items: { type: "string" }, description: "Names of the functions you changed (union with the diff). Without a diff, functions with more than 5 branches otherwise collapse into one summary row." },
         functionsOnly: { type: "boolean", description: "Analyse only the named functions." },
@@ -80,9 +80,9 @@ var DR_LIMITATIONS = [
     'No AST: static checks are regexes over a lexical mask (comments, string/template text and regex bodies blanked). A regex literal after `)` or `]`, JSX and TypeScript can mis-mask.',
     'parseGateJs compiles with the AsyncFunction constructor: it accepts top-level await/return that a classic script rejects, strips import/export with line regexes, and gives no line number (hint = first unbalanced bracket).',
     'findFunctions sees `function` declarations/expressions, `x = function`, `x: function`, block-bodied arrows assigned to a name (default parameters may nest one level of parentheses), and line-start methods including static, async, get/set, *generator and async *generator. Expression-bodied arrows and computed names are missed.',
-    'Wiring counts only references in masked code (comments and string text blanked) of non-excluded .js/.html files, outside the function own body: docs, comments, strings and test/ do not count (test-only references are unverified). Common names (render, init) can over-count, and dynamic dispatch (obj[name](), string handlers, tool registries) under-counts: declare those in opts.entryPoints or opts.waive:{name:reason}, which downgrade ONLY "defined but not referenced" wiring rows to unverified (never a missing symbol, id, handler, parse, file, probe or mutation row).',
-    'Every grep hit is judged on the WHOLE-FILE mask (drMasker, cached per file). Reads are capped at opts.maxMaskReads (default 400) and opts.maskBudgetMs (default 30000 ms): a hit in a file that cannot be read, masked or reached within the budget is "unreadable" and never counts as a definition, use or reference, so the row is unverified, never verified or refuted.',
-    'Branch counts are lexical: `?:` and `&&`/`||`/`??` count as branches whether or not they drive control flow. Named nested functions are excluded from the parent; anonymous callbacks are included. `default:` is not counted; an early return is any `return` with code after its line, EXCEPT a `return` that is the first statement of a `case`/`default:` arm or of a `try`/`catch`/`finally` block on the same line (that arm is already its own row).',
+    'Wiring counts only references in masked code (comments and string text blanked) of non-excluded .js/.html files, outside the function own body: docs, comments, strings and test/ do not count (test-only references are unverified). Common names (render, init) can over-count, and dynamic dispatch (obj[name](), string handlers, tool registries) under-counts: declare those in opts.entryPoints or opts.waive:{name:reason}, which downgrade only "defined but not referenced" wiring rows to unverified (never a missing symbol, id, handler, parse, file, probe or mutation row).',
+    'Every grep hit is judged on the whole-file mask (drMasker, cached per file). Reads are capped at opts.maxMaskReads (default 400) and opts.maskBudgetMs (default 30000 ms): a hit in a file that cannot be read, masked or reached within the budget is "unreadable" and never counts as a definition, use or reference, so the row is unverified, never verified or refuted.',
+    'Branch counts are lexical: `?:` and `&&`/`||`/`??` count as branches whether or not they drive control flow. Named nested functions are excluded from the parent; anonymous callbacks are included. `default:` is not counted; an early return is any `return` with code after its line, except a `return` that is the first statement of a `case`/`default:` arm or of a `try`/`catch`/`finally` block on the same line (that arm is already its own row).',
     'Live lookups use the workspace grep (case-sensitive, max 100 hits, gitignored files such as dist/ excluded). A capped (truncated) result with no definition in it is reported as unverified, never refuted.',
     'Probes instrument if/else-if/case/catch only (a real `catch (e) {` clause; Promise `.catch(fn)` is a call, not a branch row). Ternary, short-circuit and early-return rows are in the matrix but never probed (probe:false). An unhandled promise rejection is recorded as the run threw only when it fires within two event-loop ticks (MessageChannel) after the run settles and the host exposes globalThis.addEventListener(\'unhandledrejection\'); later rejections are missed.',
     'Mutation-lite skips operators inside for/while headers (infinite-loop risk), cannot time out synchronous code, and makes at most `max` (default 10) mutants.',
@@ -1042,7 +1042,7 @@ function drDomPostconditions(target) {
         }
     });
     Object.keys(ids).forEach(function (id) { if (ids[id] > 1) issues.push({ kind: 'duplicate-id', detail: 'id "' + id + '" x' + ids[id] }); });
-    if (typeof window !== 'undefined' && window.__drXss) { issues.push({ kind: 'xss', detail: 'edge payload EXECUTED (window.__drXss set)' }); window.__drXss = undefined; }
+    if (typeof window !== 'undefined' && window.__drXss) { issues.push({ kind: 'xss', detail: 'edge payload executed (window.__drXss set)' }); window.__drXss = undefined; }
     return { ok: issues.length === 0, issues: issues };
 }
 
@@ -1086,7 +1086,7 @@ async function drMutationTest(fnSrc, check, opts) {
             n = refName(lastErr);
         }
         if (missing.length) return Object.assign(fail, { missingStubs: missing, error: 'baseline threw ReferenceError (missing stub' + (missing.length > 1 ? 's' : '') + ': ' + missing.join(', ') + '): pass mutation stubs:{' + missing.map(function (m) { return m + ': ...'; }).join(', ') + '} and re-run' });
-        return Object.assign(fail, { error: 'check fails on the ORIGINAL function: fix the check or the code first' + (lastErr ? ' (threw ' + (lastErr.name || 'Error') + ': ' + lastErr.message + ')' : '') });
+        return Object.assign(fail, { error: 'check fails on the original function: fix the check or the code first' + (lastErr ? ' (threw ' + (lastErr.name || 'Error') + ': ' + lastErr.message + ')' : '') });
     }
     var ms = drMutants(fnSrc, opts.max), out = { baselineOk: true, total: ms.length, killed: 0, survived: [], invalid: 0 };
     for (var i = 0; i < ms.length; i++) {
@@ -1125,7 +1125,7 @@ function drLedger(rep, opts) {
     (rep.parse || []).forEach(function (p) {
         if (p.css) {
             var cst = p.balanced === false ? 'refuted' : (!p.ok || p.dropped || (!p.rules && p.empty === false)) ? 'unverified' : 'verified';
-            add(p.file + ' CSS parses', 'parse', p.file, cst, p.parser + ', ' + p.rules + ' rules' + (p.balanced === false ? ', UNBALANCED braces (comments and strings stripped)' : '') + (p.dropped ? ', ' + p.dropped + ' of ' + p.braces + ' blocks dropped by the parser' : '') + (!p.rules && p.empty === false ? ', 0 rules from non-empty CSS' : ''));
+            add(p.file + ' CSS parses', 'parse', p.file, cst, p.parser + ', ' + p.rules + ' rules' + (p.balanced === false ? ', unbalanced braces (comments and strings stripped)' : '') + (p.dropped ? ', ' + p.dropped + ' of ' + p.braces + ' blocks dropped by the parser' : '') + (!p.rules && p.empty === false ? ', 0 rules from non-empty CSS' : ''));
             return;
         }
         if (p.noDom) { add(p.file + ' HTML is well-formed', 'parse', p.file, 'unverified', p.noDom); return; }

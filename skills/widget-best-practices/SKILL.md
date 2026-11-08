@@ -132,6 +132,7 @@ const response = await executeTool('servicenow_api', {
 
 Widgets and js_eval are *programmatic* callers: their `executeTool` results never enter the model context, so they get full payloads.
 
+- **Media: prefer direct remote URLs** (`<img src>`/`<video src>`, incl. LAN http such as ComfyUI `/view?...`). Use `get_file`/`data-fid` only for files with no URL (screenshots, uploads). Never download remote outputs with `web_fetch save_file` just to display them; it fills the file store (300 MB cap) and files get evicted.
 - `executeTool('get_file', {id: fileId})` → `r.data` is a full data URL (`data:image/png;base64,…`) — set it as `img.src`. Works for every file_id (screenshots, attachments, `local_folder` reads, `web_fetch save_file`).
 - Galleries: `executeTool('get_file', {id: fileId, thumbnail: {max: 256}})` → `r.thumbnail.data_url` (small JPEG, `data` omitted).
 - `executeTool('local_folder', {action: 'read', path, encoding: 'base64'})` returns the full `data_url` to widgets/js_eval up to ~48 MB encoded (direct LLM calls: ~1 MB). Above that, `data_url_omitted: true` — fall back to `get_file` on the returned `file_id`. `thumbnail: {max: 256}` works here too.

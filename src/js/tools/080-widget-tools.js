@@ -945,6 +945,7 @@ function scrollToWidget(widgetId) {
     // collapsed card used to be scrolled to + highlighted invisibly (a silent
     // no-op), so it falls back to the modal like an absent card.
     if (widgetEl && _isWidgetCardShown(widgetEl)) {
+        if (typeof releaseChatFollow === 'function') releaseChatFollow(widgetEl);
         widgetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
         // Briefly highlight the widget
         widgetEl.classList.add('highlight');

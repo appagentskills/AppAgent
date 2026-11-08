@@ -1,10 +1,24 @@
 /* Markdown styles */
 .code-block-wrapper { position: relative; margin: var(--space-4) 0; }
 .code-block-wrapper.expanded { width: 100%; max-width: none; }
-.code-block-expand-btn { position: absolute; top: 4px; right: 4px; width: 24px; height: 24px; padding: 0; background: rgba(255,255,255,0.8); border: 1px solid var(--border); border-radius: var(--radius-sm); cursor: pointer; font-size: var(--text-body-lg); line-height: 20px; color: var(--text-secondary); z-index: 1; }
-.code-block-expand-btn:hover { background: var(--bg-white); color: var(--text-primary); }
-.code-copy-btn { position: absolute; bottom: 8px; right: 8px; padding: var(--space-2) var(--space-4); background: rgba(255,255,255,0.9); border: 1px solid var(--border); border-radius: var(--radius-sm); cursor: pointer; font-size: var(--text-body-sm); color: var(--text-secondary); z-index: 1; }
-.code-copy-btn:hover { background: var(--bg-white); color: var(--text-primary); border-color: var(--border-dark); }
+/* Code-block toolbar: copy + expand icon buttons pinned top-right. Subtle
+   (hidden) until the block is hovered or anything in it has focus; always
+   shown on touch devices (no hover) and while the copy confirmation shows.
+   Token-based colors so light and dark themes both work. */
+.code-block-expand-btn, .code-copy-btn { position: absolute; top: 6px; height: 26px; min-width: 26px; display: inline-flex; align-items: center; justify-content: center; gap: var(--space-2); padding: 0; background: var(--bg-main); color: var(--text-secondary); border: 1px solid var(--border); border-radius: var(--radius-sm); box-shadow: var(--shadow-sm); cursor: pointer; z-index: 1; opacity: 0; transition: opacity var(--transition-fast), background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast); }
+.code-block-expand-btn { right: 6px; width: 26px; font-size: var(--text-body-lg); line-height: 1; }
+.code-copy-btn { right: 38px; font-size: var(--text-body-sm); font-family: inherit; }
+.code-copy-btn .ui-icon { width: 14px; height: 14px; flex-shrink: 0; }
+.code-block-wrapper:hover > .code-block-expand-btn, .code-block-wrapper:hover > .code-copy-btn,
+.code-block-wrapper:focus-within > .code-block-expand-btn, .code-block-wrapper:focus-within > .code-copy-btn,
+.code-copy-btn.copied { opacity: 1; }
+.code-block-expand-btn:hover, .code-copy-btn:hover { background: var(--bg-hover); color: var(--text-primary); border-color: var(--border-dark); }
+.code-block-expand-btn:focus-visible, .code-copy-btn:focus-visible { opacity: 1; outline: 2px solid var(--primary); outline-offset: 1px; }
+.code-copy-btn.copied { padding: 0 var(--space-3); color: var(--success); border-color: var(--success); }
+.code-copy-label { line-height: 1; white-space: nowrap; }
+@media (hover: none) { .code-block-expand-btn, .code-copy-btn { opacity: 1; } }
+/* Room for the toolbar so the first line(s) are not covered. */
+.code-block-wrapper > .code-block { padding-right: 76px; }
 .code-block { background: var(--bg-code); color: var(--text-heading); padding: var(--space-6) var(--space-8); padding-right: 30px; border-radius: var(--radius-lg); overflow-x: auto; font-family: var(--font-mono); font-size: var(--text-body); margin: 0; line-height: var(--leading-relaxed); border: 1px solid var(--border); max-height: none; overflow-y: visible; white-space: pre-wrap; word-break: break-word; box-shadow: var(--shadow-sm); }
 .code-block.collapsed { max-height: 200px; overflow-y: auto; white-space: pre; word-break: normal; }
 .code-block code { background: none; padding: 0; color: inherit; }
@@ -114,11 +128,13 @@ code.inline-code { background: var(--bg-hover); color: var(--text-heading); padd
 .message-content .md-blockquote,
 .markdown-body .md-blockquote {
     margin: var(--space-4) 0;
-    padding: var(--space-1) var(--space-6);
-    border-inline-start: 3px solid var(--border-dark);
-    color: var(--text-secondary);
-    background: var(--bg-light);
-    border-radius: var(--radius-sm);
+    padding: var(--space-5) var(--space-6);
+    border-inline-start: 3px solid var(--primary);
+    color: var(--text-primary);
+    background: var(--bg-hover);
+    border-radius: var(--radius-md);
+    line-height: var(--leading-relaxed);
+    font-style: normal;
 }
 .message-content .md-blockquote:first-child,
 .markdown-body .md-blockquote:first-child { margin-top: 0; }
@@ -128,3 +144,21 @@ code.inline-code { background: var(--bg-hover); color: var(--text-heading); padd
 .markdown-body .md-blockquote .md-paragraph:first-child { margin-top: 0; }
 .message-content .md-blockquote .md-paragraph:last-child,
 .markdown-body .md-blockquote .md-paragraph:last-child { margin-bottom: 0; }
+/* Readability inside quotes: paragraph gaps, legible inline code on the
+   tinted background, and nested quotes as a lighter inner bar. */
+.md-blockquote .md-paragraph + .md-paragraph { margin-top: var(--space-3); }
+.md-blockquote code.inline-code { background: var(--bg-main); }
+/* Quoted text keeps its tabs / indentation / space runs (formatContent emits
+   them as &#9; / &#32; inside quotes) instead of collapsing them. */
+.md-blockquote .md-paragraph { white-space: pre-wrap; tab-size: 4; }
+.message-content .md-blockquote .md-blockquote,
+.markdown-body .md-blockquote .md-blockquote { margin: var(--space-3) 0; padding: var(--space-1) var(--space-5); background: transparent; border-inline-start-color: var(--border-dark); color: var(--text-secondary); }
+/* Copy button on top-level quotes (same look/visibility as code blocks). */
+.md-quote-wrapper { position: relative; margin: var(--space-4) 0; }
+.md-quote-wrapper:first-child { margin-top: 0; }
+.md-quote-wrapper:last-child { margin-bottom: 0; }
+.message-content .md-quote-wrapper > .md-blockquote,
+.markdown-body .md-quote-wrapper > .md-blockquote,
+.md-quote-wrapper > .md-blockquote { margin: 0; padding-right: 40px; }
+.md-quote-wrapper > .quote-copy-btn { right: 6px; top: 6px; }
+.md-quote-wrapper:hover > .code-copy-btn, .md-quote-wrapper:focus-within > .code-copy-btn { opacity: 1; }

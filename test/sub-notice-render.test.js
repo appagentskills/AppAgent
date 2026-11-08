@@ -24,7 +24,8 @@ function topVar(source, name) {
 }
 function esc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
 var NAMES = ['_subRenderNewlines', 'renderSubMarkdown', '_subIsRawErrorPayload', '_applySectionIcons', '_liftSectionIcon',
-    '_renderSubCollapsibleMarkdown', '_subActionStateHtml', '_subNoticeCardHtml', '_parentMsgCardHtml', 'renderSubAgentMessage',
+    '_renderSubCollapsibleMarkdown', '_subActionStateHtml', '_subNoticeHeadline', '_subNoticeIsExpandable', '_subNoticeHashKey',
+    '_subNoticeExpandHtml', '_subNoticeCardHtml', '_parentMsgCardHtml', 'renderSubAgentMessage',
     'renderSubReportNotices', '_subParentMessageState', '_subParentHistoryKey', '_subThreadEntries', '_hasStandaloneSubMessage'];
 function makeUi(brokenFormat) {
     var env = { escapeHtml: esc, window: { currentSearchHighlight: null }, UI_ICONS: { copy: 'C' },
@@ -108,6 +109,31 @@ describe('sub-agent notice rendering (one renderer)', function() {
         assert.strictEqual(u._subIsRawErrorPayload('[x] done'), false);
         assert.strictEqual(u._subIsRawErrorPayload('[{"a":1}]'), true);
         assert.strictEqual(u._subIsRawErrorPayload('Provider said {"error": "rate"} twice'), true);
+    });
+    test('REPORT-CHEVRON: multi-line final report collapses behind headline + chevron; short stays plain', function() {
+        var u = makeUi();
+        var long = '## Shipped **PR #9**\n\n- one\n- two\n' + 'detail '.repeat(80);
+        var h = u._subNoticeCardHtml('Alpha', 'sub_a', 'done', long, 'final');
+        assert.ok(h.indexOf('class="sub-notice-expand"') >= 0, 'expander: ' + h.slice(0, 400));
+        assert.ok(h.indexOf('<span class="sub-notice-headline">Shipped PR #9</span>') >= 0, 'plain headline: ' + h.slice(0, 600));
+        assert.match(h, /<button type="button" class="sub-notice-chevron" data-sub-notice-toggle="1" aria-expanded="false" aria-controls="sub-notice-full-[^"]+"/);
+        var full = after(h, 'class="sub-notice-full"');
+        assert.ok(/^class="sub-notice-full" id="[^"]+" hidden>/.test(full), 'collapsed by default: ' + full.slice(0, 120));
+        assert.ok(full.indexOf('detail detail') >= 0 && full.indexOf('<li>') >= 0, 'FULL text kept, not truncated');
+        var short = u._subNoticeCardHtml('Alpha', 'sub_a', 'done', 'All good', 'final');
+        assert.ok(short.indexOf('sub-notice-expand') < 0 && short.indexOf('All good') >= 0, 'single-line stays plain');
+        var mid = u._subNoticeCardHtml('Alpha', 'sub_a', 'running', long, 'mid');
+        assert.ok(mid.indexOf('sub-notice-expand') < 0, 'progress notices unchanged');
+    });
+    test('REPORT-CHEVRON: passive row shows headline collapsed and the full report on expand', function() {
+        var u = makeUi();
+        var fullText = 'PR opened\n\nChanged files:\n- a.js\n- b.css\n' + 'more '.repeat(60);
+        var h = u.renderSubAgentMessage({ role: 'sub_msg', kind: 'passive_report', subAgentId: 'kid', subAgentName: 'Kid', status: 'done', text: 'PR opened', fullText: fullText }, 4);
+        assert.ok(h.indexOf('<span class="sub-notice-headline">PR opened</span>') >= 0, h.slice(0, 500));
+        assert.ok(after(h, 'sub-notice-full').indexOf('more more') >= 0 && h.indexOf('b.css') >= 0, 'full report in expander');
+        assert.match(h, /Parent not woken/);
+        var legacy = u.renderSubAgentMessage({ role: 'sub_msg', kind: 'passive_report', subAgentId: 'kid', subAgentName: 'Kid', status: 'done', text: 'PR opened' }, 4);
+        assert.ok(legacy.indexOf('sub-notice-expand') < 0 && legacy.indexOf('PR opened') >= 0, 'legacy row unchanged');
     });
     test('a name containing both " and ( still produces a final and a lifecycle card', async function() {
         var chats = { root: { messages: [] } }, runs = [];

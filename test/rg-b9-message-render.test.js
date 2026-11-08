@@ -33,7 +33,7 @@ function count(s, re) { return (s.match(re) || []).length; }
 function codeBlockHtml(inner) {
   return '<div class="code-block-wrapper" data-copy-id="copyX"><button class="code-block-expand-btn" onclick="toggleCodeBlockExpand(this, event)" title="Expand">\u2922</button>' +
     '<pre class="code-block collapsed"><code>' + inner + '</code></pre>' +
-    '<button class="code-copy-btn" onclick="copyCodeBlock(this, event)" title="Copy">C</button></div>';
+    '<button type="button" class="code-copy-btn" onclick="copyCodeBlock(this, event)" title="Copy" aria-label="Copy code">C</button></div>';
 }
 function assertBalanced(html) {
   [['table', /<table\b/g, /<\/table>/g], ['thead', /<thead>/g, /<\/thead>/g], ['tbody', /<tbody>/g, /<\/tbody>/g],
@@ -41,7 +41,8 @@ function assertBalanced(html) {
   ].forEach(function(p) { assert.strictEqual(count(html, p[1]), count(html, p[2]), p[0] + ' open/close balance in: ' + html); });
 }
 var HDR = '<div class="md-table-wrap"><table class="md-table"><thead><tr><th>H</th></tr></thead><tbody><tr><td>v</td></tr></tbody></table></div>';
-var BQ = '<blockquote class="md-blockquote"><span class="md-paragraph">q</span></blockquote>';
+var QBTN = '<button type="button" class="code-copy-btn quote-copy-btn" onclick="copyCodeBlock(this, event)" title="Copy" aria-label="Copy quote">C</button>';
+var BQ = '<div class="md-quote-wrapper"><blockquote class="md-blockquote"><span class="md-paragraph">q</span></blockquote>' + QBTN + '</div>';
 
 describe('rg-b9 ordered lists (NEW-T11-1)', function() {
   test('numbered-only list renders as <ol>, never <ul>', function() {
@@ -138,7 +139,7 @@ describe('rg-b9 goldens: other markdown paths are byte-identical to the pre-fix 
     ['header-less table', '| a | b |\n| c | d |',
       '<div class="md-table-wrap"><table class="md-table"><tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr></table></div>'],
     ['blockquote', '> quote line\n> more\n>\n> second para\n\ntext',
-      '<blockquote class="md-blockquote"><span class="md-paragraph">quote line<br>more</span><span class="md-paragraph">second para</span></blockquote><span class="md-paragraph">text</span>'],
+      '<div class="md-quote-wrapper"><blockquote class="md-blockquote"><span class="md-paragraph">quote line<br>more</span><span class="md-paragraph">second para</span></blockquote>' + QBTN + '</div><span class="md-paragraph">text</span>'],
     ['headings', '# H1\n## H2\n### H3\n#### H4\n\nbody',
       '<h2>H1</h2><h3>H2</h3><h4>H3</h4><h5>H4</h5><span class="md-paragraph">body</span>'],
     ['mixed document', '## Title\n\nPara one\nline two\n\n- a\n- b\n\n| x | y |\n| z | w |\n\n> q\n\n```\ncode\n```\n\nEnd **b** [l](https://e.com)',

@@ -287,7 +287,7 @@ async function executeStartChat(args, options) {
     // + pendingImageAttachments (app/040-send-message.js:5). Fire-and-forget for
     // the same reason as runAgent above: it awaits the whole run internally.
     if (typeof sendMessage !== 'function') {
-        return { success: false, error: 'start_chat opened chat ' + chatId + ' and prefilled the composer, but sendMessage is not available in this context — the message was NOT sent.', chat_id: chatId, mode: mode, sent: false, widget_id: widgetId || null, message: finalMessage };
+        return { success: false, error: 'start_chat opened chat ' + chatId + ' and prefilled the composer, but sendMessage is not available in this context — the message was not sent.', chat_id: chatId, mode: mode, sent: false, widget_id: widgetId || null, message: finalMessage };
     }
     // Same async shape as runAgent above: sendMessage is `async`, so the catch
     // covers only a synchronous/stubbed throw and the .catch() arm attached by

@@ -100,6 +100,7 @@ function scrollToToolInResponse(userMsgIdx) {
                 if (toolCalls.length > 0) {
                     collapseOtherTools(toolCalls[0], container);
                     toolCalls[0].open = true;
+                    if (typeof releaseChatFollow === 'function') releaseChatFollow(toolCalls[0]);
                     toolCalls[0].scrollIntoView({ behavior: 'smooth', block: 'center' });
                     toolCalls[0].classList.add('highlight-flash');
                     setTimeout(function() { toolCalls[0].classList.remove('highlight-flash'); }, 2000);
@@ -115,6 +116,7 @@ function scrollToToolInResponse(userMsgIdx) {
         var lastToolCall = allToolCalls[allToolCalls.length - 1];
         collapseOtherTools(lastToolCall, container);
         lastToolCall.open = true;
+        if (typeof releaseChatFollow === 'function') releaseChatFollow(lastToolCall);
         lastToolCall.scrollIntoView({ behavior: 'smooth', block: 'center' });
         lastToolCall.classList.add('highlight-flash');
         setTimeout(function() { lastToolCall.classList.remove('highlight-flash'); }, 2000);
@@ -139,6 +141,7 @@ function scrollToFirstToolCall(msgIdx) {
         if (toolCalls.length > 0) {
             collapseOtherTools(toolCalls[0]);
             toolCalls[0].open = true;
+            if (typeof releaseChatFollow === 'function') releaseChatFollow(toolCalls[0]);
             toolCalls[0].scrollIntoView({ behavior: 'smooth', block: 'center' });
             toolCalls[0].classList.add('highlight-flash');
             setTimeout(function() { toolCalls[0].classList.remove('highlight-flash'); }, 2000);
@@ -157,6 +160,7 @@ function scrollToFirstToolCall(msgIdx) {
                 if (prevTcs.length > 0) {
                     collapseOtherTools(prevTcs[0]);
                     prevTcs[0].open = true;
+                    if (typeof releaseChatFollow === 'function') releaseChatFollow(prevTcs[0]);
                     prevTcs[0].scrollIntoView({ behavior: 'smooth', block: 'center' });
                     prevTcs[0].classList.add('highlight-flash');
                     setTimeout(function() { prevTcs[0].classList.remove('highlight-flash'); }, 2000);
@@ -168,6 +172,7 @@ function scrollToFirstToolCall(msgIdx) {
     
     // Last fallback: scroll to original message
     if (msgEl) {
+        if (typeof releaseChatFollow === 'function') releaseChatFollow(msgEl);
         msgEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
         msgEl.classList.add('highlight-flash');
         setTimeout(function() { msgEl.classList.remove('highlight-flash'); }, 2000);

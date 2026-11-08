@@ -81,7 +81,7 @@ describe('unified file store', function() {
 
     test('cleanup evicts old blobs only, never folder pointers', async function() {
         var t = 1000;
-        fs.ufsSetDeps({ idb: idb, now: function() { return t; } });
+        fs.ufsSetDeps({ idb: idb, now: function() { return t; }, referencedIds: async function() { return []; } });
         var b = await fs.registerFileAsync({ data: 'hello', name: 'a.txt' });
         var f = await fs.registerFileAsync({ pointer: { kind: 'folder', folder: 'virtual', path: 'x.png' } });
         t += fs.UFS_LIMITS.ttlMs + 1;
@@ -89,6 +89,102 @@ describe('unified file store', function() {
         assert.deepStrictEqual(res.deleted, [b]);
         assert.ok(idb.rows[f], 'folder pointer kept');
         assert.throws(function() { fs.registerFile({ blob: { size: fs.UFS_LIMITS.maxFileBytes + 1, type: '' } }); });
+    }, { tags: ['unit'] });
+
+    test('cleanup never evicts ids referenced by saved widgets/documents (LRU cap or TTL)', async function() {
+        var t = 1000;
+        var refs = [];
+        fs.ufsSetDeps({ idb: idb, now: function() { return t; }, referencedIds: async function() { return refs; } });
+        var savedCap = fs.UFS_LIMITS.maxTotalBytes, savedFloor = fs.UFS_LIMITS.minUnpinnedBytes;
+        fs.UFS_LIMITS.maxTotalBytes = 300;
+        fs.UFS_LIMITS.minUnpinnedBytes = 0; // unpinned budget = 300 - 202 pinned = 98
+        var big = 101;
+        try {
+        var ids = [];
+        for (var i = 0; i < 4; i++) { t += 1000; ids.push(await fs.registerFileAsync({ blob: new Blob([new Uint8Array(big)]), name: 'v' + i + '.mp4' })); }
+        // A saved widget renders the two OLDEST (least-recently-used) videos.
+        refs = ['<video data-fid="' + ids[0] + '">', ids[1]].join(' ').match(/file_\d+_\d+/g);
+        t += fs.UFS_LIMITS.graceMs;
+        var res = await fs.fileStoreCleanup();
+        assert.ok(idb.rows[ids[0]] && idb.rows[ids[1]], 'referenced ids survive the byte cap');
+        assert.deepStrictEqual(res.deleted, [ids[2], ids[3]], 'unreferenced LRU blobs still evicted');
+        assert.strictEqual(res.pinned, 2);
+        t += fs.UFS_LIMITS.ttlMs + 1;
+        await fs.fileStoreCleanup();
+        assert.ok(idb.rows[ids[0]] && idb.rows[ids[1]], 'referenced ids survive the TTL');
+        assert.ok((await fs.resolveFile(ids[0])).size === big);
+        } finally { fs.UFS_LIMITS.maxTotalBytes = savedCap; fs.UFS_LIMITS.minUnpinnedBytes = savedFloor; }
+    }, { tags: ['unit'] });
+
+    test('pinned media over the cap no longer wipes unpinned blobs: they keep a floor budget (NEW-IDS, F1)', async function() {
+        var t = 1000;
+        var refs = [];
+        fs.ufsSetDeps({ idb: idb, now: function() { return t; }, referencedIds: async function() { return refs; } });
+        var savedCap = fs.UFS_LIMITS.maxTotalBytes, savedFloor = fs.UFS_LIMITS.minUnpinnedBytes;
+        fs.UFS_LIMITS.maxTotalBytes = 300;
+        fs.UFS_LIMITS.minUnpinnedBytes = 50; // budget = max(50, 300 - 404)
+        var savedEvery = fs.UFS_LIMITS.cleanupEveryMs;
+        fs.UFS_LIMITS.cleanupEveryMs = Infinity; // only the explicit cleanups below
+        try {
+        var pinnedIds = [];
+        for (var i = 0; i < 4; i++) pinnedIds.push(await fs.registerFileAsync({ blob: new Blob([new Uint8Array(101)]), name: 'v' + i + '.mp4' }));
+        refs = pinnedIds.slice(); // 404 pinned bytes > 300 cap
+        t += fs.UFS_LIMITS.graceMs + 1;
+        var old = await fs.registerFileAsync({ blob: new Blob([new Uint8Array(10)]), name: 'old.png' });
+        t += 1000;
+        var old2 = await fs.registerFileAsync({ blob: new Blob([new Uint8Array(35)]), name: 'old2.png' });
+        t += fs.UFS_LIMITS.graceMs + 1;
+        // Fresh realm after Reload: the first id of the new realm, not yet
+        // referenced by the widget (patch lands ms later).
+        var fresh = await fs.registerFileAsync({ blob: new Blob([new Uint8Array(10)]), name: 'still.png' });
+        var res = await fs.fileStoreCleanup();
+        assert.ok(idb.rows[fresh], 'just-created id survives');
+        assert.ok((await fs.resolveFile(fresh)).size === 10);
+        // unpinned 55 > 50 floor → only the LRU one goes; old2 stays in budget
+        assert.deepStrictEqual(res.deleted, [old], 'only the LRU unpinned blob over the floor is evicted');
+        assert.ok(idb.rows[old2], 'unpinned blob within the floor budget survives');
+        assert.strictEqual(res.fresh, 1);
+        pinnedIds.forEach(function(id) { assert.ok(idb.rows[id], 'pinned kept'); });
+        t += fs.UFS_LIMITS.graceMs + 1;
+        res = await fs.fileStoreCleanup();
+        assert.deepStrictEqual(res.deleted, [], 'past grace but within the unpinned budget: kept');
+        assert.ok(idb.rows[fresh] && idb.rows[old2]);
+        } finally { fs.UFS_LIMITS.maxTotalBytes = savedCap; fs.UFS_LIMITS.minUnpinnedBytes = savedFloor; fs.UFS_LIMITS.cleanupEveryMs = savedEvery; }
+    }, { tags: ['unit'] });
+
+    test('cleanup is skipped when no reference source exists (no openDatabase, F2)', async function() {
+        var t = 1000;
+        fs.ufsSetDeps({ idb: idb, now: function() { return t; } });
+        var b = await fs.registerFileAsync({ data: 'hello', name: 'a.txt' });
+        t += fs.UFS_LIMITS.ttlMs + 1;
+        var res = await fs.fileStoreCleanup();
+        assert.deepStrictEqual(res.deleted, []);
+        assert.ok(res.skipped);
+        assert.ok(idb.rows[b], 'unprotected eviction did not run');
+    }, { tags: ['unit'] });
+
+    test('cleanup evicts nothing when the reference scan fails', async function() {
+        var t = 1000;
+        fs.ufsSetDeps({ idb: idb, now: function() { return t; }, referencedIds: async function() { throw new Error('idb down'); } });
+        var b = await fs.registerFileAsync({ data: 'hello', name: 'a.txt' });
+        t += fs.UFS_LIMITS.ttlMs + 1;
+        var res = await fs.fileStoreCleanup();
+        assert.deepStrictEqual(res.deleted, []);
+        assert.ok(idb.rows[b]);
+    }, { tags: ['unit'] });
+
+    test('reference scan reads widget versions + documents from the app DB', async function() {
+        var rowsByStore = {
+            widgets: [{ id: 'w1', versions: [{ version: 1, html: '<img data-fid="file_7_1700000000000">' }, { version: 2, html: 'executeTool("get_file",{id:"file_8_1700000000001"})' }] }],
+            dashboardWidgets: [],
+            documents: [{ id: 'd1', content: '![](file_9_1700000000002)' }]
+        };
+        var fakeDb = { objectStoreNames: { contains: function(n) { return !!rowsByStore[n]; } },
+            transaction: function(n) { return { objectStore: function() { return { getAll: function() { var rq = {}; setTimeout(function() { rq.result = rowsByStore[n]; rq.onsuccess(); }, 0); return rq; } }; } }; } };
+        var M = await loadModules(['src/js/tools/040-file-store.js'], { lenient: true, globals: { openDatabase: async function() { return fakeDb; }, widgetStoreName: 'widgets', dashboardWidgetsStoreName: 'dashboardWidgets', documentsStoreName: 'documents' } });
+        M.ufsSetDeps({ idb: fakeIdb() });
+        var set = await M._ufsReferencedIds();
+        assert.deepStrictEqual(Array.from(set).sort(), ['file_7_1700000000000', 'file_8_1700000000001', 'file_9_1700000000002']);
     }, { tags: ['unit'] });
 
     test('consumers resolve through the unified helper', async function() {
@@ -152,6 +248,57 @@ describe('unified file store', function() {
         assert.strictEqual(b.content, 'inline text', 'PNG bytes (sniffed) never replace text content');
         var c = await M.executeReadAttachedFile({ filename: 'gone.txt' }, { chatId: 'c1' });
         assert.strictEqual(c.content, 'fallback');
+    }, { tags: ['unit'] });
+
+    test('a stale chat pointer (attached in a since-retired chat) never hides stored bytes', async function() {
+        var db = fakeIdb();
+        var chatsG = {};
+        var M = await loadModules(['src/js/tools/040-file-store.js'], { lenient: true, globals: { chats: chatsG } });
+        M.ufsSetDeps({ idb: db });
+        var id = await M.registerFileAsync({ bytes: new Uint8Array(PNG_HEAD), name: 'still.png' });
+        // get_file {attach:true} in a sub-agent chat registers a location pointer
+        // to the attach message (app/030-agent-loop.js deferred screenshots).
+        chatsG.chat_sub_x = { messages: [{ role: 'screenshot', file_id: id, screenshot_id: id, base64: 'data:image/png;base64,AAAA' }] };
+        M.registerFile(id, { type: 'chat', chatId: 'chat_sub_x', msgIndex: 0 });
+        // The sub chat is GC'd / dropped from this realm: the pointer goes stale.
+        delete chatsG.chat_sub_x;
+        M.ufsSetDeps({ idb: db }); // and the SW restarted
+        var legacy = await M.getFileAsync(id);
+        assert.ok(legacy && legacy.data.indexOf('data:image/png;base64,') === 0, 'getFileAsync falls back to the store');
+        var r = await M.resolveFile(id);
+        assert.ok(r && r.blob instanceof Blob, 'resolveFile falls back to the store');
+        assert.strictEqual(r.mime, 'image/png');
+        // Payload-stripped message in a still-present chat: same fallback.
+        chatsG.chat_sub_x = { messages: [{ role: 'screenshot', file_id: id, screenshot_id: id }] };
+        var g = await M.executeGetFile({ id: id });
+        assert.strictEqual(g.success, true, g.error);
+        assert.strictEqual(g.mime, 'image/png');
+        // A genuinely unknown id still misses.
+        assert.strictEqual(await M.getFileAsync('file_nope_1'), null);
+        assert.strictEqual(await M.resolveFile('file_nope_1'), null);
+    }, { tags: ['unit'] });
+
+    test('chat-only image ids (js_eval _images / screenshots) survive deletion of their chat', async function() {
+        var db = fakeIdb();
+        var chatsG = {};
+        var M = await loadModules(['src/js/tools/040-file-store.js'], { lenient: true, globals: { chats: chatsG } });
+        M.ufsSetDeps({ idb: db });
+        var b64 = 'data:image/png;base64,' + btoa(String.fromCharCode.apply(null, PNG_HEAD));
+        chatsG.chat_sub_y = { messages: [{ role: 'screenshot', file_id: 'file_107_x', screenshot_id: 'file_107_x', base64: b64 }] };
+        M.registerFile('file_107_x', { type: 'chat', chatId: 'chat_sub_y', msgIndex: 0 });
+        for (var i = 0; i < 5 && !db.rows.file_107_x; i++) await new Promise(function(r) { setTimeout(r, 0); });
+        assert.ok(db.rows.file_107_x && db.rows.file_107_x.blob instanceof Blob, 'bytes mirrored into the store');
+        delete chatsG.chat_sub_y; // sub-agent GC drops the chat
+        M.ufsSetDeps({ idb: db });
+        var g = await M.executeGetFile({ id: 'file_107_x' });
+        assert.strictEqual(g.success, true, g.error);
+        assert.strictEqual(g.mime, 'image/png');
+        // An id already in the store is not overwritten by the chat copy.
+        var sid = await M.registerFileAsync({ bytes: new Uint8Array(PNG_HEAD), name: 'orig.png' });
+        chatsG.c2 = { messages: [{ role: 'screenshot', file_id: sid, base64: 'data:image/jpeg;base64,' + JPEG_B64 }] };
+        M.registerFile(sid, { type: 'chat', chatId: 'c2', msgIndex: 0 });
+        for (var j = 0; j < 5; j++) await new Promise(function(r) { setTimeout(r, 0); });
+        assert.strictEqual(db.rows[sid].name, 'orig.png');
     }, { tags: ['unit'] });
 
     test('no sync getFile() consumers remain outside the store', async function() {

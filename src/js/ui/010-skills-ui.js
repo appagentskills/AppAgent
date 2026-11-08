@@ -1163,17 +1163,14 @@ async function importSkills() {
 
 // Save scroll position periodically and track scroll-follow intent
 (function() {
-    var saveScrollTimeout = null;
     document.addEventListener('scroll', function(e) {
         if (e.target && e.target.id === 'messages' && currentChatId) {
             // Single stick-to-bottom mechanism (see 050-streaming.js): classify
             // this event by position + direction and update stickToBottom.
             handleChatScroll(e.target);
 
-            clearTimeout(saveScrollTimeout);
-            saveScrollTimeout = setTimeout(function() {
-                appStorage.setItem('scrollPos_' + currentChatId, e.target.scrollTop);
-            }, 200);
+            // S7: chat id + position captured NOW (see scheduleChatScrollSave).
+            if (typeof scheduleChatScrollSave === 'function') scheduleChatScrollSave(currentChatId, e.target.scrollTop);
 
             // Recalculate streaming container height when the user scrolls (more/less space available)
             if (isRunning) updateStreamingContainerHeight();

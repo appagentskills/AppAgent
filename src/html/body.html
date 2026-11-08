@@ -117,7 +117,14 @@
                 </div>
             </div>
             <div class="chat-content-wrapper">
+                <!-- .messages-viewport: positioning box for the scroll-to-bottom button. It wraps
+                     ONLY #messages, so its edges are exactly the visible message viewport (not the
+                     version sidebar, not the composer) and the button's offset is deterministic. -->
+                <div class="messages-viewport">
                 <div class="messages" id="messages" data-i18n-attr="aria-label" role="log" aria-label="Chat messages" aria-live="polite"></div>
+                <!-- Scroll-to-bottom: shown only while scrolled up (050-streaming.js updateScrollToBottomButton) -->
+                <button type="button" class="scroll-to-bottom-btn" id="scroll-to-bottom-btn" data-i18n-attr="title,aria-label" onclick="scrollChatToBottom()" title="Scroll to bottom" aria-label="Scroll to bottom" aria-hidden="true" tabindex="-1"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></svg></button>
+                </div>
                 <!-- Floating open button for sidebar -->
                 <button class="version-sidebar-open" id="version-sidebar-open" data-i18n-attr="title,aria-label" onclick="openVersionSidebar()" title="Open panel" aria-label="Open version history panel"></button>
                 <!-- Version History Sidebar (inline with messages) -->

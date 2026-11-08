@@ -526,6 +526,7 @@ function navigateToSearchMatch(chatId, match, query) {
                 // Wait for expansion, then scroll to the specific highlight
                 setTimeout(function() {
                     var highlight = getNthHighlight(tcEl, occIdx);
+                    if (typeof releaseChatFollow === 'function') releaseChatFollow(highlight || tcEl);
                     if (highlight) {
                         highlight.scrollIntoView({ behavior: 'smooth', block: 'center' });
                         highlight.classList.add('search-highlight-current');
@@ -542,6 +543,7 @@ function navigateToSearchMatch(chatId, match, query) {
                 resultDetails.open = true;
                 setTimeout(function() {
                     var highlight = getNthHighlight(resultDetails, occIdx);
+                    if (typeof releaseChatFollow === 'function') releaseChatFollow(highlight || resultDetails);
                     if (highlight) {
                         highlight.scrollIntoView({ behavior: 'smooth', block: 'center' });
                         highlight.classList.add('search-highlight-current');
@@ -555,6 +557,7 @@ function navigateToSearchMatch(chatId, match, query) {
             // Regular content - find the nth highlight in this message content
             var contentEl = msgEl.querySelector('.message-content');
             var highlight = contentEl ? getNthHighlight(contentEl, occIdx) : getNthHighlight(msgEl, occIdx);
+            if (typeof releaseChatFollow === 'function') releaseChatFollow(highlight || msgEl);
             if (highlight) {
                 highlight.scrollIntoView({ behavior: 'smooth', block: 'center' });
                 highlight.classList.add('search-highlight-current');

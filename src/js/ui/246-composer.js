@@ -505,6 +505,147 @@ function composerInsertText(input, text, start, end) {
     }
 }
 
+// ============================================
+// RICH-TEXT PASTE: KEEP HYPERLINKS
+// ============================================
+// A paste from a web page / Google Doc / Outlook / Slack carries text/html
+// with <a href> anchors, but the textarea's native paste only inserts
+// text/plain, so the URLs were lost. composerHtmlToTextWithLinks converts the
+// HTML to plain text (block elements / <br> -> newlines, no raw HTML) where
+// each usable link becomes Markdown [text](url) — or the bare url when the
+// text is empty or equals it. Returns null when there is nothing to gain
+// (no usable link, or every link URL is already in the plain text), so the
+// native paste stays untouched.
+
+var _COMPOSER_PASTE_BLOCK_TAGS = /^(P|DIV|H[1-6]|LI|UL|OL|DL|DT|DD|TR|TABLE|TBODY|THEAD|TFOOT|BLOCKQUOTE|PRE|SECTION|ARTICLE|HEADER|FOOTER|ASIDE|NAV|MAIN|FIGURE|FIGCAPTION|ADDRESS|HR|CAPTION|FORM|FIELDSET|DETAILS|SUMMARY)$/;
+var _COMPOSER_PASTE_SKIP_TAGS = /^(SCRIPT|STYLE|HEAD|TITLE|META|LINK|NOSCRIPT|TEMPLATE|SVG|IFRAME|OBJECT|BUTTON|SELECT|INPUT|TEXTAREA)$/;
+
+// Pure: absolute http(s)/mailto URL for an href, or null. Protocol-relative
+// //host/x becomes https:. Relative hrefs resolve only against an explicit
+// http(s) base (the HTML's <base href>); anything else (javascript:, data:,
+// #frag, relative without a base) is rejected.
+function composerSafeLinkUrl(href, base) {
+    var h = typeof href === 'string' ? href.trim() : '';
+    if (!h) return null;
+    if (/^mailto:[^\s]+$/i.test(h)) return h;
+    if (/^\/\/[^\/\s]/.test(h)) h = 'https:' + h;
+    if (/^https?:\/\/[^\/\s]/i.test(h)) return h;
+    if (/^[a-z][a-z0-9+.\-]*:/i.test(h)) return null; // other schemes (javascript:, data:, file:...)
+    if (h.charAt(0) === '#') return null;
+    if (typeof base === 'string' && /^https?:\/\/[^\/\s]/i.test(base) && typeof URL === 'function') {
+        try {
+            var abs = new URL(h, base).href;
+            return /^https?:\/\//i.test(abs) ? abs : null;
+        } catch (e) { return null; }
+    }
+    return null;
+}
+
+// Characters that would break the Markdown link / autolinker are encoded.
+function _composerEncodeLinkUrl(url) {
+    return url.replace(/\s/g, '%20').replace(/\(/g, '%28').replace(/\)/g, '%29').replace(/</g, '%3C').replace(/>/g, '%3E');
+}
+
+// Walk a parsed DOM node and return { text, links: [url...] }.
+function composerDomToTextWithLinks(root, base) {
+    var out = '';
+    var links = [];
+    function nl() { if (out && out.charAt(out.length - 1) !== '\n') out += '\n'; }
+    function append(s, pre) {
+        if (!s) return;
+        if (!pre) {
+            s = s.replace(/[ \t\r\n\f\u00a0]+/g, ' ');
+            if (!out || /[\n\t ]$/.test(out)) s = s.replace(/^ /, '');
+            if (!s) return;
+        }
+        out += s;
+    }
+    function plainText(node) {
+        var saved = out; out = '';
+        walkChildren(node, false);
+        var s = out; out = saved;
+        return s.replace(/\s+/g, ' ').trim();
+    }
+    function walkChildren(node, pre) {
+        var kids = node.childNodes || [];
+        for (var i = 0; i < kids.length; i++) walk(kids[i], pre);
+    }
+    function walk(node, pre) {
+        if (!node) return;
+        if (node.nodeType === 3) { append(node.nodeValue || node.textContent || '', pre); return; }
+        if (node.nodeType !== 1 && node.nodeType !== 9 && node.nodeType !== 11) return;
+        var tag = node.nodeType === 1 ? String(node.tagName || '').toUpperCase() : '';
+        if (tag && _COMPOSER_PASTE_SKIP_TAGS.test(tag)) return;
+        if (tag === 'BR') { out += '\n'; return; }
+        if (tag === 'TD' || tag === 'TH') {
+            if (out && !/[\n\t]$/.test(out)) out += '\t';
+            walkChildren(node, pre);
+            return;
+        }
+        if (tag === 'A') {
+            var url = composerSafeLinkUrl(node.getAttribute ? node.getAttribute('href') : null, base);
+            if (!url) { walkChildren(node, pre); return; }
+            url = _composerEncodeLinkUrl(url);
+            var label = plainText(node).replace(/\[/g, '(').replace(/\]/g, ')');
+            // http(s): bare url when the text adds nothing (the renderer
+            // autolinks it). mailto: always [text](mailto:...) since a bare
+            // mailto: is not autolinked.
+            var isMail = /^mailto:/i.test(url);
+            if (isMail && !label) label = url.replace(/^mailto:/i, '').split('?')[0];
+            var piece = (!isMail && (!label || label === url || label.replace(/\/$/, '') === url.replace(/\/$/, '')))
+                ? url : '[' + label + '](' + url + ')';
+            links.push(url);
+            if (out && !/[\s(\[]$/.test(out) && piece === url) out += ' ';
+            out += piece;
+            return;
+        }
+        var block = tag && _COMPOSER_PASTE_BLOCK_TAGS.test(tag);
+        if (block) nl();
+        walkChildren(node, pre || tag === 'PRE');
+        if (block) nl();
+    }
+    walk(root, false);
+    var text = out.split('\n').map(function(l) { return l.replace(/[ \t]+$/, ''); }).join('\n')
+        .replace(/\n{3,}/g, '\n\n').replace(/^\n+|\n+$/g, '');
+    return { text: text, links: links };
+}
+
+// html (clipboard text/html) + plain (clipboard text/plain) -> text to
+// insert, or null to keep the native paste.
+function composerHtmlToTextWithLinks(html, plain) {
+    if (typeof html !== 'string' || !/<a[\s>]/i.test(html) || typeof DOMParser !== 'function') return null;
+    var doc;
+    try { doc = new DOMParser().parseFromString(html, 'text/html'); } catch (e) { return null; }
+    if (!doc || !doc.body) return null;
+    var baseEl = doc.querySelector ? doc.querySelector('base[href]') : null;
+    var base = baseEl ? baseEl.getAttribute('href') : null;
+    var res = composerDomToTextWithLinks(doc.body, base);
+    if (!res.links.length || !res.text) return null;
+    if (typeof plain === 'string' && plain) {
+        var missing = res.links.some(function(u) {
+            return plain.indexOf(u) === -1 && plain.indexOf(u.replace(/^mailto:/i, '')) === -1;
+        });
+        if (!missing) return null;
+    }
+    return res.text;
+}
+
+// Insert pasted text at the caret/selection. execCommand('insertText') keeps
+// the native undo stack and fires 'input' itself; fall back to
+// composerInsertText (value splice + synthetic 'input').
+function composerPasteText(input, text) {
+    if (!input || typeof text !== 'string') return false;
+    var s = input.selectionStart, en = input.selectionEnd;
+    try {
+        if (typeof document !== 'undefined' && typeof document.execCommand === 'function') {
+            if (document.activeElement !== input && input.focus) input.focus();
+            if (document.activeElement === input && document.execCommand('insertText', false, text)) return true;
+        }
+    } catch (e) {}
+    composerInsertText(input, text, s, en);
+    return true;
+}
+
 // Ask whether a very large paste should become a .txt attachment.
 async function composerOfferPasteAsFile(input, text) {
     if (!input || typeof text !== 'string') return null;

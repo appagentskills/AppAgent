@@ -279,7 +279,7 @@ async function lfResolveFolder(ref, mode) {
     return { entry: _lfPublic(r, perm), root: r.handle };
 }
 function _lfAssertWritable(entry) {
-    if (entry.access !== 'readwrite') throw _lfErr('Folder "' + entry.label + '" is connected READ-ONLY — writes are refused. The user can change its access from its card on the Documents page.', 'READ_ONLY');
+    if (entry.access !== 'readwrite') throw _lfErr('Folder "' + entry.label + '" is connected read-only — writes are refused. The user can change its access from its card on the Documents page.', 'READ_ONLY');
 }
 // Approval gates (ui/150, worker/120): true ONLY when args is a
 // write/mkdir/delete on a REGISTERED real folder whose access is 'read' —

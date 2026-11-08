@@ -339,6 +339,42 @@ describe('reload sequence (real 270-iframe-panel.js)', function() {
             assert.ok(!(h.api.passKey in store), 'a failing run never records a pass');
         }
     }, T);
+    test('Reload now: shown only while suites run; skips the wait, aborts the run, builds once', async function() {
+        var fx = await reloadKit(), store = {}, gate = fx.deferred(), host = null, argsSeen = null;
+        var h = fx.setup({ store: store, run: function(args, hostOpts) { host = hostOpts; argsSeen = args; return gate.promise; } });
+        var fresh = fx.setup(), ui0 = fresh.api.checklist(new AbortController());
+        assert.ok(fresh.find('Reload now').hidden, 'hidden before the suites start');
+        ui0.close();
+        var p = h.api.reload();
+        await waitFor(function() { return !!host; }, 'run_tests dispatched');
+        assert.ok(!h.find('Reload now').hidden, 'visible while the suites run');
+        assert.strictEqual(count(h, 'extension_build'), 0);
+        h.find('Reload now').click();
+        h.find('Reload now').click(); // double click: first choice wins
+        assert.ok(host._runTestsAbortSignal.aborted, 'the test run is cancelled through the existing abort path');
+        assert.ok(h.find('Reload now').hidden, 'hidden once chosen');
+        // The run finishes at the same moment: still exactly one build + restart.
+        gate.resolve(fx.good(argsSeen.files));
+        await settle(p);
+        assert.strictEqual(count(h, 'extension_build'), 1, 'one build');
+        assert.strictEqual(count(h, 'reload'), 1, 'one restart');
+        assert.ok(!(h.api.passKey in store), 'a skipped run never records a pass');
+        assert.strictEqual(h.byClass('reload-preflight').length, 0, 'checklist closed');
+    }, T);
+    test('Reload now is hidden when the pre-check ends (pass or fail)', async function() {
+        var fx = await reloadKit();
+        var ok = fx.setup(); await settle(ok.api.reload());
+        assert.ok(ok.find('Reload now') === undefined || ok.find('Reload now').hidden, 'gone after pass');
+        var h = fx.setup({ run: function(args) { var r = fx.good(args.files), f = r.files[2]; f.status = 'fail'; f.passed = 1; f.failed = 1; r.success = false; return r; } });
+        var p = h.api.reload();
+        await waitFor(function() { return forceShown(h); }, 'failure dialog');
+        assert.ok(h.find('Reload now').hidden, 'hidden on failure; Force/Cancel unchanged');
+        h.find('Reload now').click();
+        await ticks(5);
+        assert.strictEqual(count(h, 'extension_build'), 0, 'a hidden Reload now never builds');
+        h.find('Cancel').click(); await settle(p);
+        assert.strictEqual(count(h, 'extension_build'), 0);
+    }, T);
     test('a suite missing from the result is an error row and nothing passes', async function() {
         var fx = await reloadKit(), h = fx.setup({ run: function(args) { return fx.good(args.files.slice(0, 4)); } });
         var p = h.api.reload();

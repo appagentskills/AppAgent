@@ -418,6 +418,28 @@
 .streaming-answer::-webkit-scrollbar { display: none; }
 .streaming-answer.has-top-shadow { box-shadow: var(--shadow-inset); }
 .messages-content { width: 100%; max-width: 800px; margin: 0 auto; }
+/* Positioning box for the scroll-to-bottom button (body.html). It wraps ONLY
+   #messages, so its box is exactly the visible message viewport: the button's
+   bottom/inline-end are measured from the messages/composer boundary and the
+   message scroll bar — not from .chat-content-wrapper, which also holds the
+   version sidebar (row layout: shifts the edge) or stacks it below the
+   messages (column layout: shifts the bottom). */
+.messages-viewport { position: relative; flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+/* Floating scroll-to-bottom button (shown via .visible while scrolled up).
+   Sits bottom-right, just inside the #messages scroll bar: inset-inline-end =
+   small gap (--space-4) + 15px, Chrome's default classic scroll bar width
+   (src/css defines no custom ::-webkit-scrollbar width for .messages, and its
+   scrollbar-gutter: stable always reserves that gutter). inset-inline-end
+   flips with the scroll bar in RTL. Responsive overrides only change
+   .messages padding, which does not affect this absolute offset.
+   Raised surface (--bg-elevated) so it never blends into the page in dark mode
+   (--bg-white == --bg-main there) and stays opaque over message text.
+   z-index 12: above the sticky tool-panel headers/buttons inside #messages
+   (05-tools.css, z-index 10-11), far below modals/dropdowns. */
+.scroll-to-bottom-btn { position: absolute; bottom: var(--space-6); inset-inline-end: calc(var(--space-4) + 15px); transform: translate(0, 8px); width: 32px; height: 32px; padding: 0; border-radius: 50%; border: 1px solid var(--secondary-border); background: var(--bg-elevated); color: var(--text-secondary); box-shadow: var(--shadow-md); display: flex; align-items: center; justify-content: center; cursor: pointer; opacity: 0; pointer-events: none; z-index: 12; transition: opacity var(--transition-fast), transform var(--transition-fast); }
+.scroll-to-bottom-btn.visible { opacity: 1; pointer-events: auto; transform: translate(0, 0); }
+.scroll-to-bottom-btn:hover { border-color: var(--secondary-border-dark); color: var(--text-primary); box-shadow: var(--shadow-lg); }
+.scroll-to-bottom-btn .ui-icon { width: 16px; height: 16px; }
 
 /* Centered state for empty chat */
 .messages.centered { justify-content: center; align-items: center; }

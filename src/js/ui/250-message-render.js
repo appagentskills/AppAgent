@@ -723,6 +723,7 @@ function renderMessages() {
                 }
             }, function() {});
         }
+        if (typeof updateScrollToBottomButton === 'function') updateScrollToBottomButton(); // S4
         return;
     }
 
@@ -737,6 +738,7 @@ function renderMessages() {
             emptyDiv.textContent = t('Start a conversation');
             inputArea.insertBefore(emptyDiv, inputArea.firstChild);
         }
+        if (typeof updateScrollToBottomButton === 'function') updateScrollToBottomButton(); // S4
         return;
     } else {
         // Remove empty state from input area if present
@@ -934,6 +936,11 @@ function renderMessages() {
         blocksByUserIdx[block.userMsgIdx] = block;
     });
     
+    // SCROLL-SWITCH guard: when the DOM still shows ANOTHER chat, its
+    // scrollTop belongs to that chat — restoring it into this one landed the
+    // new chat at an arbitrary position "based on the last chat". A chat
+    // change always opens following (lands at the bottom).
+    if (_lastRenderState.chatId && _lastRenderState.chatId !== currentChatId && !stickToBottom) stickToBottom = true;
     // Save scroll position before DOM rebuild - widgets will temporarily lose height
     var savedScrollTop = container.scrollTop;
 
@@ -2219,14 +2226,19 @@ function formatContent(content) {
 
     // Extract code blocks BEFORE escaping
     var codeBlocks = [];
-    html = html.replace(/```(\w*)\n([\s\S]*?)```/g, function(match, lang, code) {
+    // Info string may be any non-backtick text (```c++, ```json<space>, ``` sh),
+    // and an UNTERMINATED fence runs to the end of the content (CommonMark) —
+    // so a block still being streamed already renders as a code block with
+    // its copy button instead of flashing as raw text until the closing ```.
+    html = html.replace(/```([^\n`]*)\n([\s\S]*?)(?:```|$)/g, function(match, lang, code) {
+        lang = String(lang || '').trim().split(/\s+/)[0].toLowerCase();
         var codeCopyId = storeRawCopy(code);
         var isJS = !lang || lang === 'js' || lang === 'javascript';
         var highlightedCode = isJS ? highlightJS(code) : escapeHtml(code);
         var blockHtml = '<div class="code-block-wrapper" data-copy-id="' + codeCopyId + '">' +
             '<button class="code-block-expand-btn" onclick="toggleCodeBlockExpand(this, event)" title="' + escapeHtml(t('Expand')) + '">⤢</button>' +
             '<pre class="code-block collapsed"><code>' + highlightedCode + '</code></pre>' +
-            '<button class="code-copy-btn" onclick="copyCodeBlock(this, event)" title="' + escapeHtml(t('Copy')) + '">' + UI_ICONS.copy + '</button></div>';
+            '<button type="button" class="code-copy-btn" onclick="copyCodeBlock(this, event)" title="' + escapeHtml(t('Copy')) + '" aria-label="' + escapeHtml(t('Copy code')) + '">' + UI_ICONS.copy + '</button></div>';
         codeBlocks.push(blockHtml);
         return '%%CODEBLOCK' + (codeBlocks.length - 1) + '%%';
     });
@@ -2317,8 +2329,9 @@ function formatContent(content) {
     // Strikethrough ~~text~~ (no inner-edge spaces; code is still stashed).
     html = html.replace(/~~(?=\S)([^~\n]*?\S)~~/g, '<del>$1</del>');
 
-    // Markdown links [text](url) — supports http(s) and chrome-extension:// URLs
-    html = html.replace(/\[([^\]]+)\]\(((?:https?|chrome-extension):\/\/[^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+    // Markdown links [text](url) — supports http(s), chrome-extension:// and
+    // mailto: URLs (mailto: e.g. from a rich-text paste that kept its links).
+    html = html.replace(/\[([^\]]+)\]\(((?:https?|chrome-extension):\/\/[^)]+|mailto:[^)\s"]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
 
     // Auto-linkify BARE URLs (http/https) so links are clickable even when the
     // agent did not use markdown link syntax. We first stash any already-formed
@@ -2367,6 +2380,17 @@ function formatContent(content) {
     // a quote nested under a list item are rendered by a recursive call, so
     // lists/headings/quotes nest inside quotes and quotes inside list items.
     html = renderBlocks(html.split('\n'), 0);
+
+    // Top-level quotes (depth 0) get the same top-right copy button as code
+    // blocks; copyCodeBlock() copies the quote as rich HTML + formatted plain
+    // text (no `>` markers on the outer level). Nested quotes are copied as
+    // part of their outer quote.
+    function quoteHtml(inner, depth) {
+        var bqHtml = '<blockquote class="md-blockquote">' + inner + '</blockquote>';
+        if (depth > 0) return bqHtml;
+        return '<div class="md-quote-wrapper">' + bqHtml +
+            '<button type="button" class="code-copy-btn quote-copy-btn" onclick="copyCodeBlock(this, event)" title="' + escapeHtml(t('Copy')) + '" aria-label="' + escapeHtml(t('Copy quote')) + '">' + UI_ICONS.copy + '</button></div>';
+    }
 
     function renderBlocks(lines, depth) {
     var html; // local: recursive calls must not clobber the caller's html
@@ -2430,6 +2454,17 @@ function formatContent(content) {
             listHtml += '</li>';
         }
         listHtml += openItem(m[3]);
+    }
+    // Inside a quote, a text line keeps its tabs, leading indentation and
+    // runs of spaces: they become character references (&#9; / &#32;) so the
+    // paragraph pass's trim() and the `>\s+<` cleanup can't eat them, and
+    // `.md-blockquote .md-paragraph { white-space: pre-wrap }` shows them.
+    function keepQuoteWhitespace(line) {
+        if (/^\s*%%(CODEBLOCK|DISPLAY|DOCUMENT)\d+%%\s*$/.test(line)) return line;
+        return line.replace(/[ \t]+$/, '')
+            .replace(/^[ \t]+/, function(ws) { return ws.replace(/\t/g, '&#9;').replace(/ /g, '&#32;'); })
+            .replace(/\t/g, '&#9;')
+            .replace(/ {2,}/g, function(ws) { return ws.replace(/ /g, '&#32;'); });
     }
     // `[ ] text` / `[x] text` items become GFM task items with a disabled
     // checkbox. No space after the <input>: the `>\s+<` cleanup would eat it.
@@ -2520,7 +2555,7 @@ function formatContent(content) {
                 i++;
             }
             i--;
-            listHtml += '<blockquote class="md-blockquote">' + renderBlocks(liq, depth + 1) + '</blockquote>';
+            listHtml += quoteHtml(renderBlocks(liq, depth + 1), depth);
             listBlankPending = false;
         } else if (isBlockquote) {
             if (inTable) { out.push(tableClose); inTable = false; }
@@ -2541,7 +2576,7 @@ function formatContent(content) {
                 break;
             }
             i--;
-            out.push('<blockquote class="md-blockquote">' + renderBlocks(bq, depth + 1) + '</blockquote>');
+            out.push(quoteHtml(renderBlocks(bq, depth + 1), depth));
         } else if (isListItem) {
             if (inTable) { out.push(tableClose); inTable = false; }
             // "1. " items render in an <ol>, "- "/"* "/"+ " items in a <ul>;
@@ -2580,7 +2615,7 @@ function formatContent(content) {
         } else {
             if (inTable) { out.push(tableClose); inTable = false; }
             closeList();
-            out.push(ln);
+            out.push(depth > 0 ? keepQuoteWhitespace(ln) : ln);
         }
     }
     if (inTable) out.push(tableClose);

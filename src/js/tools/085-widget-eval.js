@@ -211,7 +211,7 @@ async function executeWidgetEval(args, options) {
             } catch (error) { entry.cancel('INVALID_RESULT', 'Invalid widget response JSON.'); }
         }
         entry.onResult = onResult;
-        timer = setTimeout(function() { entry.cancel('TIMEOUT', 'Response timed out; execution is NOT cancelled and side effects may continue.'); }, timeout);
+        timer = setTimeout(function() { entry.cancel('TIMEOUT', 'Response timed out; execution is not cancelled and side effects may continue.'); }, timeout);
         try {
             port.postMessage({ type: 'widgetEval', instance_id: entry.instance_id, request_id: requestId, code: args.code });
         } catch (error) { entry.cancel('INDETERMINATE', 'Document channel failed; execution cannot be confirmed. Verify state before retrying.'); }

@@ -473,6 +473,12 @@
         if (msg.type === 'active-tab-changed') {
             updateActiveTabStatus(msg);
         }
+        // OS-notification click (background.js notifications.onClicked): open
+        // the notified chat in this already-loaded page (ui/220-notification-system.js).
+        if (msg.type === 'open-chat-from-notification' && typeof handleOpenChatFromNotificationMessage === 'function') {
+            handleOpenChatFromNotificationMessage(msg, (chrome.tabs && typeof chrome.tabs.getCurrent === 'function')
+                ? function(cb) { chrome.tabs.getCurrent(cb); } : null);
+        }
     });
 
     // Query initial active tab info

@@ -677,6 +677,37 @@ function goToApprovalChat(chatId) {
     selectChat(chatId);
 }
 
+// OS-notification click → open its chat in THIS page. background.js focuses
+// the existing app.html tab (or the side panel) and broadcasts
+// {type:'open-chat-from-notification', chatId, tabId}. Focusing an already
+// loaded tab never reloads it, so this is the only path that navigates when the
+// user was already on the extension tab. tabId targets one full-page tab;
+// tabId null targets the side panel. Pure decision for testability.
+function shouldOpenChatFromNotification(msg, isSidePanel, ownTabId) {
+    if (!msg || msg.type !== 'open-chat-from-notification' || !msg.chatId) return false;
+    if (msg.tabId === null || msg.tabId === undefined) return !!isSidePanel;
+    return !isSidePanel && ownTabId === msg.tabId;
+}
+function openChatFromNotification(chatId) {
+    if (!chatId || typeof chats === 'undefined' || !chats[chatId]) return false;
+    if (chatId === currentChatId && typeof currentView !== 'undefined' && currentView === 'chat') return true;
+    selectChat(chatId);
+    return true;
+}
+// Runtime-message entry point; registered by platform-bridge.js (extension
+// only), which passes chrome.tabs.getCurrent as getCurrentTab.
+function handleOpenChatFromNotificationMessage(msg, getCurrentTab) {
+    if (!msg || msg.type !== 'open-chat-from-notification') return;
+    var isSide = !!(document.body && document.body.classList.contains('sidepanel-mode'));
+    if (isSide || typeof getCurrentTab !== 'function') {
+        if (shouldOpenChatFromNotification(msg, isSide, null)) openChatFromNotification(msg.chatId);
+        return;
+    }
+    getCurrentTab(function(tab) {
+        if (shouldOpenChatFromNotification(msg, false, tab ? tab.id : null)) openChatFromNotification(msg.chatId);
+    });
+}
+
 // Handle approval directly from notification without navigating to chat
 async function approveFromNotification(approvalIndex, chatId, action) {
     // Call the existing approval handler (skip notification clear - we handle it here)

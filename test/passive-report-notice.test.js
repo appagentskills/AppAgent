@@ -40,6 +40,7 @@ describe('passive report notice when wake_parent is false', function() {
         assert.strictEqual(rows[0].status, 'done');
         assert.strictEqual(rows[0].text, 'PR opened', 'one-line headline, markdown marker stripped');
         assert.strictEqual(rows[0].subChatId, 'c_kid');
+        assert.strictEqual(rows[0].fullText, '## PR opened\nsecond line', 'full report kept for the chevron expander');
         assert.deepStrictEqual(runs, [], 'no parent run started');
         assert.strictEqual(chats.root.messages.filter(function(x) { return x.role === 'user'; }).length, 0, 'no model-visible user row');
         assert.strictEqual(pend.root, undefined, 'nothing queued for injection');

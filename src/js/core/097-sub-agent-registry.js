@@ -2237,7 +2237,7 @@ function spawnSubAgent(args, ctx) {
         }
         if (_fuseCount >= SUBAGENT_SAME_NAME_FUSE) {
             return { success: false, error: 'spawn_sub_agent: SPAWN FUSE — ' + _fuseCount
-                + ' ACTIVE sub-agents named "' + _safeName + '" already exist for this chat (cap '
+                + ' active sub-agents named "' + _safeName + '" already exist for this chat (cap '
                 + SUBAGENT_SAME_NAME_FUSE + '). This usually means a restart/replay loop is re-issuing the same'
                 + ' spawn. Check agent_status: reuse or wake an existing sub, stop stale ones, or pick a'
                 + ' distinct name if you truly need another.' };
@@ -3630,6 +3630,10 @@ function _postPassiveReportNotice(rec, report, opts) {
             subChatId: rec.chat_id,
             status: (report && report.status) || 'done',
             text: _passiveReportHeadline(report && report.summary),
+            // Full (already summary_cap-bounded) report text for the card's
+            // chevron expander — `text` stays the one-line headline. UI-only
+            // row: sub_msg rows never reach the model payload.
+            fullText: String((report && report.summary) || '').trim(),
             handle: rec.spawn_handle_id || null,
             createdAt: Date.now()
         };

@@ -319,7 +319,7 @@ function expandSystemPromptPlaceholders(template, chatId) {
         var disabledSn = disabledTools.filter(function(t) { return _snCrudKeys.indexOf(t) !== -1; });
         if (disabledSn.length > 0 && disabledSn.length < _snCrudKeys.length) {
             var snOps = disabledSn.map(function(t) { return t.split(':')[1]; });
-            disabledToolsText += ' ServiceNow API calls (whether made by you or a sub-agent) must NOT perform these operations: ' + snOps.join(', ') + '.';
+            disabledToolsText += ' ServiceNow API calls (whether made by you or a sub-agent) must not perform these operations: ' + snOps.join(', ') + '.';
         }
     }
     expanded = expanded.replace(/\{\{DISABLED_TOOLS\}\}/g, disabledToolsText);

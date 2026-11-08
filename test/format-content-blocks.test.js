@@ -27,6 +27,9 @@ var P = function(s) { return '<span class="md-paragraph">' + s + '</span>'; };
 var BOX = '<input type="checkbox" class="md-task-box" disabled>';
 var BOXC = '<input type="checkbox" class="md-task-box" disabled checked>';
 var WRAP = '<div class="md-table-wrap"><table class="md-table">';
+// Top-level quote: wrapper + copy button around the blockquote.
+var QW = function(inner) { return '<div class="md-quote-wrapper"><blockquote class="md-blockquote">' + inner + '</blockquote>' +
+  '<button type="button" class="code-copy-btn quote-copy-btn" onclick="copyCodeBlock(this, event)" title="Copy" aria-label="Copy quote">C</button></div>'; };
 
 describe('format-content headings', function() {
   test('# .. ###### map to h2..h6 and every level is a block (no paragraph wrap)', function() {
@@ -41,7 +44,7 @@ describe('format-content headings', function() {
     assert.strictEqual(fc('#tag'), P('#tag'));
   }, T);
   test('heading inside a blockquote', function() {
-    assert.strictEqual(fc('> ## Note\n> text'), '<blockquote class="md-blockquote"><h3>Note</h3>' + P('text') + '</blockquote>');
+    assert.strictEqual(fc('> ## Note\n> text'), QW('<h3>Note</h3>' + P('text')));
   }, T);
 });
 
@@ -103,19 +106,19 @@ describe('format-content task lists', function() {
 describe('format-content blockquote / list nesting', function() {
   test('list (with sub-list) inside a blockquote', function() {
     assert.strictEqual(fc('> - a\n> - b\n>   - c'),
-      '<blockquote class="md-blockquote"><ul><li>a</li><li>b<ul><li>c</li></ul></li></ul></blockquote>');
+      QW('<ul><li>a</li><li>b<ul><li>c</li></ul></li></ul>'));
   }, T);
   test('blockquote inside a list item', function() {
     assert.strictEqual(fc('- item\n  > quote\n  > more\n- next'),
-      '<ul><li>item<blockquote class="md-blockquote">' + P('quote<br>more') + '</blockquote></li><li>next</li></ul>');
+      '<ul><li>item' + QW(P('quote<br>more')) + '</li><li>next</li></ul>');
   }, T);
   test('nested blockquote', function() {
     assert.strictEqual(fc('> outer\n> > inner'),
-      '<blockquote class="md-blockquote">' + P('outer') + '<blockquote class="md-blockquote">' + P('inner') + '</blockquote></blockquote>');
+      QW(P('outer') + '<blockquote class="md-blockquote">' + P('inner') + '</blockquote>'));
   }, T);
   test('hr and task list inside a blockquote', function() {
     assert.strictEqual(fc('> a\n> ---\n> - [x] t'),
-      '<blockquote class="md-blockquote">' + P('a') + '<hr class="md-hr"><ul><li class="md-task">' + BOXC + 't</li></ul></blockquote>');
+      QW(P('a') + '<hr class="md-hr"><ul><li class="md-task">' + BOXC + 't</li></ul>'));
   }, T);
   test('deep > > > nesting is bounded (no stack blow-up, balanced tags)', function() {
     var h = fc(new Array(200).join('&gt; '.replace('&gt;', '>')) + 'x');
@@ -125,11 +128,11 @@ describe('format-content blockquote / list nesting', function() {
   }, T);
   test('blank lines between quote lines keep one quote; text after closes it', function() {
     assert.strictEqual(fc('> a\n\n> b\nafter'),
-      '<blockquote class="md-blockquote">' + P('a') + P('b') + '</blockquote>' + P('after'));
+      QW(P('a') + P('b')) + P('after'));
   }, T);
   test('existing blockquote paragraphs unchanged', function() {
     assert.strictEqual(fc('> quote line\n> more\n>\n> second para\n\ntext'),
-      '<blockquote class="md-blockquote">' + P('quote line<br>more') + P('second para') + '</blockquote>' + P('text'));
+      QW(P('quote line<br>more') + P('second para')) + P('text'));
   }, T);
 });
 

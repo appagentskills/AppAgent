@@ -1,5 +1,23 @@
 # Changelog
 
+## v1.1.40
+
+### New
+- Chat has a scroll-to-bottom button, and each chat remembers its scroll position when you switch.
+- Sub-agent reports collapse behind a chevron instead of being truncated.
+- Pasting rich text into the composer keeps hyperlinks as Markdown links.
+- Reload pre-check has a "Reload now" button to skip waiting for tests.
+- Code blocks and quotes in chat have a copy button; copied quotes keep their formatting.
+
+### Fixes
+- Chat auto-scroll follows new messages reliably.
+- Stored files and images no longer go missing ("File not found") after cleanup or when their chat was removed.
+- Clicking an "Agent finished" notification opens its chat even when the extension tab is already open.
+- Reload pre-check no longer fails with "no tests ran".
+- Quotes keep their indentation and are easier to read.
+
+---
+
 ## v1.1.39
 
 ### New

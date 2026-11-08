@@ -295,22 +295,27 @@ function _reloadChecklist(controller) {
     node('p', '', t('Unit and canary checks use workspace sources in the installed runtime, not the new build. Contract and runtime layers are unsupported; skipped checks are not passes. Permission prompts remain separate.'), technical);
     var actions = node('div', 'modal-actions', '', dialog);
     var cancel = node('button', 'modal-btn secondary', t('Cancel'), actions); cancel.type = 'button';
+    // Shown only while the suites run: skips the wait and builds this workspace now.
+    var reloadNow = node('button', 'modal-btn primary', t('Reload now'), actions); reloadNow.type = 'button'; reloadNow.hidden = true;
     var force = node('button', 'modal-btn warning', t('Force build'), actions); force.type = 'button'; force.hidden = true; force.disabled = true;
     function choose(value) {
-        if (choice) return;
+        if (choice) return; // single-flight: the first choice wins (Cancel / Reload now / Force)
         choice = value;
         if (value === 'cancel') { controller.abort(); status.textContent = t('Cancelling — revoking test authority…'); }
+        if (value === 'skip') { reloadNow.hidden = true; controller.abort(); status.textContent = t('Skipping tests — stopping the test run…'); }
         resolveChoice(value);
     }
     cancel.addEventListener('click', function() { choose('cancel'); });
+    reloadNow.addEventListener('click', function() { if (!reloadNow.hidden) choose('skip'); });
     force.addEventListener('click', function() { if (!force.disabled) choose('force'); });
     overlay.addEventListener('keydown', function(e) {
         // Details and Cancel keep native keyboard activation; Enter must never choose Force.
-        if (e.key === 'Enter') { if (summaries.indexOf(e.target) < 0 && e.target !== cancel) e.preventDefault(); e.stopPropagation(); }
+        if (e.key === 'Enter') { if (summaries.indexOf(e.target) < 0 && e.target !== cancel && e.target !== reloadNow) e.preventDefault(); e.stopPropagation(); }
         if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); choose('cancel'); }
         // Include native summaries, but never steal focus from separate permission prompts.
         if (e.key === 'Tab') {
             var controls = summaries.concat([cancel]);
+            if (!reloadNow.hidden) controls.push(reloadNow);
             if (!force.hidden && !force.disabled) controls.push(force);
             var active = controls.indexOf(document.activeElement);
             e.preventDefault(); // S8D-04: focus on the overlay/dialog itself (active < 0) enters the ring at the first control (Shift: last)
@@ -344,6 +349,9 @@ function _reloadChecklist(controller) {
     return {
         decision: decision,
         cancelled: function() { return choice === 'cancel'; },
+        skipped: function() { return choice === 'skip'; },
+        // Toggles "Reload now" (visible only while the suites run and nothing was chosen yet).
+        running: function(on) { reloadNow.hidden = !on || !!choice; },
         // Adds the "Full test suite" row once the workspace's other test files are known.
         addRow: function(label, file) {
             labels.push(label); rows.push(makeRow(file, labels.length - 1, technical));
@@ -379,8 +387,8 @@ function _reloadChecklist(controller) {
             else if (text.indexOf('All five supported suites passed') === 0 || text.indexOf('All supported suites passed') === 0) { title.textContent = t('All checks passed'); status.textContent = t('Building the checked workspace…'); }
             else status.textContent = text;
         },
-        failure: function(text, settled) { title.textContent = t('Checks need attention'); status.textContent = text; force.hidden = false; force.disabled = !settled; cancel.focus(); },
-        close: function() { overlay.remove(); if (previous && previous.isConnected) previous.focus(); }
+        failure: function(text, settled) { reloadNow.hidden = true; title.textContent = t('Checks need attention'); status.textContent = text; force.hidden = false; force.disabled = !settled; cancel.focus(); },
+        close: function() { reloadNow.hidden = true; overlay.remove(); if (previous && previous.isConnected) previous.focus(); }
     };
 }
 
@@ -447,6 +455,7 @@ async function _runReloadPreflight() {
         if (controller.signal.aborted) throw new Error('Reload cancelled');
         // One run_tests call per batch (tooling suites first); rows map from its entries.
         files.forEach(function(_, i) { set(i, 'running', t('Running supported assertions…')); });
+        ui.running(true);
         // Live progress: each call streams per-suite events, so the counter/bar
         // advance as suites finish. Provisional only: each envelope re-judges its rows.
         provisional = files.map(function() { return false; });
@@ -469,6 +478,7 @@ async function _runReloadPreflight() {
             }
         };
         for (var offset = 0; offset < files.length; offset += RELOAD_PREFLIGHT_BATCH_FILES) await runBatch(offset);
+        ui.running(false);
         failed = states.some(function(st) { return st !== 'pass'; });
         if (!failed) {
             var current = await _reloadWait(_reloadFingerprint(workspace), controller.signal, 15000);
@@ -497,9 +507,13 @@ async function _runReloadPreflight() {
             controller.abort();
             try { await _reloadWait(pending, new AbortController().signal, 12000); } catch (cleanupError) { /* Fail closed below if still unsettled. */ }
         }
+        ui.running(false);
         if (!failed || ui.cancelled()) ui.close();
     }
     if (ui.cancelled()) { ui.close(); return { proceed: false }; }
+    // "Reload now": the user skipped the suites (run aborted above). Build the same
+    // workspace the normal path would; no pass record is written for a skipped run.
+    if (ui.skipped() && workspace) { ui.close(); return { proceed: true, workspace: workspace, skipped: true }; }
     files.forEach(function(_, i) { if (states[i] === 'pending') set(i, 'skipped', 'Not run'); });
     // Name the failing test files so a blocked Reload is never silent about why.
     var badFiles = files.filter(function(_, i) { return states[i] === 'fail' || states[i] === 'error'; });

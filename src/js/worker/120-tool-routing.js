@@ -1054,7 +1054,7 @@ var _widgetEvalRun = crypto.randomUUID();
 var _WIDGET_EVAL_PROBE_MS = 5000;
 function _widgetEvalIndeterminate() {
     return { success: false, code: 'INDETERMINATE', outcome: 'indeterminate', replay_blocked: true,
-        error: 'Prior widget evaluation may have run. No automatic re-execution; verify live state before issuing a NEW call.' };
+        error: 'Prior widget evaluation may have run. No automatic re-execution; verify live state before issuing a new call.' };
 }
 
 function _widgetEvalPanelCall(port, chatId, input, options, waitMs) {

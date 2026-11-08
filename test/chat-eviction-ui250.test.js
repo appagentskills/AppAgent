@@ -20,6 +20,7 @@ describe('ui/250 skeleton storage failure and Retry', function() {
                 _isChatInSilentHook: function() { return false; }, currentEditingWidget: null,
                 getDisplayHtmlForMessage: null,
                 updateContextIndicator: function() {}, updateInputPosition: function() {},
+                updateScrollToBottomButton: function() {},
                 escapeHtml: function(s) { return s; },
                 ensureChatPayloads: function(id) {
                     calls.push(id);
