@@ -11,17 +11,17 @@
 //  - ui/175: _subContextInfo / _subWorkStats / _reconstructSubsFromMessages
 //    use the REAL ui/120 skeletonScanValue memo over the stored row.
 
+var EX = await runFile('test/extract.js', { i18n: false });
 function rec() { var f = function() { f.calls.push([].slice.call(arguments)); }; f.calls = []; return f; }
 async function ticks(n) { for (var i = 0; i < (n || 30); i++) await Promise.resolve(); }
 
 function _cutFns(src, names) {
+    var mask = EX.codeMask(src);
     return names.map(function(name) {
-        var re = new RegExp('^(async )?function ' + name + '\\(', 'm');
-        var m = re.exec(src);
-        if (!m) throw new Error('function not found: ' + name);
-        var end = src.indexOf('\n}\n', m.index);
-        if (end === -1) throw new Error('function end not found: ' + name);
-        return src.slice(m.index, end + 2);
+        var f = EX.findFunction(src, name, { mask: mask });
+        if (!f) throw new Error('function not found: ' + name);
+        if (!(f.end > f.start)) throw new Error('function end not found: ' + name);
+        return src.slice(f.start, f.end);
     }).join('\n');
 }
 var NOOP_CONSOLE = { warn: function() {}, error: function() {}, log: function() {} };

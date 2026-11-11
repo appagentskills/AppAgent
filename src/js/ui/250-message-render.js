@@ -270,6 +270,94 @@ function showEarlierMessages() {
     }
 }
 
+// USER-MSG-NAV: up/down buttons in a user bubble's .msg-actions jump to the
+// previous / next user message. Pure view logic: it walks the RENDERED DOM
+// (so hidden rows, sub-agent notice rows and the message window are handled
+// naturally), computes neighbours at hover/focus/click time (always current
+// while messages stream in, get edited or deleted) and never writes chat
+// state. Edge state uses aria-disabled (not `disabled`) so a keyboard user's
+// focus is never dropped when the state flips under them.
+function _userMsgNavButtonsHtml() {
+    var prev = escapeHtml(t('Previous message'));
+    var next = escapeHtml(t('Next message'));
+    return '<button type="button" class="user-msg-nav-btn" data-nav-dir="-1" onclick="jumpToUserMessage(this, -1)" onfocus="refreshUserMsgNav(this)" title="' + prev + '" aria-label="' + prev + '">' + UI_ICONS.arrowUp + '</button>' +
+        '<button type="button" class="user-msg-nav-btn" data-nav-dir="1" onclick="jumpToUserMessage(this, 1)" onfocus="refreshUserMsgNav(this)" title="' + next + '" aria-label="' + next + '">' + UI_ICONS.arrowDown + '</button>';
+}
+
+// Navigable user bubbles in document order: skips sub-agent notice rows and
+// the renderer's hidden / display:none placeholder rows (the only two ways
+// the transcript hides a user row).
+function _userMsgNavList(container) {
+    var out = [];
+    if (!container || typeof container.querySelectorAll !== 'function') return out;
+    var all = container.querySelectorAll('.message.user');
+    for (var i = 0; i < all.length; i++) {
+        var el = all[i];
+        if (el.hidden || (el.classList && el.classList.contains('sub-notice-msg'))) continue;
+        if (el.style && el.style.display === 'none') continue;
+        out.push(el);
+    }
+    return out;
+}
+
+function _userMsgNavTarget(bubble, dir) {
+    var list = _userMsgNavList(document.getElementById('messages'));
+    var i = list.indexOf(bubble);
+    if (i === -1) return null;
+    return list[i + dir] || null;
+}
+
+// Earlier turns exist but are windowed out of the DOM (showEarlierMessages).
+function _userMsgHasEarlierWindow() {
+    return !!(currentChatId && _msgWindowStart && (_msgWindowStart[currentChatId] || 0) > 0);
+}
+
+// Sync the up/down edge state of one bubble (pass the bubble or any node in it).
+function refreshUserMsgNav(node) {
+    var bubble = node && typeof node.closest === 'function' ? node.closest('.message.user') : null;
+    if (!bubble) return;
+    var btns = bubble.querySelectorAll('.user-msg-nav-btn');
+    for (var i = 0; i < btns.length; i++) {
+        var dir = Number(btns[i].getAttribute('data-nav-dir')) < 0 ? -1 : 1;
+        var has = !!_userMsgNavTarget(bubble, dir) || (dir < 0 && _userMsgHasEarlierWindow());
+        if (has) btns[i].removeAttribute('aria-disabled');
+        else btns[i].setAttribute('aria-disabled', 'true');
+    }
+}
+
+function jumpToUserMessage(btn, dir) {
+    dir = dir < 0 ? -1 : 1;
+    var bubble = btn && typeof btn.closest === 'function' ? btn.closest('.message.user') : null;
+    var container = document.getElementById('messages');
+    if (!bubble || !container) return;
+    var target = _userMsgNavTarget(bubble, dir);
+    // Up from the first rendered user message: reveal windowed-out earlier
+    // turns (same path as the "show earlier" button) until one appears.
+    var guard = 0;
+    while (!target && dir < 0 && bubble.id && _userMsgHasEarlierWindow() && guard++ < 100) {
+        var bubbleId = bubble.id;
+        showEarlierMessages();
+        bubble = document.getElementById(bubbleId);
+        if (!bubble) return;
+        target = _userMsgNavTarget(bubble, dir);
+    }
+    if (!target) { refreshUserMsgNav(bubble); return; }
+    // Deliberate user navigation: lets handleChatScroll release follow-mode
+    // even for keyboard activation (pointer clicks already mark intent).
+    if (typeof _agMarkUserScrollIntent === 'function') _agMarkUserScrollIntent();
+    var top = container.scrollTop + target.getBoundingClientRect().top - container.getBoundingClientRect().top - 12;
+    if (typeof container.scrollTo === 'function') container.scrollTo({ top: Math.max(0, top), behavior: 'smooth' });
+    else container.scrollTop = Math.max(0, top);
+    target.classList.remove('user-msg-nav-flash');
+    void target.offsetWidth; // restart the animation on repeat jumps
+    target.classList.add('user-msg-nav-flash');
+    setTimeout(function() { target.classList.remove('user-msg-nav-flash'); }, 1300);
+    // Keep keyboard users on the same control in the new bubble.
+    var twin = target.querySelector('.user-msg-nav-btn[data-nav-dir="' + dir + '"]');
+    if (twin && typeof twin.focus === 'function' && document.activeElement === btn) twin.focus({ preventScroll: true });
+    refreshUserMsgNav(target);
+}
+
 function _renderSig(part) {
     var s = part.replace(/ data-copy-id="rc-[0-9]+"/g, '');
     // 31x string hash (ES5-safe, no Math.imul needed). A collision would only
@@ -1079,7 +1167,7 @@ function renderMessages() {
                     userBodyHtml = '<div class="user-text user-text-md">' + formatContent(rawUser) + '</div>';
                 }
             }
-            return '<div class="message user' + (isSubNoticeRow ? ' sub-notice-msg' : '') + '" id="msg-' + index + '"><div class="msg-actions"><button class="edit-msg-btn" onclick="editMessage(' + index + ')" title="' + escapeHtml(t('Edit and branch')) + '">' + UI_ICONS.edit + '</button><button class="copy-msg-btn" onclick="copyMessageText(' + index + ')" title="' + escapeHtml(t('Copy message')) + '">' + UI_ICONS.copy + '</button></div><div class="message-content">' + userBodyHtml + '</div></div>';
+            return '<div class="message user' + (isSubNoticeRow ? ' sub-notice-msg' : '') + '" id="msg-' + index + '" onmouseenter="refreshUserMsgNav(this)"><div class="msg-actions"><button class="edit-msg-btn" onclick="editMessage(' + index + ')" title="' + escapeHtml(t('Edit and branch')) + '">' + UI_ICONS.edit + '</button><button class="copy-msg-btn" onclick="copyMessageText(' + index + ')" title="' + escapeHtml(t('Copy message')) + '">' + UI_ICONS.copy + '</button>' + _userMsgNavButtonsHtml() + '</div><div class="message-content">' + userBodyHtml + '</div></div>';
         } else if (msg.role === 'assistant') {
             // Hide assistant responses to hook messages unless showHookMessages is enabled
             if (!hooksEnabled.showHookMessages) {
@@ -2226,22 +2314,68 @@ function formatContent(content) {
 
     // Extract code blocks BEFORE escaping
     var codeBlocks = [];
-    // Info string may be any non-backtick text (```c++, ```json<space>, ``` sh),
-    // and an UNTERMINATED fence runs to the end of the content (CommonMark) —
-    // so a block still being streamed already renders as a code block with
-    // its copy button instead of flashing as raw text until the closing ```.
-    html = html.replace(/```([^\n`]*)\n([\s\S]*?)(?:```|$)/g, function(match, lang, code) {
+    // `text` / `plaintext` / `txt` / `plain` fences are prose (email drafts,
+    // quoted output): never syntax-highlighted, and styled by
+    // `.code-block-text` (pre-wrap, prose font) in 07-markdown.css.
+    var PLAIN_FENCE_LANGS = /^(text|plaintext|plain|txt)$/;
+    function stashCodeBlock(lang, code) {
         lang = String(lang || '').trim().split(/\s+/)[0].toLowerCase();
         var codeCopyId = storeRawCopy(code);
-        var isJS = !lang || lang === 'js' || lang === 'javascript';
+        var isPlain = PLAIN_FENCE_LANGS.test(lang);
+        var isJS = !isPlain && (!lang || lang === 'js' || lang === 'javascript');
         var highlightedCode = isJS ? highlightJS(code) : escapeHtml(code);
-        var blockHtml = '<div class="code-block-wrapper" data-copy-id="' + codeCopyId + '">' +
+        var textCls = isPlain ? ' code-block-text' : '';
+        var blockHtml = '<div class="code-block-wrapper' + textCls + '" data-copy-id="' + codeCopyId + '">' +
             '<button class="code-block-expand-btn" onclick="toggleCodeBlockExpand(this, event)" title="' + escapeHtml(t('Expand')) + '">⤢</button>' +
-            '<pre class="code-block collapsed"><code>' + highlightedCode + '</code></pre>' +
+            '<pre class="code-block' + textCls + ' collapsed"><code>' + highlightedCode + '</code></pre>' +
             '<button type="button" class="code-copy-btn" onclick="copyCodeBlock(this, event)" title="' + escapeHtml(t('Copy')) + '" aria-label="' + escapeHtml(t('Copy code')) + '">' + UI_ICONS.copy + '</button></div>';
         codeBlocks.push(blockHtml);
         return '%%CODEBLOCK' + (codeBlocks.length - 1) + '%%';
-    });
+    }
+    // Fences are matched LINE BY LINE (CommonMark): an opener is a line of 3+
+    // backticks or tildes (optionally inside `>` quote markers / indentation;
+    // a backtick info string may not contain a backtick); the closer is a line
+    // holding ONLY a run of the SAME character at least as long as the opener,
+    // indented at most 3 columns more than the opener. So a ```` fence may
+    // contain ``` lines, and a ``` in the middle of a prose line never opens
+    // or closes a block. Inside a quote the block ends with the quote, and the
+    // `>` markers are stripped from its lines. An UNTERMINATED fence runs to
+    // the end of the content, so a block still being streamed already renders
+    // as a code block with its copy button.
+    // Each prefix repetition must consume a `>` (no optional-space overlap),
+    // so deep `> > > …` lines can't trigger catastrophic backtracking.
+    var FENCE_OPEN_RE = /^((?:[ \t]*>)*)([ \t]*)(`{3,}|~{3,})([^\n]*)$/;
+    function fenceCols(ws) { return ws.replace(/\t/g, '    ').length; }
+    function stripQuoteMarkers(line, depth) {
+        for (var q = 0; q < depth; q++) {
+            var qm = /^[ \t]*>[ \t]?/.exec(line);
+            if (!qm) return null;
+            line = line.slice(qm[0].length);
+        }
+        return line;
+    }
+    var srcLines = html.split('\n');
+    var fencedLines = [];
+    for (var fi = 0; fi < srcLines.length; fi++) {
+        var fm = FENCE_OPEN_RE.exec(srcLines[fi]);
+        if (!fm || (fm[3].charAt(0) === '`' && fm[4].indexOf('`') !== -1)) { fencedLines.push(srcLines[fi]); continue; }
+        var fQuoteDepth = (fm[1].match(/>/g) || []).length;
+        // The one optional space after the last `>` belongs to the marker.
+        var fIndent = Math.max(0, fenceCols(fm[2]) - (fQuoteDepth && /^[ \t]/.test(fm[2]) ? 1 : 0));
+        var fChar = fm[3].charAt(0), fLen = fm[3].length;
+        var fBody = [], fClosed = false, fk = fi + 1;
+        for (; fk < srcLines.length; fk++) {
+            var fInner = stripQuoteMarkers(srcLines[fk], fQuoteDepth);
+            if (fInner === null) break; // the enclosing quote ended: so does the block
+            var cm = /^([ \t]*)(`{3,}|~{3,})[ \t\r]*$/.exec(fInner);
+            if (cm && cm[2].charAt(0) === fChar && cm[2].length >= fLen && fenceCols(cm[1]) <= fIndent + 3) { fClosed = true; break; }
+            fBody.push(fIndent ? fInner.replace(new RegExp('^ {0,' + fIndent + '}'), '') : fInner);
+        }
+        var fCode = fClosed ? (fBody.length ? fBody.join('\n') + '\n' : '') : fBody.join('\n');
+        fencedLines.push(fm[1] + fm[2] + stashCodeBlock(fm[4], fCode));
+        fi = fClosed ? fk : fk - 1;
+    }
+    html = fencedLines.join('\n');
     
     // Stash inline code before EVERY markdown/placeholder transform. Restore
     // last, after line/table processing and whitespace cleanup, just like fences.
@@ -2249,10 +2383,39 @@ function formatContent(content) {
     var inlineCode = [];
     var inlinePrefix = '\u0000INLINE';
     while (content.indexOf(inlinePrefix) !== -1) inlinePrefix += 'I';
-    html = html.replace(/`([^`]+)`/g, function(match, code) {
-        inlineCode.push('<code class="inline-code">' + escapeHtml(code) + '</code>');
-        return inlinePrefix + (inlineCode.length - 1) + '\u0000';
+    // Code spans follow CommonMark: a backtick run is closed only by a run of
+    // EQUAL length, and an unmatched run is literal text (so a stray ``` in
+    // prose stays visible instead of opening a span). A span may continue over
+    // a soft line break inside one paragraph, but never past a blank line or
+    // into a line that starts a block (list item, `>` quote line, heading,
+    // table row), so it can't swallow following quote lines, list items or
+    // paragraphs. One leading+trailing space is stripped (`` `x` `` -> `x`).
+    var SPAN_BLOCK_START = /^[ \t]*(?:$|>|#{1,6}[ \t]|\||[-*+][ \t]|\d+[.)][ \t])/;
+    var spanGroups = [];
+    html.split('\n').forEach(function(line, idx) {
+        if (idx === 0 || SPAN_BLOCK_START.test(line) || /^[ \t]*$/.test(spanGroups[spanGroups.length - 1])) spanGroups.push(line);
+        else spanGroups[spanGroups.length - 1] += '\n' + line;
     });
+    html = spanGroups.map(function(line) {
+        if (line.indexOf('`') === -1) return line;
+        var outLine = '', pos = 0, runRe = /`+/g, om;
+        while ((om = runRe.exec(line)) !== null) {
+            var closeRe = /`+/g, cmm, closeAt = -1;
+            closeRe.lastIndex = runRe.lastIndex;
+            while ((cmm = closeRe.exec(line)) !== null) {
+                if (cmm[0].length === om[0].length) { closeAt = cmm.index; break; }
+            }
+            if (closeAt < 0) continue; // unmatched run: literal backticks
+            var code = line.slice(runRe.lastIndex, closeAt);
+            if (code.length > 2 && code.charAt(0) === ' ' && code.charAt(code.length - 1) === ' ' && /[^ ]/.test(code)) code = code.slice(1, -1);
+            if (!code) continue; // `` is not a span
+            inlineCode.push('<code class="inline-code">' + escapeHtml(code) + '</code>');
+            outLine += line.slice(pos, om.index) + inlinePrefix + (inlineCode.length - 1) + '\u0000';
+            pos = closeAt + om[0].length;
+            runRe.lastIndex = pos;
+        }
+        return outLine + line.slice(pos);
+    }).join('\n');
 
     // Images ![alt](url) — on RAW text (alt/src escaped here), stashed in the
     // inline-code list so no later pass (links, autolinker, emoji, bold) can

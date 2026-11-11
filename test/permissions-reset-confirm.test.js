@@ -5,14 +5,13 @@
 // escapeHtml) over in-memory permission maps and recorders for every storage / offscreen / UI effect, and
 // prove that nothing is saved, pushed or replaced unless the user confirms a danger dialog that says what
 // will be lost - and that Cancel writes nothing at all.
+var EX = await runFile('test/extract.js', { i18n: false });
 async function realDecl(path, name) {
     var src = await loadFile(path);
-    var m = new RegExp('\\n(?:async )?function ' + name + '\\(').exec(src);
-    assert.ok(m, name + ' found in ' + path);
-    var a = m.index + 1;
-    var b = src.indexOf('\n}\n', a);
-    assert.ok(b > a, name + ' end found in ' + path);
-    return src.slice(a, b + 2);
+    var f = EX.findFunction(src, name);
+    assert.ok(f, name + ' found in ' + path);
+    assert.ok(f.end > f.start, name + ' end found in ' + path);
+    return src.slice(f.start, f.end);
 }
 
 function clone(o) { return JSON.parse(JSON.stringify(o)); }

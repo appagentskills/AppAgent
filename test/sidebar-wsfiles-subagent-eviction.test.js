@@ -4,17 +4,16 @@
 // PR they were pushed to, and a sub chat's new messages must re-render the
 // parent sidebar. Evaluates REAL source: core/130 via loadModules and the
 // ui/115 helpers cut out of the workspace source by text.
+var EX = await runFile('test/extract.js', { i18n: false });
 describe('sidebar workspace files: sub-agent edits survive eviction', function() {
     var UI = 'src/js/ui/115-workspace-files-sidebar.js';
     var PR_URL = 'https://github.com/example-org/AppAgent/pull/1049';
 
     function cutDecl(src, name) {
-        var m = new RegExp('\\n(?:async )?function ' + name + '\\(').exec(src);
-        assert.ok(m, name + ' found in ' + UI);
-        var a = m.index + 1;
-        var b = src.indexOf('\n}\n', a);
-        assert.ok(b > a, name + ' end found');
-        return src.slice(a, b + 2);
+        var f = EX.findFunction(src, name);
+        assert.ok(f, name + ' found in ' + UI);
+        assert.ok(f.end > f.start, name + ' end found');
+        return src.slice(f.start, f.end);
     }
     function cutVar(src, name) {
         var m = new RegExp('\\nvar ' + name + ' = [^;\\n]+;').exec(src);

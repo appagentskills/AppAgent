@@ -112,6 +112,8 @@
                         <button type="button" class="jobs-badge" id="jobs-badge" data-i18n-attr="aria-label" aria-haspopup="menu" aria-expanded="false" onclick="toggleJobsDropdown(this)" title="Active background jobs" aria-label="Active background jobs" style="display:none"></button>
                         <div class="jobs-dropdown header-menu" id="jobs-dropdown" style="display:none"></div>
                     </div>
+                    <!-- Notifications pill (Silent / Notify / With sound): icon only (state in title + aria-label; red when Chrome blocks notifications); opens #notif-mode-menu (reuses the model menu). Logic: ui/240-layout.js (toggleNotificationModeMenu, syncNotificationModeControls). -->
+                    <button type="button" class="notif-mode-pill notif-mode-wrap" id="header-notif-mode" data-mode="notify" aria-haspopup="menu" aria-expanded="false" data-i18n-attr="title,aria-label" title="Notifications" aria-label="Notifications" onclick="toggleNotificationModeMenu(event)" onkeydown="notificationModeKeydown(event)"><span class="notif-mode-icon-slot" aria-hidden="true"></span></button>
                     <button type="button" onclick="toggleSettingsPanel(event)" data-i18n-attr="title,aria-label" title="Settings" class="settings-btn" aria-label="Open settings" aria-haspopup="menu" aria-expanded="false"></button>
                     <button class="ext-panel-btn ext-reload-btn" id="ext-reload-btn" data-i18n-attr="title,aria-label" style="display:none" onclick="reloadExtension()" title="Reload extension" aria-label="Reload extension"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg></button>
                 </div>
@@ -152,6 +154,9 @@
                             <path class="context-bg" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"/>
                             <path class="context-fill" id="context-fill" stroke-dasharray="0, 100" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"/>
                         </svg>
+                        <span class="context-pct" id="context-pct" aria-hidden="true" hidden></span>
+                        <span class="context-label" id="context-label" hidden></span>
+                        <span class="context-label-short" id="context-label-short" aria-hidden="true" hidden></span>
                     </div>
                     <button id="pause-btn" data-i18n-attr="aria-label" onclick="togglePause()" aria-label="Pause or resume"><span class="btn-icon" id="pause-icon" aria-hidden="true"></span>Pause</button>
                     <button id="continue-btn" data-i18n data-i18n-attr="aria-label" onclick="continueAgent()" aria-label="Continue interrupted run"><span class="btn-icon" id="continue-icon" aria-hidden="true"></span>Continue</button>
@@ -289,6 +294,8 @@
                         <button type="button" class="jobs-badge" id="home-jobs-badge" data-i18n-attr="aria-label" aria-haspopup="menu" aria-expanded="false" onclick="toggleJobsDropdown(this)" title="Active background jobs" aria-label="Active background jobs" style="display:none"></button>
                         <div class="jobs-dropdown header-menu" id="home-jobs-dropdown" style="display:none"></div>
                     </div>
+                    <!-- Notifications pill (Silent / Notify / With sound): icon only (state in title + aria-label; red when Chrome blocks notifications); opens #notif-mode-menu (reuses the model menu). Logic: ui/240-layout.js (toggleNotificationModeMenu, syncNotificationModeControls). -->
+                    <button type="button" class="notif-mode-pill notif-mode-wrap" id="home-header-notif-mode" data-mode="notify" aria-haspopup="menu" aria-expanded="false" data-i18n-attr="title,aria-label" title="Notifications" aria-label="Notifications" onclick="toggleNotificationModeMenu(event)" onkeydown="notificationModeKeydown(event)"><span class="notif-mode-icon-slot" aria-hidden="true"></span></button>
                     <button type="button" onclick="toggleSettingsPanel(event)" title="Settings" class="settings-btn" id="home-settings-btn" data-i18n-attr="title,aria-label" aria-label="Open settings" aria-haspopup="menu" aria-expanded="false"></button>
                     <button class="ext-panel-btn ext-reload-btn" id="home-ext-reload-btn" data-i18n-attr="title,aria-label" style="display:none" onclick="reloadExtension()" title="Reload extension" aria-label="Reload extension"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg></button>
                 </div>

@@ -1,7 +1,7 @@
 {
     "manifest_version": 3,
     "name": "__MSG_extName__",
-    "version": "1.1.40",
+    "version": "1.1.41",
     "description": "__MSG_extDescription__",
     "default_locale": "en",
     "permissions": [
@@ -16,6 +16,7 @@
         "notifications",
         "alarms",
         "power",
+        "idle",
         "offscreen"
     ],
     "host_permissions": [

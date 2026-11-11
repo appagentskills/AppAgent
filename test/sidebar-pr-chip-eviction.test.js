@@ -8,6 +8,7 @@
 // source by text. Only chats / currentChatId / subAgentsForChatTree /
 // getAllWorkspaceMetas and a renderVersionSidebar spy are faked. No timers:
 // every fake settles on microtasks.
+var EX = await runFile('test/extract.js', { i18n: false });
 describe('sidebar PR chip: push rows survive eviction + meta.prs union', function() {
     var UI = 'src/js/ui/120-ui-utils.js';
     // getPushedPRsForChat routes through the C2 skeleton scan (skeletonScanValue +
@@ -22,12 +23,10 @@ describe('sidebar PR chip: push rows survive eviction + meta.prs union', functio
 
     // realDecl pattern (test/chat-boot-load.test.js cutDecl), over one read.
     function cutDecl(src, name) {
-        var m = new RegExp('\\n(?:async )?function ' + name + '\\(').exec(src);
-        assert.ok(m, name + ' found in ' + UI);
-        var a = m.index + 1;
-        var b = src.indexOf('\n}\n', a);
-        assert.ok(b > a, name + ' end found in ' + UI);
-        return src.slice(a, b + 2);
+        var f = EX.findFunction(src, name);
+        assert.ok(f, name + ' found in ' + UI);
+        assert.ok(f.end > f.start, name + ' end found in ' + UI);
+        return src.slice(f.start, f.end);
     }
     function cutVar(src, name) {
         var m = new RegExp('\\nvar ' + name + ' = [^;\\n]+;').exec(src);

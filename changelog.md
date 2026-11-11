@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.1.41
+
+### New
+- Support for Fable 5.2.
+- Notification mode pill in the header: Silent / Notify / With sound.
+- Keep awake holds the display after 15 s of machine idle; idle also counts as away for notifications.
+- "Continue in a new chat" pill past 50% context, with a handoff summary.
+- Pasting text that contains images attaches the images.
+
+### Fixes
+- Markdown code blocks and quotes render more reliably.
+- Sub-agent cards no longer wrap or overflow.
+
+---
+
 ## v1.1.40
 
 ### New

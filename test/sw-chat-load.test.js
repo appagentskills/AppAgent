@@ -10,6 +10,7 @@
 // (ONE range-less store.getAll(); preF2LoaderHolder at the bottom) appended.
 // The later function declaration wins, so old and new run over identical
 // stores and their end states are compared.
+var EX = await runFile('test/extract.js', { i18n: false });
 describe('SW batched chat load (F2 boot OOM fix)', function() {
     var STORE = 'chats';
     var _sourcesP = null;
@@ -20,8 +21,9 @@ describe('SW batched chat load (F2 boot OOM fix)', function() {
                 loadFile('src/js/core/130-indexeddb.js')
             ]).then(function(r) {
                 var core = r[1];
-                var at = core.indexOf('function stripChatPayloadsInPlace(');
-                var end = at < 0 ? -1 : core.indexOf('\n}\n', at);
+                var fx = EX.findFunction(core, 'stripChatPayloadsInPlace', { includeAsync: false });   // code-mask cut (test/extract.js)
+                var at = fx ? fx.start : -1;
+                var end = fx ? fx.end - 2 : -1;
                 if (end < 0) throw new Error('stripChatPayloadsInPlace not found in core/130-indexeddb.js');
                 return { src: r[0], strip: core.slice(at, end + 2), oldLoader: preF2LoaderSource() };
             });
@@ -257,9 +259,10 @@ describe('SW batched chat load (F2 boot OOM fix)', function() {
 
     test('reads: ONE key-only pass, then gap-free getAll(range) batches, each its own readonly withStore; never a range-less getAll', async function() {
         var s = await sources();
-        var at = s.src.indexOf('async function _swLoadChatsFromStorageBatched(');
+        var fx = EX.findFunction(s.src, '_swLoadChatsFromStorageBatched');   // code-mask cut (test/extract.js)
+        var at = fx ? fx.start : -1;
         assert.ok(at >= 0, 'batched loader present');
-        var code = s.src.slice(at, s.src.indexOf('\n}\n', at)).replace(/\/\/[^\n]*/g, '');
+        var code = s.src.slice(at, fx.end - 2).replace(/\/\/[^\n]*/g, '');
         assert.ok(!/\.getAll\(\s*\)/.test(code), 'no range-less getAll() in the batched loader');
         assert.match(s.oldLoader, /store\.getAll\(\)/, 'oracle is the pre-F2 single range-less getAll loader');
         var rows = makeRows(57), keys = rows.map(function(r) { return r.id; });

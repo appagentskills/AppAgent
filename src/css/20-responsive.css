@@ -239,6 +239,10 @@
     /* Context indicator */
     .context-indicator { width: 32px; height: 32px; }
     .context-circle { width: 24px; height: 24px; }
+    /* Narrow sidepanel: the pill matches the 32px attach button and swaps to the short "New chat" label (one line). */
+    .context-indicator.continue-cta { width: auto; height: 32px; gap: var(--space-2); padding-inline: var(--space-3) var(--space-5); }
+    .context-indicator.continue-cta .context-label { display: none; }
+    .context-indicator.continue-cta .context-label-short { display: inline; }
 
     /* Search results in sidebar */
     .chat-result-snippets { max-height: 150px; }
@@ -257,6 +261,10 @@
     .input-container { padding-block: var(--space-2); padding-inline: var(--space-6) var(--space-2); }
     .input-container textarea { font-size: var(--text-body); }
     #send-btn { width: 36px; height: 36px; }
+    /* Tiniest widths: ring + % only (the full action stays in aria-label/title). */
+    .context-indicator.continue-cta .context-label-short { display: none; }
+    .context-indicator.continue-cta .context-pct::after { content: none; }
+    .context-indicator.continue-cta { padding-inline: var(--space-3) var(--space-4); }
 
     .dashboard-grid { grid-template-columns: 1fr; }
 

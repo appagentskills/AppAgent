@@ -1099,7 +1099,7 @@ function _subNoticeCardHtml(name, agentId, status, summary, kind, opts) {
     return '<div class="' + (_rowIdx != null ? 'message ' : '') + 'sub-notice sub-report-' + st + ' sub-notice-' + (isMid ? 'mid' : 'final') + '"' + (_rowIdx != null ? ' id="msg-' + _rowIdx + '"' : '') + ' data-sub-agent-id="' + escapeHtml(agentId || '') + '">' +
         '<div class="sub-notice-header">' +
             '<span class="sub-report-icon" aria-hidden="true">' + iconChar + '</span>' +
-            '<span class="sub-report-name">' + escapeHtml(name) + '</span>' +
+            '<span class="sub-report-name" title="' + escapeHtml(name) + '">' + escapeHtml(name) + '</span>' +
             badge + viewBtn +
         '</div>' + body + foot + '</div>';
 }

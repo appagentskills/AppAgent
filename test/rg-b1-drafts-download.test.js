@@ -4,6 +4,7 @@
 // Run: run_tests { files: ['test/rg-b1-drafts-download.test.js'] }
 var WS = args.workspace;
 
+var EX = await runFile('test/extract.js', { i18n: false });
 describe('TA3-3 draft debounce files the draft under the composer it was typed in', function() {
     async function load(texts) {
         var env = { onInput: null, timers: {}, next: 0, persists: 0, view: 'chat', m: null };
@@ -55,8 +56,9 @@ describe('TB-6 downloadChat exports the record present after payload hydration',
         // (no catalog set = English identity, like the harness auto-include in test/harness.js).
         var i18nCore = await loadFile('src/js/core/025-i18n.js');
         assert.ok(typeof i18nCore === 'string' && i18nCore.indexOf('function t(') >= 0, 'missing i18n core source');
-        var start = src.indexOf('async function downloadChat(');
-        var end = src.indexOf('\n}', start);
+        var fx = EX.findFunction(src, 'downloadChat');   // code-mask cut (test/extract.js)
+        var start = fx ? fx.start : -1;
+        var end = fx ? fx.end - 2 : -1;
         assert.ok(start >= 0 && end > start, 'downloadChat declaration not found');
         var blobs = [], clicks = [], snacks = [];
         var RESTORED = 'data:image/png;base64,QQ==';

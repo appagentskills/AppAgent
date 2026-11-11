@@ -469,7 +469,7 @@ describe('B2 bounded ensureOffscreenDocument + coded errors (background.js offsc
         assert.strictEqual(e.api.creating(), null);
     }, { tags: ['unit'] });
 
-    test('createDocument args (offscreen.html, BLOBS); idleSince reset to 0 on success, unchanged on failure', async function() {
+    test('createDocument args (offscreen.html, BLOBS + AUDIO_PLAYBACK); idleSince reset to 0 on success, unchanged on failure', async function() {
         var e = await env();
         e.api.idleSince(123);
         var s = settledState(e.api.ensure());
@@ -477,7 +477,7 @@ describe('B2 bounded ensureOffscreenDocument + coded errors (background.js offsc
         assertSuccess(e, s);
         assert.strictEqual(e.createArgs.length, 1);
         assert.strictEqual(e.createArgs[0].url, 'offscreen.html');
-        assert.deepStrictEqual(e.createArgs[0].reasons, ['BLOBS']);
+        assert.deepStrictEqual(e.createArgs[0].reasons, ['BLOBS', 'AUDIO_PLAYBACK']);
         assert.strictEqual(typeof e.createArgs[0].justification, 'string');
         assert.strictEqual(e.api.idleSince(), 0);
         var f = await env();

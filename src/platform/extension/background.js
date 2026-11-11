@@ -605,6 +605,10 @@ function _reopenOnCleanReload(msg, sender, sendResponse) {
     }).catch(function() {}).then(function() {
         return _reopenArmWakeAlarms();
     }).catch(function() {}).then(function() {
+        // RELOAD-QUIESCE: let an in-flight Claude token refresh persist its
+        // rotated refresh token first (bounded; never blocks the reload).
+        if (typeof quiesceClaudeOAuth === 'function') return quiesceClaudeOAuth();
+    }).catch(function() {}).then(function() {
         try { chrome.runtime.reload(); } catch (e) {
             _reopenLog('clean-reload-reload-threw', { error: _reopenErr(e) });
             _reopenCleanReloadInFlight = false;
@@ -1596,24 +1600,69 @@ self.snGetTokenForInstance = snGetTokenForInstance;
 // SW may be evicted between the toast and the click).
 var _notifChatIds = {};
 function _notifStorageKey(id) { return 'notifChat:' + id; }
+// Notification mode (chrome.storage.local.notificationMode), the single gate
+// for every AppAgent notification: 'silent' = none at all, 'notify' (default)
+// = the toast, 'sound' = the toast + a chime. Set by the 3-position switch in
+// ui/240-layout.js (setNotificationMode). A pre-release approvalSoundEnabled===true
+// still reads as 'sound' until a mode is picked (read-only, never rewritten).
+var NOTIFICATION_MODES = ['silent', 'notify', 'sound'];
+function resolveNotificationMode(d) {
+    var m = d && d.notificationMode;
+    if (NOTIFICATION_MODES.indexOf(m) !== -1) return m;
+    if (d && d.approvalSoundEnabled === true) return 'sound';
+    return 'notify';
+}
+self.resolveNotificationMode = resolveNotificationMode;
 function appagentCreateNotification(title, message, chatId) {
     // 'appagent-' prefix is REQUIRED (onClicked below filters on it). Random
     // suffix: two notifications in the same millisecond would share an id and
     // Chrome silently REPLACES the first (concurrent chats can finish together).
+    // The id is returned synchronously; the mode check is async.
     var id = 'appagent-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7);
-    if (chatId) {
-        _notifChatIds[id] = chatId;
-        try { var o = {}; o[_notifStorageKey(id)] = chatId; chrome.storage.session.set(o); } catch (e) {}
-    }
-    chrome.notifications.create(id, {
-        type: 'basic',
-        iconUrl: 'icons/AppAgentIconStarOnly_128.png',
-        title: title || 'AppAgent',
-        message: message || ''
-    });
+    var show = function(mode) {
+        if (mode === 'silent') return;
+        if (chatId) {
+            _notifChatIds[id] = chatId;
+            try { var o = {}; o[_notifStorageKey(id)] = chatId; chrome.storage.session.set(o); } catch (e) {}
+        }
+        chrome.notifications.create(id, {
+            type: 'basic',
+            iconUrl: 'icons/AppAgentIconStarOnly_128.png',
+            title: title || 'AppAgent',
+            message: message || ''
+        });
+        // Chrome plays no sound for notifications (the OS may or may not).
+        if (mode === 'sound') _playNotificationChimeNow();
+    };
+    try {
+        chrome.storage.local.get(['notificationMode', 'approvalSoundEnabled'], function(d) {
+            show(resolveNotificationMode(d));
+        });
+    } catch (e) { show('notify'); }
     return id;
 }
 self.appagentCreateNotification = appagentCreateNotification;
+
+// Notification chime. MV3 service workers have no audio, so the standard path
+// is the offscreen document (an extension may only have ONE, so we reuse the
+// existing offscreen.html; ensureOffscreenDocument lists AUDIO_PLAYBACK in
+// its reasons). offscreen-helper.js synthesizes the chime with Web Audio, so
+// no binary asset is bundled. Never throws; failures are only logged.
+function _playNotificationChimeNow() {
+    if (typeof callOffscreenHelper !== 'function') return;
+    try {
+        callOffscreenHelper('play-notification-sound', {}, 5000)
+            .catch(function(err) { console.warn('[SW] notification sound failed: ' + (err && err.message || err)); });
+    } catch (e) { console.warn('[SW] notification sound failed: ' + (e && e.message || e)); }
+}
+// Settings preview: one chime when "With sound" is picked.
+chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
+    if (message && message.type === 'preview-notification-sound') {
+        _playNotificationChimeNow();
+        try { sendResponse({ ok: true }); } catch (e) {}
+        return;
+    }
+});
 
 function _takeNotificationChatId(notificationId, cb) {
     var mem = _notifChatIds[notificationId];
@@ -3179,6 +3228,166 @@ function _recordClaudeRenew(path, via, err) {
     else console.info('[Claude OAuth] ' + via + ' succeeded via ' + path);
 }
 
+// RELOAD-QUIESCE: the refresh_token grant ROTATES the refresh token server-side
+// before saveOAuthCreds persists the new one. A chrome.runtime.reload() (Reload
+// button, restart-after-import) landing in that window leaves a DEAD refresh
+// token in storage: the next renewal gets invalid_grant and falls back to the
+// cookie authorize, which fails with session_stale_relogin when claude.ai wants
+// a fresh sign-in. Every reload path therefore asks the SW to quiesce first
+// ('claude-oauth-quiesce'): NEW renewals/logins are refused at once
+// (claudeOAuthQuiescing errors - the reload kills them anyway) and the reply
+// waits for the in-flight one to settle, bounded by CLAUDE_OAUTH_QUIESCE_MAX_MS
+// (the reload always proceeds). The block expires CLAUDE_OAUTH_QUIESCE_HOLD_MS
+// after the bound, so a reload that never happens cannot wedge renewals.
+var CLAUDE_OAUTH_QUIESCE_MAX_MS = 10000;
+var CLAUDE_OAUTH_QUIESCE_HOLD_MS = 30000;
+var claudeOAuthQuiescedUntil = 0;
+function _claudeOAuthQuiescing() { return Date.now() < claudeOAuthQuiescedUntil; }
+function _claudeOAuthQuiescingError() {
+    var e = new Error('Claude token renewal is paused because the extension is reloading; retry after the reload.');
+    e.claudeOAuthQuiescing = true;
+    return e;
+}
+// Resolves (never rejects) { outcome: 'idle'|'settled'|'timeout', via? }.
+function quiesceClaudeOAuth(timeoutMs) {
+    var ms = Number(timeoutMs);
+    if (!(ms > 0) || ms > CLAUDE_OAUTH_QUIESCE_MAX_MS) ms = CLAUDE_OAUTH_QUIESCE_MAX_MS;
+    claudeOAuthQuiescedUntil = Math.max(claudeOAuthQuiescedUntil, Date.now() + ms + CLAUDE_OAUTH_QUIESCE_HOLD_MS);
+    // The newest entry is the one to wait for: it chains after any entry it
+    // superseded, and no newer one can start while quiesced.
+    var entry = claudeRenewInFlight;
+    if (!entry) return Promise.resolve({ outcome: 'idle' });
+    return new Promise(function(resolve) {
+        var timer = setTimeout(function() { resolve({ outcome: 'timeout', via: entry.via }); }, ms);
+        entry.promise.then(function() {}, function() {}).then(function() {
+            clearTimeout(timer);
+            resolve({ outcome: 'settled', via: entry.via });
+        });
+    });
+}
+
+// REFRESH-LOSS evidence. claudeOAuthRefreshPending { at, tokenFingerprint, sw }
+// is persisted BEFORE the refresh fetch and removed once the outcome is settled
+// (new creds saved, or an HTTP rejection). One that survives into ANOTHER SW
+// lifetime (sw differs) and matches the stored token means the SW died between
+// the server rotation and the save; the next invalid_grant is then classified
+// 'lost-after-restart'. tokenFingerprint is the first 8 hex of SHA-256 - never
+// the token. A network error keeps the marker (the server may have rotated).
+var CLAUDE_SW_LIFETIME_ID = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+// Why the last refresh_token grant failed: { at, status, errorCode, body
+// (redacted, <=300 chars), cause: 'rejected'|'network'|'lost-after-restart'|
+// 'no-refresh-token' }. Persisted as claudeOAuthLastRefreshError, echoed as
+// `lastRefreshError` in claude-oauth-status. A later successful login/renew
+// does NOT overwrite it (the evidence must survive the recovery); only logout
+// or 'claude-oauth-clear-refresh-error' clears it.
+var claudeOAuthLastRefreshError = null;
+var CLAUDE_REFRESH_CAUSE_TEXT = {
+    'lost-after-restart': 'lost to a reload mid-refresh',
+    'rejected': 'refresh token rejected',
+    'network': 'no reply from the token endpoint',
+    'no-refresh-token': 'no refresh token stored'
+};
+
+// Synchronous SHA-256 (hex) of a string's UTF-8 bytes - sync so the marker
+// write never waits on crypto.subtle.
+function _claudeSha256Hex(str) {
+    var K = [], H = [], n = 2, i, j;
+    function frac(x) { return ((x - Math.floor(x)) * 4294967296) | 0; }
+    for (var found = 0; found < 64; n++) {
+        for (j = 2; j * j <= n; j++) if (n % j === 0) break;
+        if (j * j > n) { if (found < 8) H[found] = frac(Math.pow(n, 1 / 2)); K[found++] = frac(Math.pow(n, 1 / 3)); }
+    }
+    var s = unescape(encodeURIComponent(String(str))), bytes = [];
+    for (i = 0; i < s.length; i++) bytes.push(s.charCodeAt(i));
+    var bitLen = bytes.length * 8;
+    bytes.push(0x80);
+    while (bytes.length % 64 !== 56) bytes.push(0);
+    for (i = 7; i >= 0; i--) bytes.push(i >= 4 ? 0 : (bitLen >>> (i * 8)) & 0xff);
+    function rotr(x, r) { return (x >>> r) | (x << (32 - r)); }
+    for (var off = 0; off < bytes.length; off += 64) {
+        var w = [];
+        for (i = 0; i < 16; i++) w[i] = (bytes[off + i * 4] << 24) | (bytes[off + i * 4 + 1] << 16) | (bytes[off + i * 4 + 2] << 8) | bytes[off + i * 4 + 3];
+        for (i = 16; i < 64; i++) {
+            var s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3);
+            var s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10);
+            w[i] = (w[i - 16] + s0 + w[i - 7] + s1) | 0;
+        }
+        var a = H[0], b = H[1], c = H[2], d = H[3], e = H[4], f = H[5], g = H[6], h = H[7];
+        for (i = 0; i < 64; i++) {
+            var t1 = (h + (rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)) + ((e & f) ^ (~e & g)) + K[i] + w[i]) | 0;
+            var t2 = ((rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)) + ((a & b) ^ (a & c) ^ (b & c))) | 0;
+            h = g; g = f; f = e; e = (d + t1) | 0; d = c; c = b; b = a; a = (t1 + t2) | 0;
+        }
+        H = [H[0] + a, H[1] + b, H[2] + c, H[3] + d, H[4] + e, H[5] + f, H[6] + g, H[7] + h].map(function(x) { return x | 0; });
+    }
+    return H.map(function(x) { return ('00000000' + (x >>> 0).toString(16)).slice(-8); }).join('');
+}
+function _claudeTokenFingerprint(token) { return _claudeSha256Hex(token).slice(0, 8); }
+
+// Best-effort storage helpers for the evidence records: never throw/reject.
+function _claudeStorageGet(key) {
+    return new Promise(function(resolve) {
+        try { chrome.storage.local.get(key, function(d) { resolve((d && d[key]) || null); }); }
+        catch (e) { resolve(null); }
+    });
+}
+function _claudeStorageWrite(op, arg) {
+    try {
+        var p = chrome.storage.local[op](arg);
+        if (p && typeof p.then === 'function') return p.then(function() {}, function() {});
+    } catch (e) {}
+    return Promise.resolve();
+}
+
+// OAuth error code from a token-endpoint error body ({error:'invalid_grant'} or
+// {error:{type}}); null when none.
+function _claudeOAuthErrorCode(text) {
+    try {
+        var j = JSON.parse(text);
+        var code = j && (typeof j.error === 'string' ? j.error : (j.error && (j.error.type || j.error.code)));
+        // Only the leading identifier: the code also reaches the user-facing
+        // suffix and storage, so free text (possibly echoing a token) never does.
+        var ident = code ? /^[A-Za-z_][\w.]{0,59}/.exec(String(code)) : null;
+        if (ident && ident[0] !== 'sk') return ident[0];
+    } catch (e) {}
+    var m = /\b(invalid_grant|invalid_client|invalid_request|unauthorized_client)\b/.exec(String(text || ''));
+    return m ? m[1] : null;
+}
+
+function _recordClaudeRefreshError(cause, err) {
+    var body = err ? (err.body != null ? err.body : ((err && err.message) || err)) : null;
+    var rec = {
+        at: Date.now(),
+        status: (err && typeof err.status === 'number') ? err.status : null,
+        errorCode: (err && err.errorCode) || null,
+        body: body == null ? null : String(body).replace(/sk-ant-[\w-]+/g, '[redacted]').slice(0, 300),
+        cause: cause
+    };
+    claudeOAuthLastRefreshError = rec;
+    _claudeStorageWrite('set', { claudeOAuthLastRefreshError: rec });
+    return rec;
+}
+
+// Classifies a failed refresh (see REFRESH-LOSS) and persists the evidence. An
+// HTTP rejection settles the token's fate, so the pending marker goes.
+function _classifyClaudeRefreshFailure(e, leftover, fingerprint) {
+    var httpStatus = (e && typeof e.status === 'number') ? e.status : null;
+    var cause = httpStatus === null ? 'network' : 'rejected';
+    if (httpStatus !== null && e.errorCode === 'invalid_grant' && leftover &&
+        leftover.tokenFingerprint === fingerprint && leftover.sw !== CLAUDE_SW_LIFETIME_ID) {
+        cause = 'lost-after-restart';
+    }
+    if (httpStatus !== null) _claudeStorageWrite('remove', 'claudeOAuthRefreshPending');
+    return _recordClaudeRefreshError(cause, e);
+}
+
+// Short, user-facing suffix for the stale-session error.
+function _claudeRefreshCauseSuffix(rec) {
+    var detail = [rec.status, rec.errorCode].filter(function(x) { return x != null; }).join(' ');
+    return ' (Token refresh ' + rec.cause + (detail ? ' ' + detail : '') + ': ' +
+        (CLAUDE_REFRESH_CAUSE_TEXT[rec.cause] || 'unknown') + '.)';
+}
+
 // User-facing text for a failed renewal on the stream paths (pre-stream check
 // and 401 retry). session_stale_relogin already carries its own instructions.
 function _claudeRenewErrorText(e, prefix) {
@@ -3276,7 +3485,12 @@ async function refreshClaudeToken(refreshToken) {
     }, 'Claude token refresh');
     if (!res.ok) {
         var errText = await res.text();
-        throw new Error('Token refresh failed: ' + res.status + ' ' + errText);
+        // status/body/errorCode feed _classifyClaudeRefreshFailure.
+        var rErr = new Error('Token refresh failed: ' + res.status + ' ' + errText);
+        rErr.status = res.status;
+        rErr.body = errText;
+        rErr.errorCode = _claudeOAuthErrorCode(errText);
+        throw rErr;
     }
     return await res.json();
 }
@@ -3325,6 +3539,8 @@ function loginClaudeOAuth(epoch, via) {
 // (claudeRenewLastFailure), diagnostics (_recordClaudeRenew) and clearing the
 // slot when done. `run(info)` sets info.path to the path that produced creds.
 function _claudeSingleFlight(epoch, via, run) {
+    // RELOAD-QUIESCE: no NEW renewal/login while a reload is pending.
+    if (_claudeOAuthQuiescing()) return Promise.reject(_claudeOAuthQuiescingError());
     var prev = (claudeRenewInFlight && claudeRenewInFlight.epoch === epoch) ? claudeRenewInFlight.promise : null;
     var entry = { epoch: epoch, via: via, promise: null };
     entry.promise = (async function() {
@@ -3332,6 +3548,8 @@ function _claudeSingleFlight(epoch, via, run) {
             if (prev) { try { await prev; } catch (e) {} }
             // A logout while waiting for `prev` fences us before any network call.
             if (epoch !== claudeOAuthEpoch) throw _claudeOAuthStaleError();
+            // Nor one that was only queued behind `prev` when the quiesce began.
+            if (_claudeOAuthQuiescing()) throw _claudeOAuthQuiescingError();
             var info = {};
             var creds = await run(info);
             claudeRenewLastFailure = null;
@@ -3340,7 +3558,8 @@ function _claudeSingleFlight(epoch, via, run) {
         } catch (e) {
             // A run started before a logout that fails for another reason (e.g. a
             // timeout) must not re-create the back-off/diagnostics logout cleared.
-            if (!(e && e.claudeOAuthStale) && epoch === claudeOAuthEpoch) {
+            // A quiesce refusal is not a renewal failure either (no back-off).
+            if (!(e && (e.claudeOAuthStale || e.claudeOAuthQuiescing)) && epoch === claudeOAuthEpoch) {
                 claudeRenewLastFailure = { at: Date.now(), message: (e && e.message) || String(e) };
                 _recordClaudeRenew('failed', via, e);
             }
@@ -3362,11 +3581,24 @@ async function _renewClaudeTokenOnce(oauth, epoch, info) {
         return latest;
     }
     var cur = (latest && latest.accessToken) ? latest : oauth;
-    var refreshErr = null;
+    var refreshErr = null, refreshRec = null;
     if (cur && cur.refreshToken) {
+        // REFRESH-LOSS: read any leftover marker, then persist ours BEFORE the
+        // fetch rotates the token (best effort: a failed write never blocks it).
+        var fingerprint = _claudeTokenFingerprint(cur.refreshToken);
+        var leftover = await _claudeStorageGet('claudeOAuthRefreshPending');
+        await _claudeStorageWrite('set', { claudeOAuthRefreshPending: { at: Date.now(), tokenFingerprint: fingerprint, sw: CLAUDE_SW_LIFETIME_ID } });
+        // The marker awaits widen the window for a logout: re-check the fence
+        // so a logged-out run never spends the refresh token, nor leaves the
+        // marker logout just removed.
+        if (epoch !== claudeOAuthEpoch) {
+            await _claudeStorageWrite('remove', 'claudeOAuthRefreshPending');
+            throw _claudeOAuthStaleError();
+        }
         try {
             var tokenData = await refreshClaudeToken(cur.refreshToken);
             var refreshed = await saveOAuthCreds(tokenData, cur.refreshToken, epoch);
+            await _claudeStorageWrite('remove', 'claudeOAuthRefreshPending');
             info.path = 'refresh';
             return refreshed;
         } catch (e) {
@@ -3375,8 +3607,11 @@ async function _renewClaudeTokenOnce(oauth, epoch, info) {
             // burn a cookie authorize for nothing - surface it as is.
             if (e && (e.claudeOAuthStale || e.claudeOAuthSaveFailed)) throw e;
             refreshErr = e;
-            console.warn('[Claude OAuth] refresh failed, falling back to cookie authorize: ' + _redactClaudeOAuthError(e));
+            refreshRec = _classifyClaudeRefreshFailure(e, leftover, fingerprint);
+            console.warn('[Claude OAuth] refresh failed (' + refreshRec.cause + '), falling back to cookie authorize: ' + _redactClaudeOAuthError(e));
         }
+    } else {
+        refreshRec = _recordClaudeRefreshError('no-refresh-token', null);
     }
     // Fallback: silent re-auth via the claude.ai session cookie. Errors here
     // (incl. session_stale_relogin) surface only after the refresh failed too.
@@ -3386,8 +3621,14 @@ async function _renewClaudeTokenOnce(oauth, epoch, info) {
         return authorized;
     } catch (e2) {
         // session_stale_relogin keeps its clean, actionable message (it is shown
-        // as is on the stream paths); the refresh error is in the warn log above.
-        if (refreshErr && e2 && !e2.claudeOAuthStale && !e2.claudeSessionStale && e2.message) {
+        // as is on the stream paths); the full refresh error is persisted in
+        // claudeOAuthLastRefreshError.
+        // It gets the refresh cause appended, so the user (and a bug report)
+        // can tell a reload-lost token from a revoked one.
+        if (refreshRec && e2 && e2.claudeSessionStale && e2.message) {
+            e2.message += _claudeRefreshCauseSuffix(refreshRec);
+            e2.claudeRefreshCause = refreshRec.cause;
+        } else if (refreshErr && e2 && !e2.claudeOAuthStale && !e2.claudeSessionStale && e2.message) {
             e2.message += ' (refresh token also rejected: ' + String(refreshErr.message || refreshErr).slice(0, 200) + ')';
         }
         throw e2;
@@ -3457,9 +3698,10 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
     if (message.type === 'claude-oauth-status') {
         // TA4-3: captured on arrival; a logout mid-poll fences its auto-login/renew writes.
         var statusEpoch = claudeOAuthEpoch;
-        chrome.storage.local.get(['claudeOAuth', 'claudeAutoLoginFailedFor', 'claudeOAuthSuppressAutoLogin', 'claudeOAuthLastRenew'], async function(data) {
-            // Additive diagnostics field on logged-in replies (no tokens).
+        chrome.storage.local.get(['claudeOAuth', 'claudeAutoLoginFailedFor', 'claudeOAuthSuppressAutoLogin', 'claudeOAuthLastRenew', 'claudeOAuthLastRefreshError'], async function(data) {
+            // Additive diagnostics fields on logged-in replies (no tokens).
             function lastRenew() { return claudeOAuthLastRenew || data.claudeOAuthLastRenew || null; }
+            function lastRefreshError() { return claudeOAuthLastRefreshError || data.claudeOAuthLastRefreshError || null; }
             if (!data.claudeOAuth) {
                 // AUTO-LOGIN: no token stored yet. If the user is signed into
                 // claude.ai (sessionKey cookie present) and has not manually
@@ -3480,13 +3722,14 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
                         if (sk && sk !== data.claudeAutoLoginFailedFor) {
                             var creds = await loginClaudeOAuth(statusEpoch, 'auto-login');
                             chrome.storage.local.remove('claudeAutoLoginFailedFor');
-                            sendResponse({ loggedIn: true, expired: false, expiresAt: creds.expiresAt, lastRenew: lastRenew() });
+                            sendResponse({ loggedIn: true, expired: false, expiresAt: creds.expiresAt, lastRenew: lastRenew(), lastRefreshError: lastRefreshError() });
                             return;
                         }
                     } catch (e) {
                         // Remember this cookie failed so we don't retry it every poll
                         // (not when a logout fenced the attempt: the cookie itself is fine).
-                        if (sk && !(e && e.claudeOAuthStale)) chrome.storage.local.set({ claudeAutoLoginFailedFor: sk });
+                        // Nor when a reload quiesce refused it (it never ran).
+                        if (sk && !(e && (e.claudeOAuthStale || e.claudeOAuthQuiescing))) chrome.storage.local.set({ claudeAutoLoginFailedFor: sk });
                     } finally {
                         claudeAutoLoginInFlight = false;
                     }
@@ -3503,7 +3746,7 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
             var pollBackoff = claudeRenewLastFailure && !claudeRenewInFlight &&
                 (Date.now() - claudeRenewLastFailure.at) < CLAUDE_RENEW_POLL_BACKOFF_MS;
             if (Date.now() > oauth.expiresAt - 60000 && pollBackoff) {
-                sendResponse({ loggedIn: true, expired: Date.now() > oauth.expiresAt, expiresAt: oauth.expiresAt, lastRenew: lastRenew() });
+                sendResponse({ loggedIn: true, expired: Date.now() > oauth.expiresAt, expiresAt: oauth.expiresAt, lastRenew: lastRenew(), lastRefreshError: lastRefreshError() });
                 return;
             }
             if (Date.now() > oauth.expiresAt - 60000) {
@@ -3512,8 +3755,13 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
                 } catch(e) {
                     // TA4-3: a logout fenced the renew - report logged out, not expired.
                     if (e && e.claudeOAuthStale) { sendResponse({ loggedIn: false }); return; }
+                    // RELOAD-QUIESCE: not attempted - report the current state as is.
+                    if (e && e.claudeOAuthQuiescing) {
+                        sendResponse({ loggedIn: true, expired: Date.now() > oauth.expiresAt, expiresAt: oauth.expiresAt, quiescing: true, lastRenew: lastRenew(), lastRefreshError: lastRefreshError() });
+                        return;
+                    }
                     // Renew failed — login is truly expired (claude.ai session gone too)
-                    sendResponse({ loggedIn: true, expired: true, expiresAt: oauth.expiresAt, lastRenew: lastRenew() });
+                    sendResponse({ loggedIn: true, expired: true, expiresAt: oauth.expiresAt, lastRenew: lastRenew(), lastRefreshError: lastRefreshError() });
                     return;
                 }
             }
@@ -3521,7 +3769,8 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
                 loggedIn: true,
                 expired: Date.now() > oauth.expiresAt,
                 expiresAt: oauth.expiresAt,
-                lastRenew: lastRenew()
+                lastRenew: lastRenew(),
+                lastRefreshError: lastRefreshError()
             });
         });
         return true;
@@ -3533,12 +3782,25 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
         claudeRenewInFlight = null;
         claudeRenewLastFailure = null;
         claudeOAuthLastRenew = null;
-        chrome.storage.local.remove(['claudeOAuth', 'claudeOAuthLastRenew']);
+        claudeOAuthLastRefreshError = null;
+        chrome.storage.local.remove(['claudeOAuth', 'claudeOAuthLastRenew', 'claudeOAuthLastRefreshError', 'claudeOAuthRefreshPending']);
         // Suppress auto-login so an explicit logout sticks — otherwise the next
         // status poll would immediately re-exchange the still-present cookie.
         chrome.storage.local.set({ claudeOAuthSuppressAutoLogin: true });
         chrome.runtime.sendMessage({ type: 'claude-oauth-updated', claudeOAuth: null }).catch(function() {});
         sendResponse({ success: true });
+        return true;
+    }
+    if (message.type === 'claude-oauth-quiesce') {
+        // RELOAD-QUIESCE: sent by every reload path right before
+        // chrome.runtime.reload(); never rejects (the reload always proceeds).
+        quiesceClaudeOAuth(message.timeoutMs).then(function(r) { sendResponse(r); });
+        return true;
+    }
+    if (message.type === 'claude-oauth-clear-refresh-error') {
+        // Explicit clear of the persisted refresh-failure evidence.
+        claudeOAuthLastRefreshError = null;
+        _claudeStorageWrite('remove', 'claudeOAuthLastRefreshError').then(function() { sendResponse({ success: true }); });
         return true;
     }
     if (message.type === 'claude-oauth-usage') {
@@ -3665,7 +3927,11 @@ async function runClaudeOAuthStream(requestBody, sink, abortSignal) {
         var parks = 0;
         var errBodyText = null;
         var triedReauth = false;
-        var triedCliVersionBump = false;
+        // Version-gate retries: the first gate-400 always gets one retry
+        // (bump, or force-reapply when the bump declines); a second one only
+        // when the API demands a STRICTLY higher version than the first
+        // (max 2 — no loop).
+        var cliVersionRetries = 0, lastRequiredCliVersion = null;
         var usageProbed = false;
         for (var attempt = 0; attempt <= maxRetries; attempt++) {
             if (aborted) {
@@ -3728,20 +3994,30 @@ async function runClaudeOAuthStream(requestBody, sink, abortSignal) {
             // consumed here (single-use), so on any non-recoverable 400 it is
             // handed to the !res.ok handler via errBodyText and the surfaced
             // error stays exactly what it was without this block.
-            if (res.status === 400 && !triedCliVersionBump) {
-                triedCliVersionBump = true;
+            if (res.status === 400 && cliVersionRetries < 2) {
                 var body400 = '';
                 try { body400 = await res.text(); } catch (e) { body400 = ''; }
                 var requiredCliVersion = parseRequiredClaudeCliVersion(body400);
-                if (requiredCliVersion) {
+                var cliRetryAllowed = !!requiredCliVersion && (cliVersionRetries === 0
+                    || (typeof compareSemver === 'function' && compareSemver(requiredCliVersion, lastRequiredCliVersion) > 0));
+                if (cliRetryAllowed) {
                     var bumped = false;
                     try { bumped = await bumpClaudeCliVersion(requiredCliVersion); }
                     catch (e) { console.warn('[AppAgent] claude-cli version bump to ' + requiredCliVersion + ' failed:', e && e.message); }
+                    // Declined bump on the FIRST gate (a concurrent stream already
+                    // raised the rule, or the live rule drifted from the mirror):
+                    // force-reinstall and still retry once instead of failing.
+                    if (!bumped && cliVersionRetries === 0 && typeof reapplyClaudeCliVersion === 'function') {
+                        try { bumped = await reapplyClaudeCliVersion(requiredCliVersion); }
+                        catch (e) { console.warn('[AppAgent] claude-cli version reapply ' + requiredCliVersion + ' failed:', e && e.message); }
+                    }
                     if (bumped) {
+                        cliVersionRetries++;
+                        lastRequiredCliVersion = requiredCliVersion;
                         console.warn('[AppAgent] API requires Claude Code ' + requiredCliVersion + ' — claude-cli User-Agent raised, retrying once');
                         sink({ type: 'status', status: 'retrying', reason: 'claude_code_version_too_old', message: 'Model requires Claude Code ' + requiredCliVersion + ' — updating and retrying…' });
-                        // The bump retry is budgeted by triedCliVersionBump
-                        // (once): compensate the for-loop increment so it never
+                        // The bump retry is budgeted by cliVersionRetries
+                        // (max 2, strictly increasing): compensate the for-loop increment so it never
                         // eats the last attempt (which used to exit the loop
                         // with THIS consumed 400 as res → the !res.ok handler
                         // re-read a used body or surfaced a stale 429 body).
@@ -7126,8 +7402,8 @@ function ensureOffscreenDocument() {
         var cr = await within(function() {
             return chrome.offscreen.createDocument({
                 url: 'offscreen.html',
-                reasons: ['BLOBS'],
-                justification: 'Host the JS sandbox iframe for js_eval / skill tools and provide a keep-alive anchor for the agent loop in the service worker.'
+                reasons: ['BLOBS', 'AUDIO_PLAYBACK'],
+                justification: 'Host the JS sandbox iframe for js_eval / skill tools, provide a keep-alive anchor for the agent loop in the service worker, and play the notification chime.'
             });
         });
         if (cr.ok) { _swOffscreenIdleSince = 0; _swOffscreenLastError = null; return; }
@@ -7765,7 +8041,8 @@ chrome.runtime.onInstalled.addListener(function() { _swResumeIfNeeded(); });
 // release. Startup applies max(shipped, stored override): a release that
 // ships a floor ABOVE an old override wins, an override ABOVE the floor keeps
 // winning until the floor catches up.
-var CLAUDE_CLI_VERSION = '2.1.280';
+// Nov 2026: Fable 5.2 (claude-fable-5-2) requires 2.1.290.
+var CLAUDE_CLI_VERSION = '2.1.290';
 var CLAUDE_CLI_VERSION_OVERRIDE_KEY = 'claudeCliVersionOverride';
 var CLAUDE_CLI_UA_RULE_ID = 3000;
 var CLAUDE_CLI_SEMVER_RE = /^\d+\.\d+\.\d+$/;
@@ -7775,6 +8052,13 @@ var CLAUDE_CLI_REQUIRED_VERSION_RE = /version\s+(\d+\.\d+\.\d+)\s+or\s+newer\s+i
 // by applyClaudeCliUaRule). Starts at the shipped floor so a bump decision
 // made before the async startup install resolves still compares sanely.
 var _claudeCliVersionApplied = CLAUDE_CLI_VERSION;
+// Highest version raised in THIS SW session by the gate recovery. The async
+// startup install folds it in, so an install that read storage BEFORE a bump
+// persisted can no longer land after it and silently downgrade the live rule
+// (which made the next request hit the gate again).
+var _claudeCliVersionBumped = null;
+// DNR updates are serialized so rule writes land in call order.
+var _claudeCliRuleChain = Promise.resolve();
 
 // Numeric dotted-version compare: -1 / 0 / 1. Non-numeric or missing segments
 // count as 0, so '2.1' < '2.1.1' and '2.1.280' > '2.1.257'.
@@ -7814,7 +8098,7 @@ function parseRequiredClaudeCliVersion(errText) {
 // once the rule is live — the NEXT fetch carries the new header.
 function applyClaudeCliUaRule(version) {
     if (!CLAUDE_CLI_SEMVER_RE.test(String(version || ''))) return Promise.reject(new Error('applyClaudeCliUaRule: invalid version ' + version));
-    return chrome.declarativeNetRequest.updateDynamicRules({
+    var run = _claudeCliRuleChain.then(function() { return chrome.declarativeNetRequest.updateDynamicRules({
         removeRuleIds: [CLAUDE_CLI_UA_RULE_ID],
         addRules: [{
             id: CLAUDE_CLI_UA_RULE_ID,
@@ -7822,7 +8106,9 @@ function applyClaudeCliUaRule(version) {
             action: { type: 'modifyHeaders', requestHeaders: [{ header: 'User-Agent', operation: 'set', value: 'claude-cli/' + version + ' (external, cli)' }] },
             condition: { urlFilter: 'api.anthropic.com/*', resourceTypes: ['xmlhttprequest'] }
         }]
-    }).then(function() { _claudeCliVersionApplied = version; });
+    }); }).then(function() { _claudeCliVersionApplied = version; });
+    _claudeCliRuleChain = run.catch(function() {});
+    return run;
 }
 
 // Startup: rule = max(shipped floor, persisted override).
@@ -7832,6 +8118,7 @@ async function installClaudeCliUaRule() {
         var stored = (await chrome.storage.local.get(CLAUDE_CLI_VERSION_OVERRIDE_KEY))[CLAUDE_CLI_VERSION_OVERRIDE_KEY];
         if (stored && CLAUDE_CLI_SEMVER_RE.test(String(stored)) && compareSemver(stored, version) > 0) version = String(stored);
     } catch (e) { /* storage unavailable — shipped floor */ }
+    if (_claudeCliVersionBumped && compareSemver(_claudeCliVersionBumped, version) > 0) version = _claudeCliVersionBumped;
     await applyClaudeCliUaRule(version);
     return version;
 }
@@ -7841,15 +8128,37 @@ async function installClaudeCliUaRule() {
 // actually raised (caller retries once), false when the demanded version is
 // not above what is already installed (retrying would fail identically —
 // surface the original error instead).
-async function bumpClaudeCliVersion(version) {
-    if (!CLAUDE_CLI_SEMVER_RE.test(String(version || ''))) return false;
-    if (compareSemver(version, _claudeCliVersionApplied) <= 0) return false;
+// Persist the learned version (best-effort; the in-session rule still applies).
+async function _persistClaudeCliOverride(version) {
     try {
         var payload = {};
         payload[CLAUDE_CLI_VERSION_OVERRIDE_KEY] = version;
         await chrome.storage.local.set(payload);
-    } catch (e) { /* persist is best-effort; the in-session rule still applies */ }
+    } catch (e) { /* best-effort */ }
+}
+
+async function bumpClaudeCliVersion(version) {
+    if (!CLAUDE_CLI_SEMVER_RE.test(String(version || ''))) return false;
+    if (compareSemver(version, _claudeCliVersionApplied) <= 0) return false;
+    _claudeCliVersionBumped = version;
+    await _persistClaudeCliOverride(version);
     await applyClaudeCliUaRule(version);
+    return true;
+}
+
+// Fallback when bumpClaudeCliVersion declines (demanded <= mirrored applied
+// version): the server still saw an older header, so either a concurrent
+// stream raised the rule after this request left, or the live rule drifted
+// from the mirror. Force-reinstall max(demanded, applied), persist it when
+// above the floor, and let the caller retry (budgeted once by the caller).
+async function reapplyClaudeCliVersion(version) {
+    if (!CLAUDE_CLI_SEMVER_RE.test(String(version || ''))) return false;
+    var target = compareSemver(version, _claudeCliVersionApplied) > 0 ? String(version) : _claudeCliVersionApplied;
+    if (compareSemver(target, CLAUDE_CLI_VERSION) > 0) {
+        if (!_claudeCliVersionBumped || compareSemver(target, _claudeCliVersionBumped) > 0) _claudeCliVersionBumped = target;
+        await _persistClaudeCliOverride(target);
+    }
+    await applyClaudeCliUaRule(target);
     return true;
 }
 

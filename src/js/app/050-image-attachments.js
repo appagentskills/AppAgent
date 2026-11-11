@@ -136,12 +136,16 @@ function appendPendingImageForContext(contextKey, attachment) {
 }
 
 // Process an image, PDF, or spreadsheet file and add it to pending attachments
-function processImageFile(file) {
-    var originContext = getCurrentPendingContext();
+// originContextOverride: draft captured when an async source (e.g. images
+// fetched from pasted HTML) started, so a late completion lands in the draft
+// the user pasted into, not whichever view is visible by then.
+function processImageFile(file, originContextOverride) {
+    var hasOverride = !!originContextOverride && originContextOverride !== 'none';
+    var originContext = hasOverride ? originContextOverride : getCurrentPendingContext();
     // S0B2-03: only the chat and Home composers can take an attachment. On other
     // views (dashboard, skills, settings, docs, history, documents) the file
     // would land in a hidden draft, and with no chat it was reported as "deleted".
-    if ((currentView !== 'chat' && currentView !== 'home') || originContext === 'none') {
+    if (!hasOverride && ((currentView !== 'chat' && currentView !== 'home') || originContext === 'none')) {
         if (typeof showSnackbar === 'function') showSnackbar(t('Open a chat or Home to attach "{name}"', { name: (file && file.name) || t('file') }), 'info');
         return;
     }
@@ -301,6 +305,90 @@ function _isComposerPasteTarget(target) {
     return !ed || ed.id === 'message-input' || ed.id === 'home-message-input';
 }
 
+// Rich-text paste (web page, Word/Google Docs, Slack, email) carries its
+// images only as <img src> inside text/html, with no image file item: collect
+// those sources so they can be attached. data: and http(s) only (blob:/file:/
+// cid: URLs are not readable from here); relative URLs resolve against a
+// <base href> when the clipboard HTML has one. Deduped, capped.
+var MAX_PASTED_HTML_IMAGES = 10;
+function _decodeHtmlAttr(s) {
+    return String(s).replace(/&amp;/gi, '&').replace(/&quot;/gi, '"').replace(/&#39;|&apos;/gi, "'")
+        .replace(/&lt;/gi, '<').replace(/&gt;/gi, '>').replace(/&#x([0-9a-f]+);/gi, function(m, h) { return String.fromCharCode(parseInt(h, 16)); })
+        .replace(/&#(\d+);/g, function(m, d) { return String.fromCharCode(parseInt(d, 10)); });
+}
+function extractPastedHtmlImageSources(html) {
+    if (typeof html !== 'string' || !/<img[\s>\/]/i.test(html)) return [];
+    var baseM = /<base\b[^>]*?\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i.exec(html);
+    var base = baseM ? _decodeHtmlAttr(baseM[1] || baseM[2] || baseM[3] || '') : null;
+    var re = /<img\b[^>]*?\bsrc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi;
+    var out = [], seen = {}, m;
+    while ((m = re.exec(html)) && out.length < MAX_PASTED_HTML_IMAGES) {
+        var src = _decodeHtmlAttr((m[1] != null ? m[1] : (m[2] != null ? m[2] : m[3])) || '').trim();
+        if (!src) continue;
+        if (/^data:image\//i.test(src)) {
+            // keep as-is
+        } else if (/^https?:\/\//i.test(src)) {
+            // keep as-is
+        } else if (/^\/\//.test(src)) {
+            src = 'https:' + src;
+        } else if (base && !/^[a-z][a-z0-9+.-]*:/i.test(src)) {
+            try { src = new URL(src, base).href; } catch (err) { continue; }
+            if (!/^https?:\/\//i.test(src)) continue;
+        } else {
+            continue; // blob:, file:, cid:, data:non-image, unresolvable relative
+        }
+        if (seen[src]) continue;
+        seen[src] = true;
+        out.push(src);
+    }
+    return out;
+}
+
+var _PASTE_IMG_EXT_TYPES = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp', svg: 'image/svg+xml', avif: 'image/avif' };
+function _pastedImageName(src, idx) {
+    if (!/^data:/i.test(src)) {
+        try {
+            var seg = decodeURIComponent(new URL(src).pathname.split('/').pop() || '');
+            if (seg && /\.[a-z0-9]{2,5}$/i.test(seg)) return seg;
+        } catch (err) {}
+    }
+    return 'pasted-image-' + (idx + 1);
+}
+
+// Fetch the <img> sources of a rich-text paste and attach them through
+// processImageFile (same resize/compress/budget pipeline as any image).
+// Best-effort: an image that cannot be fetched or is not an image is skipped,
+// with one summary snackbar. The extension holds <all_urls> host access, so
+// cross-origin fetches are not CORS-blocked here.
+async function attachPastedHtmlImages(sources, originContext) {
+    if (!sources || !sources.length || typeof fetch !== 'function') return 0;
+    var failed = 0, attached = 0;
+    await Promise.all(sources.map(async function(src, idx) {
+        try {
+            var res = await fetch(src, /^data:/i.test(src) ? undefined : { credentials: 'include' });
+            if (!res || !res.ok) throw new Error('HTTP ' + (res && res.status));
+            var blob = await res.blob();
+            var name = _pastedImageName(src, idx);
+            var type = (blob && blob.type) || '';
+            if (type.indexOf('image/') !== 0) {
+                var ext = (/\.([a-z0-9]+)$/i.exec(name) || [])[1];
+                type = ext ? (_PASTE_IMG_EXT_TYPES[ext.toLowerCase()] || '') : '';
+            }
+            if (type.indexOf('image/') !== 0) throw new Error('not an image');
+            if (blob.size > MAX_IMAGE_RAW_BYTES) throw new Error('too large');
+            var file = new File([blob], name, { type: type });
+            processImageFile(file, originContext);
+            attached++;
+        } catch (err) {
+            failed++;
+        }
+    }));
+    if (failed && typeof showSnackbar === 'function') {
+        showSnackbar(t('{count} pasted image(s) could not be attached', { count: failed }), 'warning');
+    }
+    return attached;
+}
+
 // Handle paste events for images and PDFs
 function handlePasteForImages(e) {
     if (!_isComposerPasteTarget(e.target)) return;
@@ -315,6 +403,27 @@ function handlePasteForImages(e) {
             if (file) {
                 processImageFile(file);
             }
+        }
+    }
+
+    // Text + images copied from a web page / doc / Slack / email: the images
+    // only exist as <img> in text/html (no file item), and were ignored.
+    // Attach them; the text still pastes normally below. When the clipboard
+    // already has an image file item (e.g. "Copy image"), that item IS the
+    // html <img>, so skip extraction to avoid a duplicate.
+    if (!hasFile && typeof e.clipboardData.getData === 'function') {
+        var htmlSrcs = [];
+        try { htmlSrcs = extractPastedHtmlImageSources(e.clipboardData.getData('text/html')); } catch (err) { htmlSrcs = []; }
+        if (htmlSrcs.length) {
+            var pasteCtx = typeof getCurrentPendingContext === 'function' ? getCurrentPendingContext() : null;
+            var pasteView = typeof currentView !== 'undefined' ? currentView : null;
+            if ((pasteView !== 'chat' && pasteView !== 'home') || !pasteCtx || pasteCtx === 'none') {
+                if (typeof showSnackbar === 'function') showSnackbar(t('Open a chat or Home to attach pasted images'), 'info');
+            } else {
+                attachPastedHtmlImages(htmlSrcs, pasteCtx);
+            }
+            // Image-only HTML (no text): nothing for the native paste to insert.
+            if (!e.clipboardData.getData('text/plain')) e.preventDefault();
         }
     }
 

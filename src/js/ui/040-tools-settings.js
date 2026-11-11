@@ -249,6 +249,10 @@ function renderSettingsPage() {
                 '<div><div class="settings-page-row-label">' + t('Keep Display Awake') + '</div><div class="settings-page-row-hint">' + t('Prevent the screen from sleeping while the agent is actively running a task, and after 5 minutes of inactivity in AppAgent. Released when the task ends or the page is closed.') + '</div></div>' +
                 '<input type="checkbox" id="settings-keep-awake" ' + ((typeof window.getKeepAwakeForeverDisabled === 'function' && window.getKeepAwakeForeverDisabled()) ? '' : 'checked') + ' onchange="toggleKeepAwake(this.checked)">' +
             '</div>' +
+            '<div class="settings-page-row">' +
+                '<div><div class="settings-page-row-label">' + t('Notifications') + '</div><div class="settings-page-row-hint">' + t('Silent: no notifications. Notify: show a desktop notification. With sound: also play a short chime. Default: Notify.') + '</div></div>' +
+                (typeof notificationModeSwitchHtml === 'function' ? notificationModeSwitchHtml('settings-page-notif-mode', t) : '') +
+            '</div>' +
 
             '<div class="settings-page-row">' +
                 '<div><div class="settings-page-row-label">' + t('Deferred tool loading (experimental)') + '</div><div class="settings-page-row-hint">' + t('Declare only core tool schemas per request; every other tool is listed in a system-prompt catalog and its schema fetched on demand via get_tool_schema. Cuts input tokens per request. Default off.') + '</div></div>' +

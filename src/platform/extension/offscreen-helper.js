@@ -92,6 +92,37 @@
     // Never cancel by chat id: same-chat nested/sibling sandboxes may be live.
     var activeSandboxes = Object.create(null);
 
+    // ----- notification chime: two short sine notes (E5 -> A5), ~0.45s -----
+    // One AudioContext is reused across chimes; resume() covers a context
+    // Chrome created suspended. Resolves when playback has finished.
+    var chimeCtx = null;
+    function playNotificationChime() {
+        var AC = self.AudioContext || self.webkitAudioContext;
+        if (!AC) throw new Error('Web Audio unavailable');
+        if (!chimeCtx || chimeCtx.state === 'closed') chimeCtx = new AC();
+        var ctx = chimeCtx;
+        return Promise.resolve(ctx.state === 'suspended' ? ctx.resume() : null).then(function() {
+            var t0 = ctx.currentTime + 0.02;
+            [[659.25, 0], [880, 0.16]].forEach(function(n) {
+                var osc = ctx.createOscillator();
+                var gain = ctx.createGain();
+                var start = t0 + n[1];
+                osc.type = 'sine';
+                osc.frequency.setValueAtTime(n[0], start);
+                gain.gain.setValueAtTime(0.0001, start);
+                gain.gain.exponentialRampToValueAtTime(0.25, start + 0.015);
+                gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.28);
+                osc.connect(gain);
+                gain.connect(ctx.destination);
+                osc.start(start);
+                osc.stop(start + 0.3);
+            });
+            return new Promise(function(resolve) {
+                setTimeout(function() { resolve({ played: true, state: ctx.state }); }, 500);
+            });
+        });
+    }
+
     // ----- request dispatcher (chrome.runtime.sendMessage from SW) -----
     chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
         if (!message || !message.type) return;
@@ -107,6 +138,14 @@
         if (message.type === 'helper-ping') {
             sendResponse({ ok: true, result: { pong: true, active: Object.keys(activeSandboxes).length } });
             return;
+        }
+        // Notification chime (background.js _playNotificationChimeNow, mode
+        // 'sound'). Synthesized with Web Audio, so no audio asset ships.
+        if (message.type === 'play-notification-sound') {
+            new Promise(function(resolve) { resolve(playNotificationChime()); })
+                .then(function(result) { sendResponse({ ok: true, result: result }); })
+                .catch(function(err) { sendResponse({ ok: false, error: err && err.message ? err.message : String(err) }); });
+            return true;
         }
         if (message.type === 'helper-cancel-sandbox') {
             var requestId = message.payload && message.payload.sandboxRequestId;

@@ -39,10 +39,12 @@ function fakeClock() {
     c.Date.now = function() { return c.now; };
     return c;
 }
-// docProxy(state): the real document with an overridable `hidden`.
+// docProxy(state): the real document with an overridable `hidden` and
+// `hasFocus()` (state.focused, default true — the sandbox's real focus is
+// not under test control).
 function docProxy(state) {
     return new Proxy(document, {
-        get: function(t, k) { if (k === 'hidden') return !!state.hidden; var v = Reflect.get(t, k, t); return typeof v === 'function' ? v.bind(t) : v; },
+        get: function(t, k) { if (k === 'hidden') return !!state.hidden; if (k === 'hasFocus') return function() { return state.focused !== false; }; var v = Reflect.get(t, k, t); return typeof v === 'function' ? v.bind(t) : v; },
         set: function(t, k, v) { t[k] = v; return true; }
     });
 }
@@ -624,6 +626,29 @@ describe('ui notifications › tool approval card', function() {
         t.clock.tick(1000); assert.strictEqual(document.title, '⚠ Approval needed');
         t.st.hidden = false; t.clock.tick(1000);
         assert.strictEqual(document.title, 'AppAgent', 'restored when visible');
+    }, { tags: ['unit'] });
+    test('visible tab but unfocused window: OS notification fires, no title flash (fan-out copy still deduped)', async function() {
+        var t = await setup(); t.st.focused = false; document.title = 'AppAgent';
+        promptIn(t, 'c1', 'tool_a', { status_message: 'Doing X' }, 't1');
+        assert.deepStrictEqual(t.g.Platform.sendNotification.calls[0][0], { title: 'Tool needs approval', message: 'Doing X — Chat One', chatId: 'c1' });
+        t.m.showApprovalNotification('Other', 'tool_b', 'c2', null, 1, null, { osNotify: false });
+        assert.strictEqual(t.g.Platform.sendNotification.calls.length, 1, 'fan-out copy does not re-notify');
+        t.clock.tick(1000); assert.strictEqual(document.title, 'AppAgent', 'title flash is for hidden tabs only');
+    }, { tags: ['unit'] });
+    test('visible + focused: no OS notification while the machine is active (Keep awake irrelevant); fires once idle', async function() {
+        var listeners = [];
+        var chromeStub = { idle: { setDetectionInterval: function() {}, queryState: function(s, cb) { cb('active'); }, onStateChanged: { addListener: function(f) { listeners.push(f); } } } };
+        function idleWin() { var w = fakeWindow({ document: document, _rawCopyStore: {}, currentSearchHighlight: null, isRunning: false }); w.chrome = chromeStub; w.isKeepAwakeEnabled = function() { return true; }; return w; }
+        var t = await setup({ window: idleWin() });
+        promptIn(t, 'c1', 'tool_a', null, 't1');
+        assert.strictEqual(t.g.Platform.sendNotification.calls.length, 0, 'focused + active (keep-awake on) => quiet');
+        teardown();
+        listeners = [];
+        t = await setup({ window: idleWin() });
+        listeners.forEach(function(f) { f('idle'); });
+        promptIn(t, 'c1', 'tool_a', { status_message: 'Doing X' }, 't1');
+        assert.strictEqual(t.g.Platform.sendNotification.calls.length, 1, 'focused + idle => notifies');
+        assert.strictEqual(t.g.Platform.sendNotification.calls[0][0].title, 'Tool needs approval');
     }, { tags: ['unit'] });
     test('mousedown on an approval button is preventDefault-ed (keeps iframe focus); elsewhere untouched', async function() {
         var t = await setup(), c = card(t);

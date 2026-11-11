@@ -8,6 +8,7 @@
 // test/format-content.test.js.
 // Run: run_tests { pattern: 'rg-b9' }   (js_eval sandbox; see test/harness.js)
 'use strict';
+var EX = await runFile('test/extract.js', { i18n: false });
 var emojiSrc = await loadFile('src/js/core/055-emoji-shortcodes.js');
 var renderSrc = await loadFile('src/js/ui/250-message-render.js');
 var cssSrc = await loadFile('src/css/07-markdown.css');
@@ -194,20 +195,19 @@ describe('rg-b9 header CSS (07-markdown.css header rule)', function() {
 describe('rg-b9 P2: attachment-group placeholders carry no duplicate msg-N id', function() {
   var T2 = { tags: ['unit'], timeout: 5000 };
   function declaration(source, name) {
-    var s = source.indexOf('\nfunction ' + name + '(');
-    var e = source.indexOf('\n}', s + 1);
-    if (s < 0 || e < 0) throw new Error('rg-b9 P2: missing declaration ' + name);
-    return source.slice(s + 1, e + 2);
+    var f = EX.findFunction(source, name, { includeAsync: false });
+    if (!f || f.end <= f.start) throw new Error('rg-b9 P2: missing declaration ' + name);
+    return source.slice(f.start, f.end);
   }
   var PARTS = ['isAttachmentRole', 'renderAttachmentContent', 'findAdjacentForAttachmentGroup', '_renderSig',
     '_sigHasWidget', '_tryIncrementalRender', '_sweepOrphanedParkedWidgets', '_renderCompactThinking',
-    'renderMessages'].map(function(n) { return declaration(renderSrc, n); });
+    '_userMsgNavButtonsHtml', 'renderMessages'].map(function(n) { return declaration(renderSrc, n); });
   function noop() {}
   function esc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
   function makeEnv(messages, compact) {
     return {
       chats: { A: { messages: messages } }, currentChatId: 'A', window: { isRunning: false },
-      UI_ICONS: { eye: 'E', copy: 'C' }, _lastRenderState: { chatId: null, count: 0, sigs: [] },
+      UI_ICONS: { eye: 'E', copy: 'C', arrowUp: '', arrowDown: '' }, t: function(s) { return s; }, _lastRenderState: { chatId: null, count: 0, sigs: [] },
       activeStreamingChatId: null, thinkingExpandedState: {}, compactAreaExpandedState: {}, userMsgExpandedState: {},
       hooksEnabled: { showHookMessages: true }, showApiStats: false, showMessageSource: false, compactToolCalls: !!compact,
       console: { log: noop, info: noop, warn: noop, error: noop, debug: noop },

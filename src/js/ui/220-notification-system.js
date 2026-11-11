@@ -281,6 +281,68 @@ function getToolContextLabels(args) {
     return '<span class="notification-context-labels">' + badges + '</span>';
 }
 
+// Shared OS-notification rule (approval, finish, crash): send when the user is
+// away right now — tab hidden, OR window unfocused (side panels stay
+// document-visible on a window switch), OR the machine is idle/locked per
+// chrome.idle (no input for OS_NOTIFY_IDLE_SECONDS, Chrome's 15 s minimum).
+// Keep awake no longer forces notifications. Callers keep their own skips
+// (sub-agent chats, paused, silent-hook runs, osNotify === false); the
+// Silent/Notify/Sound mode gate stays in background.js.
+function isUserAwayFromPanel() {
+    if (typeof document === 'undefined' || !document) return false;
+    return !!document.hidden || (typeof document.hasFocus === 'function' && !document.hasFocus());
+}
+// IDLE-15S: cached chrome.idle state so the rule stays synchronous. Seeded
+// with queryState and kept current by onStateChanged (interval set to 15 s).
+// Without chrome.idle (tests, offscreen host, other platforms, permission
+// missing, no window.chrome) it stays 'active' and the rule falls back to hidden/unfocused.
+// The detection interval is extension-wide, so this is the ONE chrome.idle
+// user on the page: other features (app/060 Keep awake) subscribe through
+// subscribeOsIdleState() instead of calling setDetectionInterval themselves.
+var OS_NOTIFY_IDLE_SECONDS = 15;
+var _osNotifyIdleState = 'active';
+var _osIdleSubscribers = [];
+function _setOsIdleState(state) {
+    if (!state || state === _osNotifyIdleState) return;
+    _osNotifyIdleState = state;
+    for (var i = 0; i < _osIdleSubscribers.length; i++) {
+        try { _osIdleSubscribers[i](state); } catch (e) {}
+    }
+}
+function _initOsNotifyIdleDetection() {
+    try {
+        // Read via window.chrome (same object as the chrome global on the
+        // page) so test harnesses can inject a stub through their fake window.
+        var c = (typeof window !== 'undefined' && window) ? window.chrome : null;
+        if (!c || !c.idle) return false;
+        var idle = c.idle;
+        if (typeof idle.setDetectionInterval === 'function') idle.setDetectionInterval(OS_NOTIFY_IDLE_SECONDS);
+        if (idle.onStateChanged && typeof idle.onStateChanged.addListener === 'function') {
+            idle.onStateChanged.addListener(_setOsIdleState);
+        }
+        if (typeof idle.queryState === 'function') {
+            idle.queryState(OS_NOTIFY_IDLE_SECONDS, _setOsIdleState);
+        }
+        return true;
+    } catch (e) { return false; }
+}
+var _osIdleAvailable = _initOsNotifyIdleDetection();
+// Shared idle-state source. Returns false (nothing registered) when chrome.idle
+// is unavailable so the caller keeps its own fallback; otherwise registers fn
+// for every state change ('active' | 'idle' | 'locked') and returns true.
+function subscribeOsIdleState(fn) {
+    if (!_osIdleAvailable || typeof fn !== 'function') return false;
+    _osIdleSubscribers.push(fn);
+    return true;
+}
+function getOsIdleState() { return _osNotifyIdleState; }
+function isMachineIdleOrLocked() {
+    return _osNotifyIdleState === 'idle' || _osNotifyIdleState === 'locked';
+}
+function shouldSendOsNotification() {
+    return isUserAwayFromPanel() || isMachineIdleOrLocked();
+}
+
 // Show notification for tool approval with action button to go to the chat
 function showApprovalNotification(chatTitle, toolName, chatId, statusMessage, approvalIndex, args, opts) {
     // Check if this approval is already in the queue or currently showing
@@ -310,8 +372,9 @@ function showApprovalNotification(chatTitle, toolName, chatId, statusMessage, ap
     } catch (eTci) { toolCallId = null; }
     var newNotification = { chatTitle: chatTitle, toolName: toolName, chatId: chatId, statusMessage: statusMessage, approvalIndex: approvalIndex, toolCallId: toolCallId, args: args };
 
-    // Send browser notification when the page is hidden so user knows a tool needs approval
-    if (document.hidden) {
+    // OS notification so the user knows a tool needs approval: shared rule
+    // (away = hidden OR window unfocused OR machine idle/locked >= 15 s).
+    if (shouldSendOsNotification()) {
         // AB (OS-notification dedup): the SW broadcasts approval prompts to
         // EVERY panel — only the PRIMARY copy may fire the OS notification
         // (opts.osNotify === false on fan-out / re-delivery / rebind copies),
@@ -326,8 +389,10 @@ function showApprovalNotification(chatTitle, toolName, chatId, statusMessage, ap
                 chatId: chatId
             });
         }
+    }
+    if (document.hidden) {
         // Flash the tab title until the approval is handled or the tab
-        // becomes visible (ui/225-approval-attention.js).
+        // becomes visible (ui/225-approval-attention.js). Hidden tabs only.
         if (typeof startApprovalTitleFlash === 'function') { try { startApprovalTitleFlash(); } catch (e) {} }
     }
 

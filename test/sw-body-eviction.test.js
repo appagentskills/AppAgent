@@ -3,6 +3,7 @@
 // src/js/core/130-indexeddb.js: report_to_parent / update_action_state
 // argument exemption, parked-tool-call skip, the save-race bodyGuard, and the
 // deferred idempotent boot-cleanup scheduler.
+var EX = await runFile('test/extract.js', { i18n: false });
 describe('SW body eviction + deferred boot cleanup', function() {
     var U = { tags: ['unit'], timeout: 20000 };
     var BIG = 'Z'.repeat(2000);
@@ -90,8 +91,9 @@ describe('SW body eviction + deferred boot cleanup', function() {
 
     test('_repaintParent stamps an evicted parent _dirtyWhileEvicted before saving (review must-fix)', async function() {
         var src = await loadFile('src/js/core/097-sub-agent-registry.js');
-        var at = src.indexOf('function _repaintParent(');
-        var end = src.indexOf('\n}\n', at);
+        var fx = EX.findFunction(src, '_repaintParent', { includeAsync: false });   // code-mask cut (test/extract.js)
+        var at = fx ? fx.start : -1;
+        var end = fx ? fx.end - 2 : -1;
         assert.ok(at >= 0 && end > at, '_repaintParent found');
         var saves = [];
         var map = { p: { id: 'p', _payloadsEvicted: true, messages: [] }, q: { id: 'q', messages: [] } };

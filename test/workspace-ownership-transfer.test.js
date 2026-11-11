@@ -4,6 +4,7 @@
 // later subs) keep same-lineage ownership even after the sub's registry record
 // is GC'd (otherwise _wsRootChatId(subId) degrades to subId → false
 // cross_chat_conflict against a dead chat).
+var EX = await runFile('test/extract.js', { i18n: false });
 describe('#7 _wsTransferOwnership (tools/020-tool-execution.js)', function() {
     var M = null;
     async function load() {
@@ -158,9 +159,10 @@ describe('#7 _wsTransferOwnership (tools/020-tool-execution.js)', function() {
 describe('merged-mid-task wsPush result wiring (tools/020-tool-execution.js)', function() {
     test('previous_pr_merged is derived from the previous PR and surfaced next to previous_pr_number', async function() {
         var src = await loadFile('src/js/tools/020-tool-execution.js');
-        var i = src.indexOf('async function wsPush(');
+        var fx = EX.findFunction(src, 'wsPush');   // code-mask cut (test/extract.js)
+        var i = fx ? fx.start : -1;
         assert.ok(i > 0, 'wsPush must exist');
-        var body = src.slice(i);
+        var body = src.slice(i, fx.end);   // wsPush body only
         assert.ok(/_previousPrMerged = !!listRes\.body\[0\]\.merged_at;/.test(body), 'flag derived from the newest PR for the head');
         assert.ok(/previous_pr_number: _previousPrNumber \|\| undefined,\s*previous_pr_merged: _previousPrNumber \? _previousPrMerged : undefined,/.test(body), 'result carries previous_pr_merged only when a previous PR exists');
         assert.ok(/this PR contains only the files pushed now/.test(body), 'stale-branch message explains the clean diff');

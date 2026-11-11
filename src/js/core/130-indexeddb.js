@@ -2796,6 +2796,31 @@ function applyOpus5DefaultRepoint() {
     if (currentProvider === 'Opus-4-8' || currentProvider === 'Opus 5') currentProvider = OPUS5_REPOINT_TARGET;
 }
 
+// Nov 2026 effort retune: the 'Opus 5.5' (xhigh) and 'Fable 5.2' (high) seeds
+// now default to effort 'medium'. Retune ONLY copies that still have the exact
+// old seed shape (apiKey value ignored); anything user-customized is left
+// alone. Run ONCE (EFFORT_MEDIUM_RETUNE_KEY) so a user who later picks
+// xhigh/high again on an otherwise-default entry is never reverted.
+var EFFORT_MEDIUM_RETUNE_KEY = 'effortMediumRetune202611';
+var EFFORT_MEDIUM_RETUNE_SEEDS = [
+    { name: 'Opus 5.5', model: 'claude-opus-5-5', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', effort: 'xhigh', isClaudeOAuth: true },
+    { name: 'Fable 5.2', model: 'claude-fable-5-2', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', effort: 'high', isClaudeOAuth: true }
+];
+function retuneSeedEffortToMedium(list) {
+    var changed = false;
+    (list || []).forEach(function(p) {
+        if (!p) return;
+        var seed = EFFORT_MEDIUM_RETUNE_SEEDS.find(function(s) { return s.name === p.name; });
+        if (!seed) return;
+        var untouched = Object.keys(seed).every(function(k) { return k === 'apiKey' || p[k] === seed[k]; })
+            && Object.keys(p).every(function(k) { return Object.prototype.hasOwnProperty.call(seed, k); });
+        if (!untouched) return;
+        p.effort = 'medium';
+        changed = true;
+    });
+    return changed;
+}
+
 // API Providers Management
 // v16 compatibility bridge: old builds stored connection fields behind
 // apiProviders[].endpointId in an llmEndpoints store. The DB version did not
@@ -2888,6 +2913,9 @@ async function loadApiProviders() {
                     apiProviders = DEFAULT_API_PROVIDERS.slice();
                     // Save defaults to IndexedDB
                     await saveAllApiProviders();
+                    // Fresh seeds already carry the new efforts — mark the
+                    // one-shot retune done so it never touches later choices.
+                    try { await setSetting(EFFORT_MEDIUM_RETUNE_KEY, true); } catch (eRt) {}
                 } else {
                     apiProviders = loaded;
                     // Persist the v16 compatibility repair before any later default
@@ -2960,13 +2988,17 @@ async function loadApiProviders() {
                         { to: 'GPT-6.1 Sol (ChatGPT)', from: { name: 'GPT-6 Sol (ChatGPT)', model: 'gpt-6-sol', endpoint: 'https://chatgpt.com/backend-api/codex/responses', apiKey: 'oauth', effort: 'high', isChatGPTOAuth: true } },
                         { to: 'GPT-6 Luna (ChatGPT)', from: { name: 'GPT-5.6 Luna (ChatGPT)', model: 'gpt-5.6-luna', endpoint: 'https://chatgpt.com/backend-api/codex/responses', apiKey: 'oauth', effort: 'medium', isChatGPTOAuth: true } },
                         // Sept 2026 model-list tidy-up: Opus 5 and Opus-4-8 retire
-                        // into Opus 5.5, Fable 5 into Fable 5.1. Opus-4-8 matches
-                        // both seed vintages (with / without the pre-global
-                        // maxTokens + context_length fields).
+                        // into Opus 5.5, Fable 5 into Fable 5.1 (chain-collapsed
+                        // to 'Fable 5.2': the Fable 5.1 seed retired Nov 2026).
+                        // Opus-4-8 matches both seed vintages (with / without the
+                        // pre-global maxTokens + context_length fields).
                         { to: 'Opus 5.5', from: { name: 'Opus 5', model: 'claude-opus-5', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', effort: 'xhigh', isClaudeOAuth: true } },
                         { to: 'Opus 5.5', from: { name: 'Opus-4-8', model: 'claude-opus-4-8', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', effort: 'xhigh', isClaudeOAuth: true } },
                         { to: 'Opus 5.5', from: { name: 'Opus-4-8', model: 'claude-opus-4-8', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', maxTokens: 100000, context_length: 200000, effort: 'xhigh', isClaudeOAuth: true } },
-                        { to: 'Fable 5.1', from: { name: 'Fable 5', model: 'claude-fable-5', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', effort: 'high', isClaudeOAuth: true } },
+                        { to: 'Fable 5.2', from: { name: 'Fable 5', model: 'claude-fable-5', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', effort: 'high', isClaudeOAuth: true } },
+                        // Nov 2026: Fable 5.2 (claude-fable-5-2) supersedes the
+                        // Fable 5.1 seed (one seed shape, 030-config.js history).
+                        { to: 'Fable 5.2', from: { name: 'Fable 5.1', model: 'claude-fable-5-1', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', effort: 'high', isClaudeOAuth: true } },
                         // Sept 2026: Sonnet 5.5 supersedes the Sonnet 5 seeds
                         // (OpenRouter 'sonnet-5' + OAuth 'Sonnet 5'). One row per
                         // historical seed shape (030-config.js git history):
@@ -3105,6 +3137,13 @@ async function loadApiProviders() {
                         }
                     });
                     if (migrated) await saveAllApiProviders();
+                    // One-shot Nov 2026 effort retune (see retuneSeedEffortToMedium).
+                    try {
+                        if (!(await getSetting(EFFORT_MEDIUM_RETUNE_KEY, false))) {
+                            if (retuneSeedEffortToMedium(apiProviders)) await saveAllApiProviders();
+                            await setSetting(EFFORT_MEDIUM_RETUNE_KEY, true);
+                        }
+                    } catch (eRetune) { console.warn('Effort retune migration failed:', eRetune); }
                 }
                 // Hoisted OUT of the else above so it runs on BOTH branches (see
                 // the function's header for why the fresh-install branch is safe).

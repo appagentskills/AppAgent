@@ -4,6 +4,7 @@
 // - every shard gets its own tool-call id even without a host toolCallId;
 // - denial accounting (no double count, timeout denials kept) and timed_out.file.
 
+var EX = await runFile('test/extract.js', { i18n: false });
 async function rrEntry(evalImpl, env) {
     env = env || {};
     var P = new Function('setTimeout', 'clearTimeout', (await loadFile('src/js/core/075-test-run-policy.js')) + '\nreturn TestRunPolicy;')(function() { return null; }, function() {});
@@ -307,7 +308,7 @@ describe('run_tests SW delegation: fail-closed lifecycle', function() {
 describe('Reload checklist: pre-dispatch failure rows', function() {
     test('_reloadSuiteRows shows the cause once on the first row and fails every suite', async function() {
         var src = await loadFile('src/js/ui/270-iframe-panel.js');
-        function fn(name) { var i = src.indexOf('function ' + name + '('), j = src.indexOf('\n}\n', i); assert.ok(i >= 0 && j > i, name); return src.slice(i, j + 2); }
+        function fn(name) { var f = EX.findFunction(src, name, { includeAsync: false }); assert.ok(f && f.end > f.start, name); return src.slice(f.start, f.end); }
         var rows = new Function(fn('_reloadSuiteResult') + fn('_reloadSuiteRows') + 'return _reloadSuiteRows;')();
         var H = (await rrEntry(async function() {})).helpers;
         var r = rows(H.rtFailedRunResult('run_tests failed before any test ran: Cannot read complete source: test/harness.js', 'PRE_DISPATCH_FAILED'), [RA, RB]);

@@ -3,6 +3,7 @@
 // SW settles the pending prompt with {success:true, answered_via_chat:true,
 // text} (via the existing _swSettleRemotePrompt lane) instead of setting
 // userInterruptedChats / firing the interrupt resolver / aborting the stream.
+var EX = await runFile('test/extract.js', { i18n: false });
 describe('#18 _swAnswerPendingPromptViaChat (worker/120-tool-routing.js)', function() {
     var M = null;
     async function load() {
@@ -92,9 +93,10 @@ describe('#18 _swAnswerPendingPromptViaChat (worker/120-tool-routing.js)', funct
     });
     test('wiring: SW send-message running branch consults the fast path BEFORE marking the interrupt', async function() {
         var bridge = await loadFile('src/js/worker/130-port-bridge.js');
-        var fnStart = bridge.indexOf('function _handlePanelSendMessage(');
+        var fx = EX.findFunction(bridge, '_handlePanelSendMessage', { includeAsync: false });   // code-mask cut (test/extract.js)
+        var fnStart = fx ? fx.start : -1;
         assert.ok(fnStart > 0, '_handlePanelSendMessage must exist');
-        var body = bridge.slice(fnStart);
+        var body = bridge.slice(fnStart, fx.end);   // the handler body only
         var fast = body.indexOf('_swAnswerPendingPromptViaChat(chatId, msg.text)');
         var mark = body.indexOf('userInterruptedChats[chatId] = true');
         assert.ok(fast > 0, 'fast path must be called in _handlePanelSendMessage');

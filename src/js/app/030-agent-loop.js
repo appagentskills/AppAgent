@@ -1083,9 +1083,8 @@ async function runAgent(overrideChatId) {
     if (runningChatIds[streamingChatId]) return;
     runningChatIds[streamingChatId] = true;
     // PR1: runStarted handler (035-agent-events.js) owns the foreground UI
-    // setup (pause button, is-streaming class, retry/continue cleanup) AND
-    // captures the initial document.hidden / hasFocus state for the
-    // finish-notification heuristic. The loop just emits.
+    // setup (pause button, is-streaming class, retry/continue cleanup).
+    // The loop just emits.
     //
     // The emit is INSIDE the try so the finally still runs and clears
     // runningChatIds even if a UI handler throws — same safety net the
@@ -2409,8 +2408,9 @@ async function runAgent(overrideChatId) {
     if (typeof refreshClaudeOAuthUsage === 'function') refreshClaudeOAuthUsage();
 
     // Send browser notification when agent finishes in the background.
-    // notifyFinish handler decides based on document.hidden / hasFocus +
-    // the wasHidden-during-run flag tracked in 035. Kept distinct from
+    // notifyFinish handler (036) decides at finish time via the shared
+    // shouldSendOsNotification rule (document hidden / window unfocused /
+    // machine idle or locked >= 15 s, right now). Kept distinct from
     // runFinished so it fires AFTER hooks + fetchCredits, matching the
     // original ordering.
     //

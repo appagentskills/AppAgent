@@ -8,6 +8,7 @@
 //     'Approval needed: {tool}', like the ui/220 notification sites, and still
 //     escapes it. No new catalog keys: the name is a TOOL_DISPLAY_NAMES N_() value.
 // Run: run_tests { files: ['test/i18n-phase4-fixes.test.js'] }
+var EX = await runFile('test/extract.js', { i18n: false });
 var WS = args.workspace; // resolved workspace, passed in by run_tests
 var U = await runFile('test/ui-helpers.js', { workspace: WS }, WS);
 
@@ -96,7 +97,7 @@ describe('i18n phase 4: RTL overflow fade mirrors .has-right-shadow', function()
         var src = await loadFile('src/js/ui/250-message-render.js', WS);
         var i = src.indexOf('function _updateRowShadow(');
         assert.ok(i >= 0, '_updateRowShadow exists');
-        var fnSrc = src.slice(i, src.indexOf('\n}', i) + 2);
+        var fnSrc = src.slice(i, EX.blockFrom(src, i).end);
         var dir = 'ltr';
         var update = new Function('i18nDir', fnSrc + '\nreturn _updateRowShadow;')(function() { return dir; });
         function row(scrollLeft) {

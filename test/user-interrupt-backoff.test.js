@@ -1,5 +1,6 @@
 
 // Simulated units: real worker handlers + real retry Promise; fake clock, no live UI.
+var EX = await runFile('test/extract.js', { i18n: false });
 var opts = { tags: ['unit'], timeout: 20000 };
 async function fixture() {
     var timers = [], settled = {}, calls = [];
@@ -150,7 +151,7 @@ test('mutation-lite detects removing wake, removing cleanup and inverting the ne
             var bridge = await loadFile('src/js/worker/130-port-bridge.js');
             var signature = lane === 'send' ? 'async function _handlePanelSendMessage(' : 'function _handlePanelMessage(';
             var fnStart = bridge.indexOf(signature);
-            var fnEnd = bridge.indexOf('\n}', fnStart) + 2;
+            var fnEnd = fnStart < 0 ? -1 : EX.blockFrom(bridge, fnStart).end;   // code-mask cut (test/extract.js)
             assert.ok(fnStart >= 0 && fnEnd > fnStart, 'extract untransformed real handler');
             var key = lane === 'send' ? 'chatId' : 'icid';
             var lookup = 'providerChangeBackoffResolversByChatId[' + key + ']';

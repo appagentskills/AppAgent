@@ -32,34 +32,24 @@
 // AGENT_EVENT_HANDLERS_SENTINEL — used by build-verify grep.
 // =============================================================
 
-// document.hidden / window-focus tracking for the "Agent finished"
-// browser notification. Semantics: any chat that was running while
-// the document went hidden gets a notification at run-finish;
-// "away right now" (window blurred OR document hidden) also fires it.
-//
-// In the offscreen-host architecture, the offscreen doc is always
-// "hidden" (no UI), so this tracking MUST run on the page side.
-// The notification heuristic asks "was the USER away from this
-// panel while the run was happening?", not "was the offscreen doc
-// hidden?".
-
-var _agentEventsHiddenDuringRun = {};
-function _agentEventsMarkAllRunningHidden() {
-    if (typeof runningChatIds !== 'object' || !runningChatIds) return;
-    for (var cid in runningChatIds) {
-        if (runningChatIds[cid]) _agentEventsHiddenDuringRun[cid] = true;
-    }
+// "Agent finished" / "Agent stopped — error" OS notifications follow the
+// shared rule evaluated AT the finish/crash (shouldSendOsNotification,
+// ui/220): the user is away right now (document hidden OR window unfocused
+// OR machine idle/locked >= 15 s per chrome.idle). Not sticky: a user who left mid-run but came back
+// before the finish gets no toast. Page-side on purpose — the offscreen
+// host is always "hidden", the question is whether the USER is away.
+function _agentEventsShouldOsNotify() {
+    if (typeof shouldSendOsNotification === 'function') return shouldSendOsNotification();
+    return !!document.hidden || (typeof document.hasFocus === 'function' && !document.hasFocus());
 }
-if (typeof document !== 'undefined' && document.addEventListener) {
-    document.addEventListener('visibilitychange', function() {
-        if (document.hidden) _agentEventsMarkAllRunningHidden();
-    });
+function _agentEventsChatTitle(nc) {
+    return nc && nc.title ? (nc.title === 'New Chat' ? t('New Chat') : nc.title) : t('Chat');
 }
-// Chrome side panels stay document-visible when the user switches
-// windows, so also treat "window lost focus" as away.
-if (typeof window !== 'undefined' && window.addEventListener) {
-    window.addEventListener('blur', _agentEventsMarkAllRunningHidden);
-}
+// One crash = one OS notification: set when runCrashed sent its toast; a
+// notifyFinish for the same chat that follows (e.g. a nested hook run crashed
+// and the outer run then finished) skips its own toast. Cleared by runStarted
+// of the next independent run and consumed by that notifyFinish.
+var _agentEventsCrashNotified = {};
 
 // UNREAD-MISS counterpart: returning to a visible+focused panel while the chat
 // view is on screen counts as SEEING the focused chat — stamp lastViewedAt so
@@ -111,12 +101,11 @@ function _stampChatActivity(chatId) {
     if (typeof markChatActivity === 'function') { try { markChatActivity(chatId); } catch (e) {} }
 }
 
-// runStarted — initial hidden snapshot, chat-list refresh, foreground UI flags.
+// runStarted — chat-list refresh, foreground UI flags.
 AgentEvents.on('runStarted', function(e) {
     var chatId = e.chatId;
     _stampChatActivity(chatId);
-    _agentEventsHiddenDuringRun[chatId] = !!document.hidden ||
-        (typeof document.hasFocus === 'function' && !document.hasFocus());
+    delete _agentEventsCrashNotified[chatId];
     // FLUX-4C review fix B (paint ordering): a chat starting a run clears its own
     // persisted per-chat error. This used to be dispatched at the TAIL of the
     // handler (both branches, identical payload) — i.e. AFTER the three repaints
@@ -767,6 +756,21 @@ AgentEvents.on('runCrashed', function(e) {
     }
     if (e && e.chatId) _stampChatActivity(e.chatId);
     if (e && e.chatId && typeof markChatRecentlyFinished === 'function') { try { markChatRecentlyFinished(e.chatId); } catch (err) {} }
+    // OS notification for a crash: same shared rule + title logic as
+    // notifyFinish. Never for sub-agent chats or silent-hook runs (checked
+    // BEFORE the silent-hook flag is cleared just below).
+    if (e && e.chatId) {
+        var _crChat = (typeof chats !== 'undefined' && chats) ? chats[e.chatId] : null;
+        var _crSilent = typeof _silentHookChats !== 'undefined' && !!_silentHookChats[e.chatId];
+        if (!(_crChat && _crChat.isSubAgent) && !_crSilent && _agentEventsShouldOsNotify()) {
+            _agentEventsCrashNotified[e.chatId] = true;
+            Platform.sendNotification({
+                title: t('Agent stopped — error'),
+                message: _agentEventsChatTitle(_crChat),
+                chatId: e.chatId
+            });
+        }
+    }
     // A crashed hook run never emits silentHookState{active:false} — clear the
     // per-chat flag here too (same self-heal as the runFinished handler).
     if (e && e.chatId && typeof _silentHookChats !== 'undefined' && _silentHookChats[e.chatId]) delete _silentHookChats[e.chatId];
@@ -782,10 +786,8 @@ AgentEvents.on('runCrashed', function(e) {
 
 AgentEvents.on('notifyFinish', function(e) {
     var chatId = e.chatId;
-    var wasHidden = !!_agentEventsHiddenDuringRun[chatId];
-    delete _agentEventsHiddenDuringRun[chatId];
-    var awayNow = document.hidden ||
-        (typeof document.hasFocus === 'function' && !document.hasFocus());
+    var crashNotified = !!_agentEventsCrashNotified[chatId];
+    delete _agentEventsCrashNotified[chatId];
     // Sub-agent chats are invisible to the user — they finish constantly as
     // part of the parent's work. Pushing a browser notification for every
     // sub natural-finish would spam the user with "Agent finished" toasts
@@ -793,11 +795,10 @@ AgentEvents.on('notifyFinish', function(e) {
     // the right surface for the actual PM-visible work.
     var nc = chats[chatId];
     if (nc && nc.isSubAgent) return;
-    if (!e.isPaused && !e.wasSilentHook && (awayNow || wasHidden)) {
-        var title = nc && nc.title ? (nc.title === 'New Chat' ? t('New Chat') : nc.title) : t('Chat');
+    if (!e.isPaused && !e.wasSilentHook && !crashNotified && _agentEventsShouldOsNotify()) {
         Platform.sendNotification({
             title: e.hasError ? t('Agent stopped — error') : t('Agent finished'),
-            message: title,
+            message: _agentEventsChatTitle(nc),
             chatId: chatId
         });
     }

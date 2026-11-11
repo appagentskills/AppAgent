@@ -23,6 +23,7 @@
 // Real function sources sliced from the files and run with fakes (DOM, window.open,
 // GitHub API, IDB). No live GitHub, IDB, setting or workspace.
 // Run: run_tests { files: ['test/rg-b5-workspace-settings.test.js'] }
+var EX = await runFile('test/extract.js', { i18n: false });
 var WS = args.workspace;
 var TOKEN_PATH = '/settings/tokens/new?scopes=repo&description=AppAgent';
 
@@ -32,9 +33,9 @@ async function fnFrom(file, sig, name, deps) {
     var src = await loadFile(file, WS);
     var i = src.indexOf(sig);
     assert.ok(i >= 0, file + ': ' + sig + ' must exist');
-    var m = /\n\}\r?\n/.exec(src.slice(i));
-    assert.ok(m, file + ': ' + name + ' must close at column 0');
-    var code = src.slice(i, i + m.index + 2);
+    var b = EX.blockFrom(src, i);
+    assert.ok(b, file + ': ' + name + ' must close at column 0');
+    var code = src.slice(i, b.end);
     var names = Object.keys(deps || {});
     return new Function(names.join(','), code + '\nreturn ' + name + ';').apply(null, names.map(function(k) { return deps[k]; }));
 }
@@ -372,9 +373,9 @@ async function fnSrc(file, sig) {
     var src = await loadFile(file, WS);
     var i = src.indexOf(sig);
     assert.ok(i >= 0, file + ': ' + sig + ' must exist');
-    var m = /\n\}\r?\n/.exec(src.slice(i));
-    assert.ok(m, file + ': ' + sig + ' must close at column 0');
-    return src.slice(i, i + m.index + 2);
+    var b = EX.blockFrom(src, i);
+    assert.ok(b, file + ': ' + sig + ' must close at column 0');
+    return src.slice(i, b.end);
 }
 // Fake settings IDB (withStore + store.get/put). Fault 'reqerror' fails the get
 // request (onerror); 'throw' rejects a readonly withStore. Faults hit READS only, so

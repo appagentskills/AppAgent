@@ -4,6 +4,7 @@
 // into an about:blank popup where the MV3 CSP kills its scripts and inline handlers.
 var WS = args.workspace; // resolved workspace, passed in by run_tests
 var U = await runFile('test/ui-helpers.js', { workspace: WS }, WS);
+var EX = await runFile('test/extract.js', { i18n: false });
 var WG_FILES = ['src/js/core/060-ui-constants.js', 'src/js/ui/180-search.js', 'src/js/core/135-widget-store.js', 'src/js/ui/070-dashboard-ui.js',
     'src/js/tools/080-widget-tools.js'];
 
@@ -34,7 +35,8 @@ describe('widget print (S0C2-02)', function() {
 
     test('120-init widget deep link prints when print=1 (S0C2-02, static)', async function() {
         var src = await loadFile('src/js/core/120-init.js');
-        var a = src.indexOf('function _dlOnWidgetMsg');
+        var fx = EX.findFunction(src, '_dlOnWidgetMsg', { includeAsync: false });   // code-level start (test/extract.js)
+        var a = fx ? fx.start : -1;   // region runs past the handler to its addEventListener (window.print() lives there)
         var b = src.indexOf("window.addEventListener('message', _dlOnWidgetMsg)");
         assert.strictEqual(a > 0 && b > a, true, 'deep-link widget message handler found');
         var body = src.slice(a, b);

@@ -27,7 +27,7 @@ async function loadGateModule() {
         declarativeNetRequest: { updateDynamicRules: async function(spec) { rules.push(spec); } }
     };
     var api = new Function('chrome', 'console', gate +
-        '\nreturn { compareSemver: compareSemver, parse: parseRequiredClaudeCliVersion, apply: applyClaudeCliUaRule, install: installClaudeCliUaRule, bump: bumpClaudeCliVersion, shipped: CLAUDE_CLI_VERSION, applied: function() { return _claudeCliVersionApplied; } };'
+        '\nreturn { compareSemver: compareSemver, parse: parseRequiredClaudeCliVersion, apply: applyClaudeCliUaRule, install: installClaudeCliUaRule, bump: bumpClaudeCliVersion, reapply: reapplyClaudeCliVersion, shipped: CLAUDE_CLI_VERSION, applied: function() { return _claudeCliVersionApplied; } };'
     )(chrome, { warn: function(m) { warnings.push(String(m)); }, error: function() {}, log: function() {} });
     return { api: api, store: store, rules: rules, warnings: warnings };
 }
@@ -93,26 +93,26 @@ describe('claude-cli version gate helpers', function() {
 
     test('installClaudeCliUaRule applies max(shipped floor, stored override)', async function() {
         var g = await loadGateModule();
-        assert.strictEqual(g.api.shipped, '2.1.280');
+        assert.strictEqual(g.api.shipped, '2.1.290', 'floor must satisfy Fable 5.2 (2.1.290)');
         // no override → shipped floor
-        assert.strictEqual(await g.api.install(), '2.1.280');
-        assert.strictEqual(g.rules[0].addRules[0].action.requestHeaders[0].value, 'claude-cli/2.1.280 (external, cli)');
+        assert.strictEqual(await g.api.install(), '2.1.290');
+        assert.strictEqual(g.rules[0].addRules[0].action.requestHeaders[0].value, 'claude-cli/2.1.290 (external, cli)');
         // override BELOW the floor → floor still wins
         g.store.claudeCliVersionOverride = '2.1.100';
-        assert.strictEqual(await g.api.install(), '2.1.280');
+        assert.strictEqual(await g.api.install(), '2.1.290');
         // override ABOVE the floor → override wins
         g.store.claudeCliVersionOverride = '2.1.310';
         assert.strictEqual(await g.api.install(), '2.1.310');
         assert.strictEqual(g.rules[2].addRules[0].action.requestHeaders[0].value, 'claude-cli/2.1.310 (external, cli)');
         // garbage override → ignored
         g.store.claudeCliVersionOverride = 'latest';
-        assert.strictEqual(await g.api.install(), '2.1.280');
+        assert.strictEqual(await g.api.install(), '2.1.290');
     }, { tags: ['unit'], timeout: 5000 });
 
     test('bumpClaudeCliVersion persists + installs only when the demanded version is above the applied one', async function() {
         var g = await loadGateModule();
         await g.api.install();
-        assert.strictEqual(await g.api.bump('2.1.280'), false, 'equal → no bump');
+        assert.strictEqual(await g.api.bump('2.1.290'), false, 'equal → no bump');
         assert.strictEqual(await g.api.bump('2.1.100'), false, 'lower → no bump');
         assert.strictEqual(await g.api.bump('x.y.z'), false, 'garbage → no bump');
         assert.strictEqual(g.rules.length, 1);
@@ -125,12 +125,36 @@ describe('claude-cli version gate helpers', function() {
         assert.strictEqual(await g.api.bump('2.1.295'), false);
         assert.strictEqual(g.rules.length, 2);
     }, { tags: ['unit'], timeout: 5000 });
+
+    test('a startup install that resolves AFTER a bump never downgrades the rule', async function() {
+        var g = await loadGateModule();
+        // bump lands first (storage still empty when install reads it below)
+        assert.strictEqual(await g.api.bump('2.1.300'), true);
+        delete g.store.claudeCliVersionOverride; // simulate install having read storage pre-bump
+        assert.strictEqual(await g.api.install(), '2.1.300');
+        assert.strictEqual(g.api.applied(), '2.1.300');
+        assert.strictEqual(g.rules[g.rules.length - 1].addRules[0].action.requestHeaders[0].value, 'claude-cli/2.1.300 (external, cli)');
+    }, { tags: ['unit'], timeout: 5000 });
+
+    test('reapplyClaudeCliVersion force-reinstalls max(demanded, applied) and persists above the floor', async function() {
+        var g = await loadGateModule();
+        await g.api.install();
+        assert.strictEqual(await g.api.reapply('2.1.290'), true, 'equal demand still re-installs');
+        assert.strictEqual(g.rules.length, 2);
+        assert.strictEqual(g.store.claudeCliVersionOverride, undefined, 'floor is not persisted');
+        assert.strictEqual(await g.api.reapply('2.1.100'), true);
+        assert.strictEqual(g.api.applied(), '2.1.290', 'never downgrades');
+        assert.strictEqual(await g.api.reapply('2.1.305'), true);
+        assert.strictEqual(g.api.applied(), '2.1.305');
+        assert.strictEqual(g.store.claudeCliVersionOverride, '2.1.305');
+        assert.strictEqual(await g.api.reapply('bad'), false);
+    }, { tags: ['unit'], timeout: 5000 });
 });
 
 describe('Opus 5.5 thinking binding (betas + thinking object)', function() {
     test('THINKING_BINDING_RE covers Fable/Mythos 5.1+ and Opus 5.5+, excludes Opus 5.0-5.4 and dated 5.0 ids', async function() {
         var m = await loadThinkingModule();
-        var yes = ['claude-opus-5-5', 'claude-opus-5.5', 'claude-opus-5-5-20260915', 'claude-opus-5-10', 'claude-opus-6', 'claude-opus-10', 'claude-fable-5-1', 'claude-mythos-5-1', 'claude-fable-5-1-20260901'];
+        var yes = ['claude-opus-5-5', 'claude-opus-5.5', 'claude-opus-5-5-20260915', 'claude-opus-5-10', 'claude-opus-6', 'claude-opus-10', 'claude-fable-5-1', 'claude-mythos-5-1', 'claude-fable-5-1-20260901', 'claude-fable-5-2', 'claude-mythos-5-2'];
         var no = ['claude-opus-5', 'claude-opus-5-20260701', 'claude-opus-5-1', 'claude-opus-5-4', 'claude-opus-4-8', 'claude-fable-5', 'claude-fable-5-20260501', 'claude-sonnet-5', 'claude-sonnet-4-6', 'gpt-6-astra'];
         yes.forEach(function(id) { assert.strictEqual(m.isBinding(id), true, id + ' should bind'); });
         no.forEach(function(id) { assert.strictEqual(m.isBinding(id), false, id + ' should NOT bind'); });
@@ -145,6 +169,7 @@ describe('Opus 5.5 thinking binding (betas + thinking object)', function() {
         var extra = ',thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18';
         assert.strictEqual(m.betas('claude-opus-5-5'), base + extra);
         assert.strictEqual(m.betas('claude-fable-5-1'), base + extra);
+        assert.strictEqual(m.betas('claude-fable-5-2'), base + extra);
         assert.strictEqual(m.betas('claude-opus-5'), base);
         assert.strictEqual(m.betas('claude-sonnet-5'), base);
         assert.strictEqual(m.betas('claude-opus-4-8'), base);
@@ -184,6 +209,11 @@ describe('Opus 5.5 thinking binding (betas + thinking object)', function() {
         assert.strictEqual(o5off.thinking, undefined);
         var f51 = m.transform({ model: 'claude-fable-5-1', max_tokens: 64000, messages: msgs, reasoning: { effort: 'high' } });
         assert.deepStrictEqual(f51.thinking, { type: 'adaptive', display: 'summarized', block_binding: { prefix_mismatch_behavior: 'drop_block' } });
+        // Fable 5.2 enforces the prefix check for all accounts: same drop_block opt-out, adaptive-only, Fable predicate
+        var f52 = m.transform({ model: 'claude-fable-5-2', max_tokens: 64000, messages: msgs, reasoning: { effort: 'high' } });
+        assert.deepStrictEqual(f52.thinking, { type: 'adaptive', display: 'summarized', block_binding: { prefix_mismatch_behavior: 'drop_block' } });
+        assert.strictEqual(m.isAdaptiveOnly('claude-fable-5-2'), true);
+        assert.strictEqual(m.isFable51('claude-fable-5-2'), true);
         var legacy = m.transform({ model: 'claude-sonnet-4-5', max_tokens: 64000, messages: msgs, reasoning: { effort: 'medium' } });
         assert.deepStrictEqual(legacy.thinking, { type: 'enabled', budget_tokens: 16000 });
         assert.strictEqual(legacy.output_config, undefined);

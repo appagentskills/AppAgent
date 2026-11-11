@@ -6,6 +6,7 @@
 // a live chat, the service worker, IndexedDB or settings.
 'use strict';
 
+var EX = await runFile('test/extract.js', { i18n: false });
 var DCL_NAV = 'src/js/ui/170-chat-management.js';
 // The excerpts call t()/tn()/N_(): every with (env) sandbox below gets the REAL i18n core first
 // (no catalog set = English identity, like the harness auto-include in test/harness.js).
@@ -25,10 +26,9 @@ async function dclSources() {
 
 // Column-zero closing-brace convention (same as test/chat-navigation-state.test.js).
 function dclDeclaration(source, header) {
-    var start = source.indexOf(header + '(');
-    var end = source.indexOf('\n}', start);
-    if (!(start >= 0 && end > start)) throw new Error('Missing declaration: ' + header);
-    var code = source.slice(start, end + 2);
+    var code = null;
+    try { code = EX.extractFrom(source, header + '('); } catch (e) { code = null; }
+    if (code === null) throw new Error('Missing declaration: ' + header);
     new Function(code); // Syntax-check the exact excerpt before executing it.
     return code;
 }
@@ -236,7 +236,11 @@ test('TA-9: continue-from-summary resets a stale composer hint (A6A3-02)', async
         setChatPausedPersistent: noop, pushPauseToggleToOffscreen: noop, syncPauseButtonUI: noop,
         runAgent: function() { return Promise.resolve(); }
     };
-    var fn = new Function('env', 'with (env) {\n' + dclI18n(all) + '\n' + dclDeclaration(src, 'function resetComposerPlaceholder') + '\n' +
+    // Handoff helpers the excerpt calls (seed builder + summary extraction).
+    var helpers = (/\nvar HANDOFF_USER_MSG_VERBATIM_MAX = \d+;\nvar HANDOFF_USER_MSG_HEAD = \d+;/.exec(src) || [''])[0] + '\n' +
+        ['extractHandoffSummary', '_isTypedUserMessage', 'buildHandoffUserMessages', 'buildContinuationSeed']
+            .map(function(n) { return dclDeclaration(src, 'function ' + n); }).join('\n');
+    var fn = new Function('env', 'with (env) {\n' + dclI18n(all) + '\n' + helpers + '\n' + dclDeclaration(src, 'function resetComposerPlaceholder') + '\n' +
         dclDeclaration(src, 'function completeSummaryAndCreateNewChat') + '\nreturn completeSummaryAndCreateNewChat;\n}')(env);
     fn();
     await Promise.resolve();

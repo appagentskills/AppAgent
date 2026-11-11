@@ -3,11 +3,11 @@
 // No network, runtime UI, or real rate-limit cache is read or changed.
 'use strict';
 
+var EX = await runFile('test/extract.js', { i18n: false });
 function runCodexUsageLabelAudit(source) {
-    var start = source.indexOf('function codexUsageModelFromRl(');
-    var end = source.indexOf('\n}', start);
-    if (start < 0 || end <= start) throw new Error('Codex usage model declaration missing');
-    var model = new Function(source.slice(start, end + 2) + '\nreturn codexUsageModelFromRl;')();
+    var f = EX.findFunction(source, 'codexUsageModelFromRl', { includeAsync: false });
+    if (!f || f.end <= f.start) throw new Error('Codex usage model declaration missing');
+    var model = new Function(source.slice(f.start, f.end) + '\nreturn codexUsageModelFromRl;')();
     var cases = [
         ['missing', undefined, 'Secondary limit'],
         ['null', null, 'Secondary limit'],

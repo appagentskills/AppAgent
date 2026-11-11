@@ -19,6 +19,7 @@
 // flex + the guarded derive for the displayed chat). Assertions read the fake buttons'
 // real `visible` classes and the Pause/Resume label.
 'use strict';
+var EX = await runFile('test/extract.js', { i18n: false });
 var T = { tags: ['unit'], timeout: 15000 };
 function noop() {}
 var quiet = { log: noop, warn: noop, error: noop, info: noop, debug: noop };
@@ -62,11 +63,10 @@ async function srcOf(path) {
 }
 // The real top-level `function name(...) {...}` (its closing brace sits at column 0).
 function declaration(src, name) {
-    var start = src.indexOf('\nfunction ' + name + '(');
-    assert.ok(start >= 0, 'declaration found: ' + name);
-    var end = src.indexOf('\n}', start + 1);
-    assert.ok(end > start, 'end of declaration found: ' + name);
-    var code = src.slice(start + 1, end + 2);
+    var f = EX.findFunction(src, name, { includeAsync: false });
+    assert.ok(f, 'declaration found: ' + name);
+    assert.ok(f.end > f.start, 'end of declaration found: ' + name);
+    var code = src.slice(f.start, f.end);
     new Function(code);   // the excerpt compiles on its own
     return code;
 }

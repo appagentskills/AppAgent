@@ -53,6 +53,9 @@ async function init() {
     if (savedShowApiStats !== null) showApiStats = savedShowApiStats === 'true';
     var statsCheckbox = document.getElementById('show-api-stats');
     if (statsCheckbox) statsCheckbox.checked = showApiStats;
+    // Notifications switch (silent / notify / sound) lives in chrome.storage.local
+    // (async; default 'notify').
+    if (typeof loadNotificationModeSetting === 'function') loadNotificationModeSetting();
 
     // History/sidebar search scope (ui/180-search.js): '1' = include inner
     // model text (tool calls/results).
@@ -1158,6 +1161,14 @@ async function renderSkillsList() {
     if (slot && !slot.firstChild && typeof pageToolbarControlsHtml === 'function') {
         slot.innerHTML = pageToolbarControlsHtml({ placeholder: t('Search skills\u2026'), inputClass: 'skills-search-input', onInput: 'skillsOnSearchInput', countId: 'skills-count', layoutFn: 'skillsSetPageLayout' });
     }
+    // All / Built-in / Edited filter (ui/012-skills-filter.js) — typeof-guarded cross-tier calls.
+    var hasFilter = typeof skillMatchesFilter === 'function';
+    var filter = hasFilter ? skillsFilterGet() : 'all';
+    if (slot && hasFilter && !slot.querySelector('.skills-filter-toggle')) {
+        var searchEl = slot.querySelector('.widget-library-search');
+        if (searchEl) searchEl.insertAdjacentHTML('afterend', skillsFilterToggleHtml());
+        else slot.insertAdjacentHTML('beforeend', skillsFilterToggleHtml());
+    }
     var layout = typeof pageLayoutGet === 'function' ? pageLayoutGet(SKILLS_PAGE_LAYOUT_KEY) : 'rows';
     if (typeof pageLayoutSyncButtons === 'function') pageLayoutSyncButtons(slot, layout);
     container.className = 'skills-list widget-library-items page-list layout-' + layout;
@@ -1167,9 +1178,15 @@ async function renderSkillsList() {
     var allSkills = Object.values(skills).filter(function(s) {
         return !(typeof isSkillDevHidden === 'function' && isSkillDevHidden(s.id));
     });
-    var skillList = allSkills.filter(function(s) { return skillMatchesQuery(s, q); });
+    var queryMatches = allSkills.filter(function(s) { return skillMatchesQuery(s, q); });
+    if (hasFilter) skillsFilterSync(slot, filter, skillFilterCounts(queryMatches));
+    var skillList = hasFilter ? queryMatches.filter(function(s) { return skillMatchesFilter(s, filter); }) : queryMatches;
     var countEl = slot ? slot.querySelector('.widget-library-count') : null;
-    if (countEl) countEl.textContent = q ? t('{shown} of {total}', { shown: skillList.length, total: allSkills.length }) : tn(allSkills.length, '{count} skill', '{count} skills');
+    if (countEl) countEl.textContent = (q || filter !== 'all') ? t('{shown} of {total}', { shown: skillList.length, total: allSkills.length }) : tn(allSkills.length, '{count} skill', '{count} skills');
+    if (allSkills.length > 0 && skillList.length === 0 && !q) {
+        container.innerHTML = '<div class="skills-empty"><span class="skills-empty-icon">' + UI_ICONS.skill + '</span><p>' + (filter === 'edited' ? t('No edited skills') : t('No built-in skills')) + '</p><p class="skills-empty-hint">' + t('Built-in skills you modify show up under Edited.') + '</p></div>';
+        return;
+    }
     if (allSkills.length > 0 && skillList.length === 0) {
         container.innerHTML = '<div class="skills-empty"><span class="skills-empty-icon">' + UI_ICONS.search + '</span><p>' + t('No skills match \u201c{query}\u201d', { query: escapeHtml(q) }) + '</p><p class="skills-empty-hint">' + t('Search looks at skill names, ids, descriptions and tags.') + '</p></div>';
         return;

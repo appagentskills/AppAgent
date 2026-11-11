@@ -8,6 +8,7 @@
 // transformMessageToAnthropic (background.js). Evaluates the REAL sources.
 'use strict';
 
+var EX = await runFile('test/extract.js', { i18n: false });
 function _bo_cut(source, start, end) {
     var a = source.indexOf(start);
     if (a < 0) throw new Error('Source extraction failed (start): ' + start);
@@ -16,12 +17,10 @@ function _bo_cut(source, start, end) {
     return source.slice(a, b);
 }
 function _bo_cutFn(source, name) {
-    var start = 'function ' + name + '(';
-    var a = source.indexOf(start);
-    if (a < 0) throw new Error('Source extraction failed: ' + name);
-    var b = source.indexOf('\n}\n', a);
-    if (b < 0) throw new Error('Source extraction failed (end): ' + name);
-    return source.slice(a, b + 3);
+    var f = EX.findFunction(source, name, { includeAsync: false });
+    if (!f) throw new Error('Source extraction failed: ' + name);
+    if (!(f.end > f.start)) throw new Error('Source extraction failed (end): ' + name);
+    return source.slice(f.start, f.end) + '\n';
 }
 
 async function loadReplay() {

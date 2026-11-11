@@ -4,21 +4,12 @@
 // Run: run_tests { pattern: 'regression-sweep-870-1136-part3' }
 'use strict';
 
-// Balanced-brace extraction (works for indented functions inside IIFEs too).
+// Code-mask extraction (test/extract.js; works for indented functions inside IIFEs too).
+var EX = await runFile('test/extract.js', { i18n: false });
 function decl(src, name) {
-    var start = src.indexOf('function ' + name + '(');
-    if (start < 0) throw new Error('missing declaration ' + name);
-    if (src.slice(start - 6, start) === 'async ') start -= 6;
-    var i = src.indexOf('{', src.indexOf(')', start)), depth = 0, q = null;
-    for (; i < src.length; i++) {
-        var c = src[i];
-        if (q) { if (c === '\\') { i++; continue; } if (c === q) q = null; continue; }
-        if (c === '"' || c === "'" || c === '`') { q = c; continue; }
-        if (c === '/' && src[i + 1] === '/') { i = src.indexOf('\n', i); continue; }
-        if (c === '{') depth++;
-        else if (c === '}') { depth--; if (depth === 0) break; }
-    }
-    var code = src.slice(start, i + 1);
+    var f = EX.findFunction(src, name);   // includes a leading 'async '
+    if (!f) throw new Error('missing declaration ' + name);
+    var code = src.slice(f.start, f.end);
     new Function(code);
     return code;
 }

@@ -2,6 +2,7 @@
 // record with no loop yet. Real core/097 registry + ui/175 renderers via
 // loadModules; _chipKey (nested in the _wireSubAgentUi IIFE) is cut from the
 // real source. Globals stub only IDB/chrome/runtime plumbing.
+var EX = await runFile('test/extract.js', { i18n: false });
 var T = { tags: ['unit'], timeout: 8000 };
 var quiet = { log: function() {}, warn: function() {}, error: function() {}, info: function() {} };
 var REG = ['src/js/core/095-handle-registry.js', 'src/js/core/097-sub-agent-registry.js'];
@@ -36,14 +37,12 @@ async function loadUi(SA) {
         UI_ICONS: { bot: 'BOT', thinking: 'THINK' }, getToolIcon: function(t) { return 'TI:' + t; }
     } });
 }
-// Cut the nested `function _chipKey() {...}` by brace matching (no braces in its strings/comments).
+// Cut the nested `function _chipKey() {...}` with the code-mask extractor (test/extract.js).
 async function chipKeyFn(env) {
     var src = await loadFile('src/js/ui/175-sub-agent-ui.js');
-    var a = src.indexOf('function _chipKey() {');
-    assert.ok(a > 0, '_chipKey declaration present');
-    var i = src.indexOf('{', a), depth = 0, b = -1;
-    for (; i < src.length; i++) { if (src[i] === '{') depth++; else if (src[i] === '}') { depth--; if (!depth) { b = i + 1; break; } } }
-    return new Function('env', 'with (env) { return (' + src.slice(a, b) + '); }')(env);
+    var f = EX.findFunction(src, '_chipKey', { includeAsync: false });
+    assert.ok(f && f.start > 0, '_chipKey declaration present');
+    return new Function('env', 'with (env) { return (' + src.slice(f.start, f.end) + '); }')(env);
 }
 
 describe('pool queue visibility (core/097)', function() {

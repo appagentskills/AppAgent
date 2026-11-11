@@ -7,15 +7,15 @@
 // (core/097) as the notice producer.
 // Run: run_tests { files: ['test/sub-notice-render.test.js'] }
 'use strict';
+var EX = await runFile('test/extract.js', { i18n: false });
 var ui = await loadFile('src/js/ui/175-sub-agent-ui.js');
 var render = await loadFile('src/js/ui/250-message-render.js');
 var emojiSrc = await loadFile('src/js/core/055-emoji-shortcodes.js');
 
-function declaration(source, name, indent) {
-    var start = source.indexOf('function ' + name + '(');
-    var end = source.indexOf('\n' + (indent || '') + '}', start);
-    if (start < 0 || end < 0) throw new Error('missing declaration ' + name);
-    return source.slice(start, end + (indent || '').length + 2);
+function declaration(source, name, indent) {   // indent: kept for callers; the code mask finds the real closing brace
+    var f = EX.findFunction(source, name, { includeAsync: false });
+    if (!f) throw new Error('missing declaration ' + name);
+    return source.slice(f.start, f.end);
 }
 function topVar(source, name) {
     var m = source.match(new RegExp('^var ' + name + ' = .*;$', 'm'));

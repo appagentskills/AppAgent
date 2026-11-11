@@ -4,6 +4,7 @@
 // injectInterceptors slice against a fake chrome.scripting, then the injected func
 // against a fake page window whose postMessage queue is drained like the browser's
 // (one message event per post; window.event is set while it is dispatched).
+var EX = await runFile('test/extract.js', { i18n: false });
 describe('S0C4-06: console interceptor does not loop (background.js injectInterceptors)', function() {
     function between(text, start, end) {
         var a = text.indexOf(start), b = text.indexOf(end, a + start.length);
@@ -333,7 +334,8 @@ describe('TA4-3: Claude OAuth logout fences an in-flight login/renew (background
             '\nreturn { renewClaudeToken: renewClaudeToken, CLAUDE_OAUTH: CLAUDE_OAUTH,' +
             ' inFlight: function() { return claudeRenewInFlight; },' +
             ' ageLastFailure: function(ms) { claudeRenewLastFailure.at -= ms; },' +
-            ' lastFailure: function() { return claudeRenewLastFailure; } };')
+            ' lastFailure: function() { return claudeRenewLastFailure; },' +
+            ' ageQuiesce: function(ms) { claudeOAuthQuiescedUntil -= ms; } };')
             .apply(null, names.map(function(n) { return deps[n]; }));
         assert.strictEqual(typeof h.listener, 'function', 'the OAuth listener is registered');
         h.until = async function(pred, label) {
@@ -548,7 +550,7 @@ describe('TA4-3: Claude OAuth logout fences an in-flight login/renew (background
     test('CLI client: the status poll does not refresh a token that is not near expiry', async function() {
         var exp = Date.now() + 3600 * 1000;
         var h = await oauthHarness({ claudeOAuth: { accessToken: 'ok', refreshToken: 'rt-1', expiresAt: exp } });
-        assert.deepStrictEqual(await h.post({ type: 'claude-oauth-status' }).wait(), { loggedIn: true, expired: false, expiresAt: exp, lastRenew: null });
+        assert.deepStrictEqual(await h.post({ type: 'claude-oauth-status' }).wait(), { loggedIn: true, expired: false, expiresAt: exp, lastRenew: null, lastRefreshError: null });
         assert.strictEqual(h.fetches.length, 0);
     }, { tags: ['unit'], timeout: 2000 });
 
@@ -717,7 +719,9 @@ describe('TA4-3: Claude OAuth logout fences an in-flight login/renew (background
         h.fetches[3].resolve(errJson(403, { error: { details: { error_code: 'session_stale_relogin' } } }));
         var se = (await s).err;
         assert.strictEqual(se.claudeSessionStale, true);
-        assert.strictEqual(se.message, 'Your claude.ai session needs a fresh sign-in (session_stale_relogin). Sign out of https://claude.ai and back in, then retry.');
+        assert.strictEqual(se.message, 'Your claude.ai session needs a fresh sign-in (session_stale_relogin). Sign out of https://claude.ai and back in, then retry.' +
+            ' (Token refresh rejected 400 invalid_grant: refresh token rejected.)');
+        assert.strictEqual(se.claudeRefreshCause, 'rejected');
 
         h.bg.ageLastFailure(5 * 60 * 1000 + 1);
         var later = h.post({ type: 'claude-oauth-status' });
@@ -727,6 +731,133 @@ describe('TA4-3: Claude OAuth logout fences an in-flight login/renew (background
         var lr = await later.wait();
         assert.strictEqual(lr.expired, false);
         assert.strictEqual(lr.lastRenew.path, 'refresh');
+        assert.strictEqual(lr.lastRefreshError.cause, 'rejected', 'a later successful renew keeps the evidence');
+    }, { tags: ['unit'], timeout: 2000 });
+
+    // REFRESH-LOSS: sha256('abc') = ba7816bf..., so a refresh token 'abc' has fingerprint 'ba7816bf'.
+    function seedAbc(marker) {
+        var s = { claudeOAuth: { accessToken: 'old', refreshToken: 'abc', expiresAt: 1 } };
+        if (marker) s.claudeOAuthRefreshPending = marker;
+        return s;
+    }
+    test('REFRESH-LOSS: marker from another SW lifetime + invalid_grant -> lost-after-restart; kept across login; cleared on explicit clear', async function() {
+        var h = await oauthHarness(seedAbc({ at: 1, tokenFingerprint: 'ba7816bf', sw: 'old-sw' }));
+        var s = settle(h.bg.renewClaudeToken(h.store.claudeOAuth));
+        await h.fetched(1);
+        var m = h.store.claudeOAuthRefreshPending;
+        assert.strictEqual(m.tokenFingerprint, 'ba7816bf', 'marker persisted before the fetch; fingerprint = sha256 prefix');
+        assert.notStrictEqual(m.sw, 'old-sw');
+        assert.ok(!/abc/.test(JSON.stringify(m)), 'marker never holds the token');
+        h.fetches[0].resolve(errJson(400, { error: 'invalid_grant' }));
+        await h.fetched(2);
+        h.fetches[1].resolve(errJson(403, { error: { details: { error_code: 'session_stale_relogin' } } }));
+        var se = (await s).err;
+        assert.strictEqual(se.claudeRefreshCause, 'lost-after-restart');
+        assert.match(se.message, /session_stale_relogin.*\(Token refresh lost-after-restart 400 invalid_grant: lost to a reload mid-refresh\.\)$/);
+        assert.ok(!/abc/.test(h.logs.join('\n') + JSON.stringify(h.store.claudeOAuthLastRefreshError)), 'refresh token never logged nor in the evidence');
+        var rec = h.store.claudeOAuthLastRefreshError;
+        assert.deepStrictEqual([rec.cause, rec.status, rec.errorCode], ['lost-after-restart', 400, 'invalid_grant']);
+        assert.ok(rec.body.length <= 300);
+        assert.strictEqual('claudeOAuthRefreshPending' in h.store, false, 'an HTTP rejection settles the marker');
+        // A successful login does NOT overwrite the evidence.
+        var login = h.post({ type: 'claude-oauth-login' });
+        await h.fetched(3);
+        h.fetches[2].resolve(okJson(AUTH_OK));
+        await h.fetched(4);
+        h.fetches[3].resolve(okJson({ access_token: 'new', refresh_token: 'rt-2', expires_in: 28800 }));
+        assert.strictEqual((await login.wait()).success, true);
+        assert.strictEqual(h.store.claudeOAuthLastRefreshError.cause, 'lost-after-restart');
+        assert.strictEqual((await h.post({ type: 'claude-oauth-status' }).wait()).lastRefreshError.cause, 'lost-after-restart');
+        assert.deepStrictEqual(await h.post({ type: 'claude-oauth-clear-refresh-error' }).wait(), { success: true });
+        assert.strictEqual('claudeOAuthLastRefreshError' in h.store, false);
+        assert.strictEqual((await h.post({ type: 'claude-oauth-status' }).wait()).lastRefreshError, null);
+    }, { tags: ['unit'], timeout: 2000 });
+
+    test('REFRESH-LOSS: mismatched marker -> rejected; network error keeps the marker; no refresh token; logout clears all', async function() {
+        var h = await oauthHarness(seedAbc({ at: 1, tokenFingerprint: 'deadbeef', sw: 'old-sw' }));
+        var s = settle(h.bg.renewClaudeToken(h.store.claudeOAuth));
+        await h.fetched(1);
+        h.fetches[0].resolve(errJson(400, { error: 'invalid_grant' }));
+        await h.fetched(2);
+        h.fetches[1].resolve(errJson(500, { error: 'boom' }));
+        await s;
+        assert.strictEqual(h.store.claudeOAuthLastRefreshError.cause, 'rejected');
+
+        var s2 = settle(h.bg.renewClaudeToken(h.store.claudeOAuth));
+        await h.fetched(3);
+        h.fetches[2].reject(new Error('Failed to fetch'));
+        await h.fetched(4);
+        h.fetches[3].resolve(errJson(500, { error: 'boom' }));
+        await s2;
+        assert.strictEqual(h.store.claudeOAuthLastRefreshError.cause, 'network');
+        assert.strictEqual(h.store.claudeOAuthLastRefreshError.status, null);
+        assert.strictEqual(h.store.claudeOAuthRefreshPending.tokenFingerprint, 'ba7816bf', 'network error keeps the marker');
+        await h.logout();
+        assert.strictEqual('claudeOAuthLastRefreshError' in h.store, false);
+        assert.strictEqual('claudeOAuthRefreshPending' in h.store, false);
+
+        var h2 = await oauthHarness({ claudeOAuth: { accessToken: 'old', expiresAt: 1 } });
+        var s3 = settle(h2.bg.renewClaudeToken(h2.store.claudeOAuth));
+        await h2.fetched(1);
+        assert.match(h2.fetches[0].url, /authorize$/);
+        h2.fetches[0].resolve(errJson(403, { error: { details: { error_code: 'session_stale_relogin' } } }));
+        assert.match((await s3).err.message, /\(Token refresh no-refresh-token: no refresh token stored\.\)$/);
+    }, { tags: ['unit'], timeout: 2000 });
+
+    test('RELOAD-QUIESCE: waits for the in-flight refresh to persist, refuses new renewals, bounded by timeoutMs', async function() {
+        var idle = await oauthHarness(expiredWithRefresh());
+        assert.deepStrictEqual(await idle.post({ type: 'claude-oauth-quiesce' }).wait(), { outcome: 'idle' });
+
+        var h = await oauthHarness(expiredWithRefresh());
+        var r = settle(h.bg.renewClaudeToken(h.store.claudeOAuth));
+        await h.fetched(1);
+        var q = h.post({ type: 'claude-oauth-quiesce' });
+        var login = await h.post({ type: 'claude-oauth-login' }).wait();
+        assert.match(login.error, /extension is reloading/, 'a NEW login is refused fast');
+        assert.strictEqual(h.fetches.length, 1, 'and makes no request');
+        assert.strictEqual(q.done, false, 'quiesce waits for the in-flight refresh');
+        h.fetches[0].resolve(okJson({ access_token: 'fresh', refresh_token: 'rt-2', expires_in: 28800 }));
+        assert.deepStrictEqual(await q.wait(), { outcome: 'settled', via: 'renew' });
+        assert.strictEqual((await r).ok.refreshToken, 'rt-2');
+        assert.strictEqual(h.store.claudeOAuth.refreshToken, 'rt-2', 'rotated token persisted before the reply');
+        assert.strictEqual('claudeOAuthRefreshPending' in h.store, false);
+        var late = await settle(h.bg.renewClaudeToken({ accessToken: 'x', refreshToken: 'rt-2', expiresAt: 1 }));
+        assert.strictEqual(late.err.claudeOAuthQuiescing, true);
+        assert.strictEqual(h.bg.lastFailure(), null, 'a quiesce refusal is no back-off failure');
+
+        var t = await oauthHarness(expiredWithRefresh());
+        settle(t.bg.renewClaudeToken(t.store.claudeOAuth));
+        await t.fetched(1);
+        var box = { reply: null };
+        t.listener({ type: 'claude-oauth-quiesce', timeoutMs: 20 }, {}, function(x) { box.reply = x; });
+        await new Promise(function(res) { setTimeout(res, 80); });
+        assert.deepStrictEqual(box.reply, { outcome: 'timeout', via: 'renew' });
+    }, { tags: ['unit'], timeout: 3000 });
+
+    test('RELOAD-QUIESCE: the renewal block expires if the reload never happens', async function() {
+        var h = await oauthHarness(expiredWithRefresh());
+        assert.deepStrictEqual(await h.post({ type: 'claude-oauth-quiesce', timeoutMs: 50 }).wait(), { outcome: 'idle' });
+        var refused = await settle(h.bg.renewClaudeToken(h.store.claudeOAuth));
+        assert.strictEqual(refused.err.claudeOAuthQuiescing, true, 'blocked right after the quiesce');
+        assert.strictEqual(h.fetches.length, 0);
+        h.bg.ageQuiesce(50 + 30000 + 1); // past timeoutMs + CLAUDE_OAUTH_QUIESCE_HOLD_MS
+        var r = settle(h.bg.renewClaudeToken(h.store.claudeOAuth));
+        await h.fetched(1);
+        assert.strictEqual(h.fetches[0].body.grant_type, 'refresh_token', 'renewals resume after the hold');
+        h.fetches[0].resolve(okJson({ access_token: 'fresh', refresh_token: 'rt-2', expires_in: 28800 }));
+        assert.strictEqual((await r).ok.refreshToken, 'rt-2');
+        assert.strictEqual('claudeOAuthRefreshPending' in h.store, false, 'marker cleared on success');
+    }, { tags: ['unit'], timeout: 2000 });
+
+    test('REFRESH-LOSS: a logout during the marker write fences the refresh (no fetch, no leftover marker)', async function() {
+        var h = await oauthHarness(expiredWithRefresh());
+        var r = settle(h.bg.renewClaudeToken(h.store.claudeOAuth));
+        var lo = h.post({ type: 'claude-oauth-logout' });
+        assert.strictEqual((await r).err.claudeOAuthStale, true);
+        assert.deepStrictEqual(await lo.wait(), { success: true });
+        assert.strictEqual(h.fetches.length, 0, 'the refresh token was not spent');
+        assert.strictEqual('claudeOAuthRefreshPending' in h.store, false);
+        assert.strictEqual(h.bg.inFlight(), null, 'single-flight slot released');
     }, { tags: ['unit'], timeout: 2000 });
 
     test('hardening: exact request shape (real CLAUDE_OAUTH) for refresh, authorize and code exchange', async function() {
@@ -858,9 +989,121 @@ describe('TA4-3: Claude OAuth logout fences an in-flight login/renew (background
         assert.ok(!/sk-ant-|SECRET/.test(warn[0]), 'no secret in warn: ' + warn[0]);
         assert.match(warn[0], /\[redacted\]/);
         assert.ok(warn[0].length < 300, 'capped: ' + warn[0].length);
+        var ev = JSON.stringify(h.store.claudeOAuthLastRefreshError);
+        assert.ok(!/sk-ant-|SECRET/.test(ev), 'no secret in the persisted evidence: ' + ev);
+        assert.ok(h.store.claudeOAuthLastRefreshError.body.length <= 300);
+        assert.strictEqual(h.store.claudeOAuthLastRefreshError.errorCode, 'invalid_grant', 'only the leading code identifier is kept');
         h.fetches[1].resolve(okJson(AUTH_OK));
         await h.fetched(3);
         h.fetches[2].resolve(okJson({ access_token: 'a2', refresh_token: 'rt-2', expires_in: 3600 }));
         assert.strictEqual((await renew.wait()).success, true);
+    }, { tags: ['unit'], timeout: 2000 });
+});
+
+// RELOAD-QUIESCE, page side: _prepareRealmsForReload (270-iframe-panel.js)
+// evaluated from the real source with a fake clock and a stub chrome.runtime.
+describe('reload prepare quiesces Claude OAuth (270-iframe-panel.js)', function() {
+    async function panelHarness(opts) {
+        opts = opts || {};
+        var src = await loadFile('src/js/ui/270-iframe-panel.js');
+        var a = src.indexOf('var RELOAD_OAUTH_QUIESCE_MS');
+        var fnAt = src.indexOf('function _prepareRealmsForReload()');
+        var b = fnAt < 0 ? -1 : EX.blockFrom(src, fnAt).end - 2;   // code-mask end (test/extract.js)
+        assert.ok(a > 0 && fnAt > a && b > fnAt, 'quiesce + prepare functions found in the source');
+        var h = { now: 0, timers: [], sent: [], callbacks: [], posted: [], closed: 0 };
+        h.setTimeout = function(fn, ms) { var t = { at: h.now + (ms || 0), fn: fn }; h.timers.push(t); return t; };
+        h.clearTimeout = function(t) { h.timers = h.timers.filter(function(x) { return x !== t; }); };
+        h.advance = async function(ms) {
+            var end = h.now + ms;
+            for (;;) {
+                var due = h.timers.filter(function(t) { return t.at <= end; }).sort(function(x, y) { return x.at - y.at; })[0];
+                if (!due) break;
+                h.timers = h.timers.filter(function(t) { return t !== due; });
+                h.now = due.at;
+                due.fn();
+                for (var i = 0; i < 10; i++) await Promise.resolve();
+            }
+            h.now = end;
+            for (var j = 0; j < 10; j++) await Promise.resolve();
+        };
+        var chrome = opts.noChrome ? undefined : { runtime: {
+            lastError: undefined,
+            sendMessage: function(msg, cb) {
+                if (opts.throws) throw new Error('Extension context invalidated.');
+                h.sent.push(msg); h.callbacks.push(cb);
+            }
+        } };
+        var deps = {
+            chrome: chrome, setTimeout: h.setTimeout, clearTimeout: h.clearTimeout,
+            _openAgentBus: function() {},
+            _agentBusPort: { postMessage: function(m) { h.posted.push(m); } },
+            closeDatabase: function() { h.closed++; }
+        };
+        var names = Object.keys(deps);
+        h.m = new Function(names.join(','), src.slice(a, b + 2) +
+            '\nreturn { prepare: _prepareRealmsForReload, quiesce: _quiesceClaudeOAuthForReload, CAP: RELOAD_OAUTH_QUIESCE_MS };')
+            .apply(null, names.map(function(n) { return deps[n]; }));
+        h.track = function(p) {
+            var box = { done: false, value: undefined, rejected: false };
+            p.then(function(v) { box.done = true; box.value = v; }, function(e) { box.done = true; box.rejected = true; box.value = e; });
+            return box;
+        };
+        return h;
+    }
+
+    test('sends claude-oauth-quiesce and waits for the SW reply before resolving', async function() {
+        var h = await panelHarness();
+        var p = h.track(h.m.prepare());
+        assert.deepStrictEqual(h.sent, [{ type: 'claude-oauth-quiesce' }]);
+        assert.deepStrictEqual(h.posted, [{ type: 'prepare-reload' }]);
+        assert.strictEqual(h.closed, 1);
+        await h.advance(5000);
+        assert.strictEqual(p.done, false, 'the 250ms settle alone does not release the reload');
+        h.callbacks[0]({ outcome: 'settled', via: 'renew' });
+        await h.advance(0);
+        assert.deepStrictEqual([p.done, p.rejected, p.value], [true, false, undefined]);
+        assert.strictEqual(h.timers.length, 0, 'quiesce cap timer cleared on reply');
+    }, { tags: ['unit'], timeout: 2000 });
+
+    test('a silent SW never hangs the reload past the ~10.5s cap', async function() {
+        var h = await panelHarness();
+        assert.strictEqual(h.m.CAP, 10500);
+        var p = h.track(h.m.prepare());
+        var q = h.track(h.m.quiesce());
+        await h.advance(10499);
+        assert.strictEqual(p.done, false);
+        await h.advance(1);
+        assert.deepStrictEqual([p.done, p.rejected], [true, false]);
+        assert.deepStrictEqual([q.done, q.value], [true, 'timeout']);
+        h.callbacks[0]({ outcome: 'settled' }); // a late reply is ignored
+        await h.advance(0);
+        assert.strictEqual(q.value, 'timeout');
+    }, { tags: ['unit'], timeout: 2000 });
+
+    test('SW errors never reject: throw, no chrome, lastError/no reply', async function() {
+        var t = await panelHarness({ throws: true });
+        var pt = t.track(t.m.prepare());
+        var qt = t.track(t.m.quiesce());
+        await t.advance(250);
+        assert.deepStrictEqual([pt.done, pt.rejected], [true, false], 'released by the settle alone');
+        assert.strictEqual(qt.value, 'threw');
+
+        var n = await panelHarness({ noChrome: true });
+        var pn = n.track(n.m.prepare());
+        await n.advance(250);
+        assert.deepStrictEqual([pn.done, pn.rejected], [true, false]);
+        var qn = n.track(n.m.quiesce());
+        await n.advance(0);
+        assert.strictEqual(qn.value, 'unavailable');
+
+        var e = await panelHarness();
+        var pe = e.track(e.m.prepare());
+        e.callbacks[0](undefined); // chrome.runtime.lastError path: no response
+        await e.advance(250);
+        assert.deepStrictEqual([pe.done, pe.rejected], [true, false]);
+        var qe = e.track(e.m.quiesce());
+        e.callbacks[1]({});
+        await e.advance(0);
+        assert.strictEqual(qe.value, 'no-reply');
     }, { tags: ['unit'], timeout: 2000 });
 });

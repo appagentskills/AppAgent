@@ -1,8 +1,10 @@
 // ============================================================
 // Keep-Awake feature
 // ------------------------------------------------------------
-// When the AppAgent chat page is open AND the user has been idle
-// for IDLE_MS, request the OS keep the display awake. Show an
+// When the AppAgent chat page is open AND the computer has been idle
+// for 15 s (chrome.idle, shared with ui/220 via subscribeOsIdleState),
+// request the OS keep the display awake. Without chrome.idle the old
+// in-page activity timer (IDLE_MS) is the fallback. Show an
 // inline notice with "Disable for this session" and "Disable
 // forever" buttons. Release the lock on any user activity, tab
 // hide, or unload.
@@ -13,7 +15,8 @@
     // Only run inside the browser extension build (chrome.runtime.sendMessage available).
     if (typeof chrome === 'undefined' || !chrome.runtime || !chrome.runtime.sendMessage) return;
 
-    var IDLE_MS = 5 * 60 * 1000;       // 5 minutes
+    var IDLE_MS = 5 * 60 * 1000;       // fallback only (no chrome.idle): 5 minutes without page activity
+    var osIdleMode = false;            // true once subscribed to the shared chrome.idle source (15 s, machine-wide)
     var HEARTBEAT_MS = 20 * 1000;      // 20s — must be < MV3 service-worker idle timeout (~30s)
     var idleTimer = null;
     var heartbeatTimer = null;
@@ -83,7 +86,8 @@
     // Single source of truth for whether the OS display lock should be held.
     // PRIMARY trigger: an agent run is in progress (long tasks must keep the
     // screen on even with zero mouse/keyboard activity). SECONDARY trigger:
-    // the user has been idle for IDLE_MS while just reading. The master
+    // the computer has been idle (chrome.idle, 15 s; fallback IDLE_MS of no
+    // page activity) while the user is just reading. The master
     // setting (foreverDisabled) turns the whole feature off; the per-session
     // opt-out ("Disable this session") also turns it off — for runs too — until
     // the page reloads (H17: the user asked for the display lock to go away).
@@ -109,16 +113,20 @@
         }
     }
 
-    // Idle threshold reached. Flag the idle desire and (only for the idle path,
-    // and only when no run is already holding the lock) show the inline notice.
+    // Idle threshold reached. Flag the idle desire and show the inline notice.
+    // IDLE-NOTICE: shown even when an agent run already holds the lock. The
+    // notice used to be skipped then, but with the 15 s chrome.idle threshold
+    // the user is typically idle *while a run streams*, so it never appeared
+    // (and nothing re-showed it when the run ended with the machine still
+    // idle). "Disable this session" releases run locks too (H17), so the
+    // notice is meaningful either way.
     function activateLock() {
         if (foreverDisabled || sessionDisabled) return;
         if (document.hidden) return;
         if (noticeFadeTimer) { clearTimeout(noticeFadeTimer); noticeFadeTimer = null; }
-        var hadRunLock = anyRunActive();
         idleActivated = true;
         syncLock();
-        if (!noticeDismissed && !hadRunLock) showNotice();
+        if (!noticeDismissed) showNotice();
     }
 
     // Drop the idle-based desire (user is active again). Any active-run lock is
@@ -148,15 +156,46 @@
         hideNotice();
     }
 
+    // NOTICE-CONSISTENCY: with chrome.idle the OS is the authority on idleness.
+    // 'scroll' and 'mousemove' also fire WITHOUT user input — streaming
+    // auto-scroll (core/050) and Chrome's synthetic mousemove when layout moves
+    // under a still cursor. While chrome.idle says idle they used to clear the
+    // hold and fade the notice 10 s later, and chrome.idle (transition-only)
+    // never re-fired 'idle', so the notice only stuck when nothing streamed.
+    // Real input flips chrome.idle to 'active', which clears the hold anyway.
+    function isPassiveActivityWhileOsIdle(evt) {
+        if (!osIdleMode || !evt) return false;
+        var st;
+        try { st = (typeof getOsIdleState === 'function') ? getOsIdleState() : 'active'; } catch (e) { st = 'active'; }
+        if (st !== 'idle') return false;
+        return evt.isTrusted === false || evt.type === 'scroll' || evt.type === 'mousemove';
+    }
+
     function resetIdleTimer(evt) {
         // Activity inside the notice itself — user is reading/clicking buttons. Ignore.
         if (evt && evt.target && noticeEl && noticeEl.contains && noticeEl.contains(evt.target)) return;
+        if (isPassiveActivityWhileOsIdle(evt)) return;
         // Any user activity: drop the idle desire (a run lock, if any, persists).
         clearIdle(false);
         if (sessionDisabled || foreverDisabled || document.hidden) return;
         // Reset notice-dismissed flag so a fresh idle period shows the notice again.
         noticeDismissed = false;
+        // chrome.idle drives activation (onOsIdleState); the timer is the fallback only.
+        if (osIdleMode) return;
         idleTimer = setTimeout(activateLock, IDLE_MS);
+    }
+
+    // Shared chrome.idle state (ui/220, 15 s threshold). 'idle' -> hold the
+    // display. 'locked' -> release the idle hold and hide the notice: a locked
+    // screen gains nothing from staying lit. 'active' -> drop the idle desire
+    // (grace period for the notice). Run locks persist via syncLock() either way.
+    function onOsIdleState(state) {
+        if (state === 'idle') { activateLock(); return; }
+        clearIdle(state === 'locked');
+        // NOTICE-CONSISTENCY: an idle period ended, so the next one shows the
+        // notice again even if the user dismissed it and then worked in another
+        // window (no page events -> resetIdleTimer never reset the flag).
+        noticeDismissed = false;
     }
 
     // ---------- Agent-run tracking (primary keep-awake trigger) ----------
@@ -265,8 +304,14 @@
         // Hiding the panel drops the idle desire but NOT an active-run lock
         // (chrome.power is machine-global, so the screen should stay awake
         // while a run streams even if this document is backgrounded).
-        if (document.hidden) clearIdle(true);
-        else resetIdleTimer();
+        if (document.hidden) { clearIdle(true); return; }
+        resetIdleTimer();
+        // NOTICE-CONSISTENCY: shown again while the machine is still idle (or
+        // chrome.idle went idle while hidden, where activateLock bails):
+        // onStateChanged won't fire again, so re-hold now.
+        try {
+            if (osIdleMode && typeof getOsIdleState === 'function' && getOsIdleState() === 'idle') activateLock();
+        } catch (e) {}
     }
 
     function attachListeners() {
@@ -301,8 +346,17 @@
                 for (var cid in runningChatIds) { if (runningChatIds[cid]) runningChats[cid] = true; }
             }
         } catch (e) {}
+        // Subscribe before resetIdleTimer() so no fallback timer is armed when
+        // chrome.idle is available. false (no chrome.idle) keeps the timer path.
+        try {
+            if (typeof subscribeOsIdleState === 'function') osIdleMode = !!subscribeOsIdleState(onOsIdleState);
+        } catch (e) { osIdleMode = false; }
         resetIdleTimer();
         syncLock();
+        // Already idle when this page loaded: hold now rather than at the next change.
+        try {
+            if (osIdleMode && typeof getOsIdleState === 'function' && getOsIdleState() === 'idle') activateLock();
+        } catch (e) {}
     }
 
     // A8B-02: keep both twins (gear #keep-awake-checkbox, Settings-page
@@ -424,12 +478,17 @@
             idleTimerArmed: !!idleTimer,
             heartbeatRunning: !!heartbeatTimer,
             idleMs: IDLE_MS,
+            osIdleMode: osIdleMode,
             heartbeatMs: HEARTBEAT_MS,
-            documentHidden: document.hidden
+            documentHidden: document.hidden,
+            osIdleState: (function () { try { return typeof getOsIdleState === 'function' ? getOsIdleState() : null; } catch (e) { return null; } })(),
+            noticeVisible: !!noticeEl,
+            noticeDismissed: noticeDismissed,
+            noticeFading: !!noticeFadeTimer
         };
         return s;
     };
-    // Manual force-on for testing — bypasses the 5-min wait.
+    // Manual force-on for testing — bypasses the idle wait.
     window.keepAwakeForceOn = function () {
         if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
         activateLock();

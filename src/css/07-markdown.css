@@ -22,6 +22,11 @@
 .code-block { background: var(--bg-code); color: var(--text-heading); padding: var(--space-6) var(--space-8); padding-right: 30px; border-radius: var(--radius-lg); overflow-x: auto; font-family: var(--font-mono); font-size: var(--text-body); margin: 0; line-height: var(--leading-relaxed); border: 1px solid var(--border); max-height: none; overflow-y: visible; white-space: pre-wrap; word-break: break-word; box-shadow: var(--shadow-sm); }
 .code-block.collapsed { max-height: 200px; overflow-y: auto; white-space: pre; word-break: normal; }
 .code-block code { background: none; padding: 0; color: inherit; }
+/* ```text / ```plaintext / ```txt blocks hold prose (email drafts, quoted
+   output), not code: wrap long lines and use the prose font. Real code
+   languages keep the monospace, no-wrap .code-block rules above. */
+.code-block.code-block-text,
+.code-block.code-block-text.collapsed { white-space: pre-wrap; word-break: normal; overflow-wrap: anywhere; font-family: var(--font-sans); line-height: 1.5; tab-size: 4; }
 .sh-keyword { color: var(--sh-keyword); font-weight: var(--font-medium); }
 .sh-string { color: var(--sh-string); }
 .sh-number { color: var(--sh-number); }

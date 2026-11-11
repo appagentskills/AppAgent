@@ -1,12 +1,12 @@
 // Run: run_tests { files: ['test/pdf-modal-download.test.js'] } (js_eval sandbox; no Node).
 // A3A2-01: the PDF modal's Download button must not double the .pdf extension.
 'use strict';
+var EX = await runFile('test/extract.js', { i18n: false });
 async function loadDownloadPdfFromModal(doc) {
     var src = await loadFile('src/js/app/050-image-attachments.js');
-    var start = src.indexOf('function downloadPdfFromModal(');
-    var end = src.indexOf('\n}', start);
-    assert.ok(start >= 0 && end > start, 'downloadPdfFromModal not found');
-    return new Function('document', src.slice(start, end + 2) + '\nreturn downloadPdfFromModal;')(doc);
+    var f = EX.findFunction(src, 'downloadPdfFromModal', { includeAsync: false });
+    assert.ok(f && f.end > f.start, 'downloadPdfFromModal not found');
+    return new Function('document', src.slice(f.start, f.end) + '\nreturn downloadPdfFromModal;')(doc);
 }
 function fakeDoc(dataset) {
     var links = [];
@@ -43,10 +43,9 @@ describe('pdf modal › download', function() {
 async function loadModalLifecycle(doc) {
     var src = await loadFile('src/js/ui/220-notification-system.js');
     var code = ['settlePendingModalResolve', 'resetModalContentMode', 'showModal', 'closeModal'].map(function(name) {
-        var start = src.indexOf('function ' + name + '(');
-        var end = src.indexOf('\n}', start);
-        assert.ok(start >= 0 && end > start, name + ' not found');
-        return src.slice(start, end + 2);
+        var f = EX.findFunction(src, name, { includeAsync: false });
+        assert.ok(f && f.end > f.start, name + ' not found');
+        return src.slice(f.start, f.end);
     }).join('\n');
     return new Function('document', 'screenshotNav', 'screenshotModalKeyHandler', 'sanitizeModalMessage',
         'normalizeModalVariant', 'escapeHtml', 'escapeJsString',

@@ -1,0 +1,19 @@
+/* Model pill: provider brand icon replaces the status dot.
+   The pill's own connected/disconnected text color tints the icon. */
+.model-status-dot.has-provider-icon {
+    width: 14px;
+    height: 14px;
+    min-width: 14px;
+    min-height: 14px;
+    border-radius: 0;
+    background: none !important;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: currentColor;
+}
+.model-status-dot.has-provider-icon svg {
+    width: 14px;
+    height: 14px;
+    display: block;
+}

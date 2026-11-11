@@ -1,6 +1,7 @@
 // Composer items 10 (picker) and 11 (Send -> Stop), driven through the REAL
 // handleKeyDown (app/040) / handleHomeKeyDown (ui/030) delegates and the real
 // ui/246 + ui/247 sources, with stub globals and a small fake DOM.
+var EX = await runFile('test/extract.js', { i18n: false });
 describe('composer picker (item 10) through the real keydown delegates', function() {
     var ICONS = { skill: '<svg>SK</svg>', compose: '<svg>DOC</svg>', chat: '<svg>CH</svg>', image: '<svg>IMG</svg>',
         pdf: '<svg>PDF</svg>', file: '<svg>FILE</svg>', code: '<svg>CODE</svg>', send: '<svg>SEND</svg>', stop: '<svg>STOP</svg>' };
@@ -12,11 +13,10 @@ describe('composer picker (item 10) through the real keydown delegates', functio
         return e;
     }
     function extractFn(src, name) {
-        var start = src.indexOf('function ' + name + '(');
-        assert.ok(start !== -1, name + ' declared');
-        var end = src.indexOf('\n}\n', start);
-        assert.ok(end !== -1, name + ' closed');
-        return src.slice(start, end + 2);
+        var f = EX.findFunction(src, name, { includeAsync: false });
+        assert.ok(f, name + ' declared');
+        assert.ok(f.end > f.start, name + ' closed');
+        return src.slice(f.start, f.end);
     }
     function makeDom() {
         var els = {}, docL = {};

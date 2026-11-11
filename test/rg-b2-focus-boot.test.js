@@ -11,6 +11,7 @@
 // Sandbox focus() does not move activeElement and there is no layout, so focus is observed
 // through per-element spies and visibility through an offsetParent getter on the shown gear.
 // Run: run_tests { files: ['test/rg-b2-focus-boot.test.js'] }
+var EX = await runFile('test/extract.js', { i18n: false });
 var WS = args.workspace; // resolved workspace, passed in by run_tests
 var FROM = "document.addEventListener('keydown', function(e) {\n        if (e.key !== 'Escape')";
 var TO = '// NAV-H7';
@@ -50,11 +51,11 @@ describe('RG-B2 part 3: settings focus return (ui/130) and ?doc= boot (core/120-
     // column-0 "}"), evaluated against `doc` plus the named deps (`pre` declares module vars).
     async function realFn(file, name, doc, deps, pre) {
         var src = await loadFile(file, WS);
-        var a = src.indexOf('\nfunction ' + name + '('), b = src.indexOf('\n}\n', a);
-        assert.ok(a >= 0 && b > a, name + ' found in ' + file);
+        var f = EX.findFunction(src, name, { includeAsync: false });
+        assert.ok(f && f.end > f.start, name + ' found in ' + file);
         deps = deps || {};
         var names = Object.keys(deps);
-        var body = (pre || '') + src.slice(a, b + 2) + '\nreturn ' + name + ';';
+        var body = (pre || '') + '\n' + src.slice(f.start, f.end) + '\nreturn ' + name + ';';
         return Function.apply(null, ['document'].concat(names, [body]))
             .apply(null, [doc].concat(names.map(function(k) { return deps[k]; })));
     }

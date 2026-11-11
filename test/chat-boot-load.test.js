@@ -11,6 +11,7 @@
 // UI effects are faked. No timers: every fake settles on microtasks.
 // fix-f1: the CURRENT chat leads the keep set (restored + repainted first),
 // and one test swaps the adoptChatRow stub for the REAL 045 guard + merges.
+var EX = await runFile('test/extract.js', { i18n: false });
 describe('chat boot load: per-batch payload strip (F1)', function() {
     var LOADER = 'src/js/ui/070-dashboard-ui.js';
     var FNS = ['loadChatsFromStorage', '_loadChatsFromStorageImpl', '_bootStripLoadedChat', '_chatsLoadCrumb'];
@@ -21,12 +22,10 @@ describe('chat boot load: per-batch payload strip (F1)', function() {
     // realDecl pattern (test/permissions-reset-confirm.test.js), over one read.
     function cutDecl(src, name, file) {
         file = file || LOADER;
-        var m = new RegExp('\\n(?:async )?function ' + name + '\\(').exec(src);
-        assert.ok(m, name + ' found in ' + file);
-        var a = m.index + 1;
-        var b = src.indexOf('\n}\n', a);
-        assert.ok(b > a, name + ' end found in ' + file);
-        return src.slice(a, b + 2);
+        var f = EX.findFunction(src, name);
+        assert.ok(f, name + ' found in ' + file);
+        assert.ok(f.end > f.start, name + ' end found in ' + file);
+        return src.slice(f.start, f.end);
     }
     function clone(o) { return JSON.parse(JSON.stringify(o)); }
     function big(ch, n) { return new Array(n + 1).join(ch); }

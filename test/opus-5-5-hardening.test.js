@@ -124,10 +124,11 @@ function fakeRes(status, body) {
     };
 }
 
-async function loadOAuthStream(responses) {
+async function loadOAuthStream(responses, opts) {
+    opts = opts || {};
     var bg = await loadFile('src/platform/extension/background.js');
     var fn = _cut(bg, 'async function runClaudeOAuthStream(', 'chrome.runtime.onConnect.addListener(function(port) {');
-    var calls = 0, bumps = 0;
+    var calls = 0, bumps = 0, reapplies = 0;
     var deps = {
         chrome: { storage: { local: { get: async function() { return { claudeOAuth: { accessToken: 't', expiresAt: Date.now() + 3600000 } }; } } } },
         fetch: async function() { var r = responses[calls++]; if (!r) throw new Error('unexpected extra fetch #' + calls); return r; },
@@ -135,7 +136,9 @@ async function loadOAuthStream(responses) {
         transformToAnthropic: function(b) { return { model: b.model }; },
         getAnthropicBetas: function() { return ''; },
         parseRequiredClaudeCliVersion: function(t) { var mm = /version (\d+\.\d+\.\d+) or newer/.exec(t || ''); return mm ? mm[1] : null; },
-        bumpClaudeCliVersion: async function() { bumps++; return true; },
+        bumpClaudeCliVersion: async function() { bumps++; return opts.bumpResult !== undefined ? opts.bumpResult : true; },
+        reapplyClaudeCliVersion: async function() { reapplies++; return true; },
+        compareSemver: function(a, b) { var pa = a.split('.'), pb = b.split('.'); for (var i = 0; i < 3; i++) { if (+pa[i] !== +pb[i]) return +pa[i] < +pb[i] ? -1 : 1; } return 0; },
         _claudeStreams: { active: 0, waiters: [] }, _claudeStreamEnded: function() {},
         _waitForFreeStreamSlot: async function() {}, _claudeAbortableDelay: async function() {},
         detectUsageExhaustion: function() { return null; }, refreshClaudeOrgUsage: async function() { return {}; },
@@ -144,7 +147,7 @@ async function loadOAuthStream(responses) {
     };
     var names = Object.keys(deps);
     var run = new Function(names.join(','), fn + '\nreturn runClaudeOAuthStream;').apply(null, names.map(function(k) { return deps[k]; }));
-    return { run: run, calls: function() { return calls; }, bumps: function() { return bumps; } };
+    return { run: run, calls: function() { return calls; }, bumps: function() { return bumps; }, reapplies: function() { return reapplies; } };
 }
 
 var GATE = JSON.stringify({ error: { error_code: 'claude_code_version_too_old', message: 'version 2.1.300 or newer is required.' } });
@@ -174,5 +177,29 @@ describe('fix 4: version-gate retry does not burn an attempt', function() {
         assert.strictEqual(err.length, 1);
         assert.ok(/^API error 400: /.test(err[0].error) && /2\.1\.300/.test(err[0].error), err[0].error);
         rs.forEach(function(r, i) { assert.ok(r.reads() <= 1, 'response #' + i + ' body read ' + r.reads() + 'x'); });
+    }, { tags: ['unit'], timeout: 10000 });
+
+    test('declined bump (already-applied version) force-reapplies and still retries once → success', async function() {
+        var ok = { status: 200, ok: true, headers: { get: function() { return null; }, forEach: function() {} }, body: { getReader: function() { return { read: function() { return Promise.resolve({ done: true }); } }; } } };
+        var m = await loadOAuthStream([fakeRes(400, GATE), ok], { bumpResult: false });
+        var out = [];
+        await m.run({ model: 'claude-fable-5-2' }, function(e) { out.push(e); }, null);
+        assert.strictEqual(m.reapplies(), 1);
+        assert.strictEqual(m.calls(), 2);
+        assert.strictEqual(out.filter(function(e) { return e.type === 'error'; }).length, 0, JSON.stringify(out));
+    }, { tags: ['unit'], timeout: 10000 });
+
+    test('a second gate demanding a HIGHER version gets one more retry; never more than 2', async function() {
+        var g2 = JSON.stringify({ error: { error_code: 'claude_code_version_too_old', message: 'version 2.1.310 or newer is required.' } });
+        var g3 = JSON.stringify({ error: { error_code: 'claude_code_version_too_old', message: 'version 2.1.320 or newer is required.' } });
+        var rs = [fakeRes(400, GATE), fakeRes(400, g2), fakeRes(400, g3)];
+        var m = await loadOAuthStream(rs);
+        var out = [];
+        await m.run({ model: 'claude-fable-5-2' }, function(e) { out.push(e); }, null);
+        assert.strictEqual(m.bumps(), 2);
+        assert.strictEqual(m.calls(), 3);
+        var err = out.filter(function(e) { return e.type === 'error'; });
+        assert.strictEqual(err.length, 1);
+        assert.ok(/2\.1\.320/.test(err[0].error), err[0].error);
     }, { tags: ['unit'], timeout: 10000 });
 });

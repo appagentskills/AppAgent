@@ -2,6 +2,7 @@
 // the chat's + its sub-agents' PRs (message scan + durable meta.prs stamps),
 // deduped by URL, with open/merged/closed state; _jobsCardPrChipsHtml renders
 // the pill row ('' when no PRs).
+var EX = await runFile('test/extract.js', { i18n: false });
 describe('active chat card PR chips (tools/120-actions.js)', function() {
     var M = null;
     async function load() {
@@ -35,7 +36,7 @@ describe('active chat card PR chips (tools/120-actions.js)', function() {
         if (R) return R;
         var src = await loadFile('src/js/ui/120-ui-utils.js');
         var a = src.indexOf('function renderPrSidebarItemHtml(');
-        var b = src.indexOf('\n}\n', a);
+        var b = a < 0 ? -1 : EX.blockFrom(src, a).end - 2;   // code-mask end (test/extract.js)
         var esc = function(x) { return String(x).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;'); };
         var icons = { gitBranch: '<i>b</i>', gitMerge: '<i>m</i>', spinner: '<i>s</i>', close: '<i>x</i>', externalLink: '<i>e</i>' };
         R = new Function('escapeHtml', 't', 'UI_ICONS', src.slice(a, b + 2) + '\nreturn renderPrSidebarItemHtml;')(esc, function(x) { return x; }, icons);

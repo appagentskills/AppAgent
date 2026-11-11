@@ -3,6 +3,7 @@
 // dispatches to the service worker, or reads/writes a live chat or settings value.
 'use strict';
 
+var EX = await runFile('test/extract.js', { i18n: false });
 function runChatNavigationAudit(sources) {
     var results = [];
     var navigation = sources['src/js/ui/170-chat-management.js'];
@@ -18,10 +19,9 @@ function runChatNavigationAudit(sources) {
     // These production declarations use column-zero closing braces. Fail loudly
     // if that convention changes instead of silently testing a different excerpt.
     function declaration(source, name) {
-        var start = source.indexOf('function ' + name + '(');
-        var end = source.indexOf('\n}', start);
-        check(start >= 0 && end > start, 'Missing declaration: ' + name);
-        var code = source.slice(start, end + 2);
+        var f = EX.findFunction(source, name, { includeAsync: false });
+        check(!!f && f.end > f.start, 'Missing declaration: ' + name);
+        var code = source.slice(f.start, f.end);
         new Function(code); // Syntax-check the exact excerpt before executing it.
         return code;
     }

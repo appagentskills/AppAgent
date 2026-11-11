@@ -1,12 +1,13 @@
 // PR chip hover flash: identical sidebar/doc re-renders must not replace nodes.
 // Run: run_tests { files: ['test/sidebar-hover-flash.test.js'] }
+var EX = await runFile('test/extract.js', { i18n: false });
 var WS = args.workspace;
 
 async function sliceFn(file, name) {
     var src = await loadFile(file, WS);
-    var a = src.indexOf('\nfunction ' + name + '('), b = src.indexOf('\n}\n', a);
-    if (a < 0 || b < a) throw new Error(name + ' not found in ' + file);
-    return src.slice(a, b + 2);
+    var f = EX.findFunction(src, name, { includeAsync: false });
+    if (!f || f.end <= f.start) throw new Error(name + ' not found in ' + file);
+    return '\n' + src.slice(f.start, f.end);
 }
 
 describe('sidebar hover flash', function() {

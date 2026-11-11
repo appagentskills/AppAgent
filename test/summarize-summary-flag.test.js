@@ -8,6 +8,7 @@
 
 // The 170 excerpt calls t(): its with (env) sandbox gets the REAL i18n core first
 // (no catalog set = English identity, like the harness auto-include in test/harness.js).
+var EX = await runFile('test/extract.js', { i18n: false });
 var SSF_I18N = 'src/js/core/025-i18n.js';
 var SSF_PATHS = [SSF_I18N, 'src/js/app/030-agent-loop.js', 'src/js/ui/170-chat-management.js'];
 var _ssfSources = null;
@@ -16,10 +17,9 @@ async function ssfSources() { return _ssfSources || (_ssfSources = await loadSou
 // These production declarations use column-zero closing braces. Fail loudly
 // if that convention changes instead of silently testing a different excerpt.
 function ssfDeclaration(source, name, prefix) {
-    var start = source.indexOf((prefix || '') + 'function ' + name + '(');
-    var end = source.indexOf('\n}', start);
-    if (!(start >= 0 && end > start)) throw new Error('Missing declaration: ' + name);
-    return source.slice(start, end + 2);
+    var f = EX.findFunction(source, name, { includeAsync: !!prefix });
+    if (!(f && (!prefix || f.isAsync) && f.end > f.start)) throw new Error('Missing declaration: ' + name);
+    return source.slice(f.start, f.end);
 }
 function ssfI18n(sources) {
     var core = sources[SSF_I18N];
@@ -69,7 +69,14 @@ describe('summarize › isSummary flag (A2B3-01)', function() {
 
     test('completeSummaryAndCreateNewChat uses an already-stamped reply', async function() {
         var all = await ssfSources(), src = all['src/js/ui/170-chat-management.js'];
-        var code = ssfI18n(all) + '\n' + ssfDeclaration(src, 'completeSummaryAndCreateNewChat');
+        // Handoff helpers the excerpt calls (seed builder + summary extraction).
+        var helpers = ['HANDOFF_USER_MSG_VERBATIM_MAX', 'HANDOFF_USER_MSG_HEAD'].map(function(n) {
+            var m = new RegExp('\\nvar ' + n + ' = \\d+;').exec(src);
+            if (!m) throw new Error('Missing declaration: ' + n);
+            return m[0];
+        }).join('\n') + '\n' + ['extractHandoffSummary', '_isTypedUserMessage', 'buildHandoffUserMessages', 'buildContinuationSeed']
+            .map(function(n) { return ssfDeclaration(src, n); }).join('\n');
+        var code = ssfI18n(all) + '\n' + helpers + '\n' + ssfDeclaration(src, 'completeSummaryAndCreateNewChat');
         var snacks = [], runs = 0, saves = 0;
         function noop() {}
         var env = {

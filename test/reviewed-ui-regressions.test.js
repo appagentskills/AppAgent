@@ -1,6 +1,7 @@
 // Run: run_tests { pattern: 'reviewed-ui-regressions' } (js_eval sandbox; no Node).
 // Production declarations in an isolated fixture; no live page/SW/settings writes.
 'use strict';
+var EX = await runFile('test/extract.js', { i18n: false });
 async function runReviewedUiAudit(sources) {
     var results = [];
     function check(value, message) { if (!value) throw new Error(message); }
@@ -9,10 +10,9 @@ async function runReviewedUiAudit(sources) {
         catch (e) { results.push({ name: name, passed: false, error: e.message }); }
     }
     function declaration(source, name) {
-        var start = source.indexOf('function ' + name + '(');
-        var end = source.indexOf('\n}', start);
-        check(start >= 0 && end > start, 'Missing declaration: ' + name);
-        var code = source.slice(start, end + 2);
+        var f = EX.findFunction(source, name, { includeAsync: false });
+        check(!!f && f.end > f.start, 'Missing declaration: ' + name);
+        var code = source.slice(f.start, f.end);
         new Function(code);
         return code;
     }

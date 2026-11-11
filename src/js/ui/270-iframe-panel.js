@@ -698,13 +698,42 @@ async function _reloadExtensionLocked() {
     });
 }
 
+// RELOAD-QUIESCE (background.js quiesceClaudeOAuth): asks the SW to refuse new
+// Claude token renewals and resolves once an in-flight refresh has persisted
+// its rotated refresh token - a reload in between strands a dead token and
+// forces a claude.ai re-sign-in. Resolves with the SW outcome or 'timeout' |
+// 'unavailable' | 'threw' | 'no-reply'; never rejects, and is bounded by
+// RELOAD_OAUTH_QUIESCE_MS (the SW's own 10s bound plus slack).
+var RELOAD_OAUTH_QUIESCE_MS = 10500;
+function _quiesceClaudeOAuthForReload(timeoutMs) {
+    return new Promise(function(resolve) {
+        var done = false, timer = null;
+        function finish(outcome) {
+            if (done) return;
+            done = true;
+            if (timer) clearTimeout(timer);
+            resolve(outcome);
+        }
+        timer = setTimeout(function() { finish('timeout'); }, timeoutMs > 0 ? timeoutMs : RELOAD_OAUTH_QUIESCE_MS);
+        try {
+            if (typeof chrome === 'undefined' || !chrome.runtime || typeof chrome.runtime.sendMessage !== 'function') { finish('unavailable'); return; }
+            chrome.runtime.sendMessage({ type: 'claude-oauth-quiesce' }, function(resp) {
+                void chrome.runtime.lastError;
+                finish((resp && resp.outcome) || 'no-reply');
+            });
+        } catch (e) { finish('threw'); }
+    });
+}
+
 // Best-effort pre-reload cleanup across realms. Signals the service worker to
 // close its own IDB connection (and its offscreen doc), closes this page's
-// connection, then resolves after a short settle so the closes can land. Never
-// rejects and never hangs -- the settle timer is the only gate, so a reload
-// always proceeds even if the SW never answers (fail-open).
+// connection, quiesces Claude token renewals, then resolves after a short
+// settle so the closes can land. Never rejects and never hangs -- the settle
+// timer and the bounded quiesce are the only gates, so a reload always
+// proceeds even if the SW never answers (fail-open).
 function _prepareRealmsForReload() {
-    return new Promise(function(resolve) {
+    var quiesced = _quiesceClaudeOAuthForReload();
+    var settled = new Promise(function(resolve) {
         try {
             if (typeof _openAgentBus === 'function') { try { _openAgentBus(); } catch (e) {} }
             if (typeof _agentBusPort !== 'undefined' && _agentBusPort) {
@@ -716,6 +745,7 @@ function _prepareRealmsForReload() {
         // Give the SW ~250ms to run its own closeDatabase() before teardown.
         setTimeout(resolve, 250);
     });
+    return Promise.all([settled, quiesced]).then(function() {});
 }
 
 // Backstop: on page teardown (reload, tab close, navigation) close the IDB

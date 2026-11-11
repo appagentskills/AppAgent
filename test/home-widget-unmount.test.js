@@ -5,11 +5,11 @@
 // controllable fake IntersectionObserver + the REAL live-widget registry.
 'use strict';
 
+var EX = await runFile('test/extract.js', { i18n: false });
 function hwDecl(src, name) {
-    var start = src.indexOf('function ' + name + '(');
-    var end = src.indexOf('\n}', start);
-    if (start < 0 || end < start) throw new Error('Missing declaration: ' + name);
-    return src.slice(start, end + 2);
+    var f = EX.findFunction(src, name, { includeAsync: false });
+    if (!f || f.end < f.start) throw new Error('Missing declaration: ' + name);
+    return src.slice(f.start, f.end);
 }
 
 async function hwBuild(opts) {

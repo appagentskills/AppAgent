@@ -65,9 +65,19 @@ Platform.sendNotification = function(opts) {
         // Prefer background.js's helper: it also records opts.chatId so the
         // notification click navigates the open UI to that chat.
         if (typeof self.appagentCreateNotification === 'function') {
+            // It also applies the notificationMode gate (silent/notify/sound).
             self.appagentCreateNotification(title, message, (opts && opts.chatId) || '');
             return;
         }
+        // Fallback still honors notificationMode (same legacy rule as
+        // background.js resolveNotificationMode): 'silent' = none, 'sound' = + chime.
+        chrome.storage.local.get(['notificationMode', 'approvalSoundEnabled'], function(d) {
+            var m = d && d.notificationMode;
+            if (['silent', 'notify', 'sound'].indexOf(m) === -1) m = (d && d.approvalSoundEnabled === true) ? 'sound' : 'notify';
+            if (m === 'silent') return;
+            if (m === 'sound' && typeof callOffscreenHelper === 'function') {
+                try { callOffscreenHelper('play-notification-sound', {}, 5000).catch(function() {}); } catch (e) {}
+            }
         // 'appagent-' id prefix is REQUIRED: background.js's notifications.onClicked
         // handler only focuses/opens the panel for ids starting with 'appagent-'.
         // An auto-generated id would make the notification click a silent no-op.
@@ -78,6 +88,7 @@ Platform.sendNotification = function(opts) {
             iconUrl: 'icons/AppAgentIconStarOnly_128.png',
             title: title,
             message: message
+        });
         });
     } catch (e) { /* notifications unavailable */ }
 };

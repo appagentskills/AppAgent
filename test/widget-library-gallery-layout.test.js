@@ -4,9 +4,9 @@
 // height and the overflow:hidden cards have a 0 automatic min-height, so `auto`
 // grid rows were squeezed into the viewport instead of overflowing + scrolling.
 // Fix: .widget-library-items.layout-gallery { grid-auto-rows: max-content }.
-// The run_tests sandbox renders without layout (offset* are 0), so the computed
-// style contract is always asserted; the measured-geometry test runs only when a
-// layout engine is available and is skipped (explicitly) otherwise.
+// The run_tests sandbox renders without layout (offset* are 0), so geometry is
+// asserted through the computed-style contract and the real CSS rules (16:10
+// padding-top thumb, scrolling flex:1 list) instead of measured offsets.
 // Run: run_tests { files: ['test/widget-library-gallery-layout.test.js'] }
 var WS = args.workspace; // resolved workspace, passed in by run_tests
 var U = await runFile('test/ui-helpers.js', { workspace: WS }, WS);
@@ -55,17 +55,31 @@ describe('widget library › gallery layout (real CSS)', function() {
         assert.strictEqual(getComputedStyle(card.querySelector('.widget-library-actions')).display, 'none');
     }, { tags: ['unit'], timeout: 10000 });
 
-    test('measured: 60 cards keep 16:10 thumb + caption and the list scrolls (needs layout)', async function() {
+    test('60 cards: real CSS keeps a 16:10 thumb + caption per card and the list scrolls', async function() {
         var dom = await mountGallery(60);
         var list = dom.$('#widget-library-items');
-        if (!list.offsetWidth) { skipTest('run_tests sandbox has no layout engine (offsetWidth 0) — verified live instead'); return; }
         var items = dom.$$('.widget-library-item');
+        assert.strictEqual(items.length, 60);
         [items[0], items[items.length - 1]].forEach(function(card) {
-            var thumb = card.querySelector('.widget-library-thumb'), info = card.querySelector('.widget-library-info');
-            assert.ok(Math.abs(thumb.offsetHeight - thumb.offsetWidth * 0.625) <= 1.5, '16:10 thumb');
-            assert.ok(thumb.offsetHeight >= 148, 'thumb >= ~150px');
-            assert.ok(card.clientHeight >= thumb.offsetHeight + info.offsetHeight - 1, 'card contains thumb + caption');
+            assert.ok(card.querySelector('.widget-library-thumb'), 'thumb present');
+            assert.ok(card.querySelector('.widget-library-info'), 'caption present');
         });
-        assert.ok(list.scrollHeight > list.clientHeight + 100, 'list scrolls instead of squeezing rows');
+        assert.strictEqual(getComputedStyle(list).overflowY, 'auto', 'list scrolls instead of clipping');
+        // Geometry contract read from the real stylesheet (no layout engine here).
+        var css = (await loadFile('src/css/19b-widget-library.css')).replace(/\/\*[\s\S]*?\*\//g, '');
+        function rule(sel) {
+            var esc = sel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            var m = new RegExp('(?:^|[}\\n])\\s*' + esc + '\\s*\\{([^}]*)\\}').exec(css);
+            assert.ok(m, 'rule not found: ' + sel);
+            return m[1].replace(/\s+/g, ' ');
+        }
+        var thumb = rule('.layout-gallery .widget-library-thumb');
+        assert.ok(/width:\s*100%/.test(thumb), 'thumb spans the card width');
+        assert.ok(/(?:^|;)\s*height:\s*0\s*;/.test(thumb), 'thumb height comes from padding only');
+        assert.ok(/padding-top:\s*62\.5%/.test(thumb), '16:10 thumb (padding-top 62.5% = 10/16)');
+        var items_ = rule('.widget-library-items');
+        assert.ok(/flex:\s*1/.test(items_) && /overflow-y:\s*auto/.test(items_), 'list is the flex:1 scroll container');
+        assert.ok(/grid-auto-rows:\s*max-content/.test(rule('.widget-library-items.layout-gallery')), 'rows never squeezed');
+        assert.ok(/min-height:\s*0/.test(rule('.widget-library')), 'library column can shrink so the list scrolls');
     }, { tags: ['unit'], timeout: 10000 });
 });

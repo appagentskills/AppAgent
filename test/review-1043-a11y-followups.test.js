@@ -6,14 +6,15 @@
 // only DOM/document scoping. Sandbox focus() does not move activeElement, so focus is
 // observed through spies.
 // Run: run_tests { files: ['test/review-1043-a11y-followups.test.js'] }
+var EX = await runFile('test/extract.js', { i18n: false });
 var WS = args.workspace;
 
 async function sliceFns(file, names) {
-    var src = await loadFile(file, WS);
+    var src = await loadFile(file, WS), mask = EX.codeMask(src);
     return names.map(function(name) {
-        var a = src.indexOf('\nfunction ' + name + '('), b = src.indexOf('\n}\n', a);
-        if (a < 0 || b < a) throw new Error(name + ' not found in ' + file);
-        return src.slice(a, b + 2);
+        var f = EX.findFunction(src, name, { includeAsync: false, mask: mask });
+        if (!f || f.end <= f.start) throw new Error(name + ' not found in ' + file);
+        return '\n' + src.slice(f.start, f.end);
     }).join('\n');
 }
 // Evaluate `code` with `document` + named deps; returns the named functions.

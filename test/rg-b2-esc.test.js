@@ -11,6 +11,7 @@
 //          async cancel) but no longer removes the overlay under it: ui.close() owns that.
 // Sandbox focus() does not move activeElement, so focus is observed through spies.
 // Run: run_tests { files: ['test/rg-b2-esc.test.js'] }
+var EX = await runFile('test/extract.js', { i18n: false });
 var WS = args.workspace; // resolved workspace, passed in by run_tests
 var U = await runFile('test/ui-helpers.js', { workspace: WS }, WS);
 var ANY_UNSTUBBED = { indexOf: function() { return 0; } };
@@ -56,11 +57,11 @@ describe('RG-B2 global Escape: search box, chat row menu, Reload checklist (core
     // column-0 "}"), evaluated against `doc` plus the named deps (`pre` declares module vars).
     async function realFn(file, name, doc, deps, pre) {
         var src = await loadFile(file, WS);
-        var a = src.indexOf('\nfunction ' + name + '('), b = src.indexOf('\n}\n', a);
-        assert.ok(a >= 0 && b > a, name + ' found in ' + file);
+        var f = EX.findFunction(src, name, { includeAsync: false });
+        assert.ok(f && f.end > f.start, name + ' found in ' + file);
         deps = deps || {};
         var names = Object.keys(deps);
-        var body = (pre || '') + src.slice(a, b + 2) + '\nreturn ' + name + ';';
+        var body = (pre || '') + '\n' + src.slice(f.start, f.end) + '\nreturn ' + name + ';';
         return Function.apply(null, ['document'].concat(names, [body]))
             .apply(null, [doc].concat(names.map(function(k) { return deps[k]; })));
     }

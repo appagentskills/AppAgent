@@ -456,3 +456,184 @@ describe('RELOAD-ZOMBIE (P1): Reload and restart-after-import route through appC
         assert.ok(c < body.indexOf('chrome.runtime.reload()') && c < body.lastIndexOf('window.location.reload()'), 'direct reload is only the fallback');
     }, { tags: ['unit'], timeout: 2000 });
 });
+
+// IDLE-15S: the idle hold follows the shared chrome.idle source (ui/220,
+// subscribeOsIdleState, 15 s) instead of the in-page 5-min timer. The real
+// ui/220 is loaded with a chrome.idle stub and its subscriber is handed to 060.
+describe('IDLE-15S keep-awake: idle hold driven by chrome.idle', function() {
+    async function loadWithIdle(opts) {
+        opts = opts || {};
+        var idle = { state: opts.initial || 'active', interval: null, listeners: [],
+            fire: function(s) { idle.state = s; idle.listeners.forEach(function(f) { f(s); }); } };
+        var noop = function() {};
+        var n = await loadModules(['src/js/ui/220-notification-system.js'], { globals: {
+            document: { hidden: false, hasFocus: function() { return true; }, addEventListener: noop },
+            window: { addEventListener: noop, chrome: { idle: {
+                setDetectionInterval: function(s) { idle.interval = s; },
+                queryState: function(s, cb) { cb(idle.state); },
+                onStateChanged: { addListener: function(f) { idle.listeners.push(f); } } } } }
+        } });
+        var env = makeKeepAwakeEnv();
+        env.globals.subscribeOsIdleState = n.subscribeOsIdleState;
+        env.globals.getOsIdleState = n.getOsIdleState;
+        if (opts.foreverDisabled) env.globals.getSetting = async function(k, d) { return k === 'keepAwakeForeverDisabled' ? true : d; };
+        await loadModules(['src/js/app/060-keep-awake.js'], { globals: env.globals });
+        for (var i = 0; i < 5; i++) await Promise.resolve();
+        env.idle = idle;
+        return env;
+    }
+    function armedIdleTimers(env) { return env.timeouts.filter(function(t) { return !t.cleared && t.ms === env.status().idleMs; }); }
+
+    test('chrome.idle idle -> hold (notice shown); 15 s shared interval; no 5-min timer armed', async function() {
+        var env = await loadWithIdle();
+        assert.strictEqual(env.idle.interval, 15, 'one shared 15 s detection interval');
+        assert.strictEqual(env.status().osIdleMode, true);
+        assert.strictEqual(armedIdleTimers(env).length, 0, 'fallback timer not armed');
+        assert.strictEqual(env.status().lockActive, false, 'active: no hold');
+        env.idle.fire('idle');
+        assert.strictEqual(env.status().idleActivated, true);
+        assert.strictEqual(env.status().lockActive, true, 'idle event holds the display');
+        assert.strictEqual(env.lastSent(), true);
+        assert.strictEqual(typeof env.clicks['.ka-session'], 'function', 'notice rendered');
+        // Visibility/activity resets never re-arm the old timer in chrome.idle mode.
+        env.doc._listeners.visibilitychange.forEach(function(f) { f(); });
+        assert.strictEqual(armedIdleTimers(env).length, 0);
+    }, { tags: ['unit'], timeout: 3000 });
+
+    test('chrome.idle active -> idle hold released while a run lock persists', async function() {
+        var env = await loadWithIdle();
+        env.idle.fire('idle');
+        env.startRun('c1');
+        env.idle.fire('active');
+        assert.strictEqual(env.status().idleActivated, false, 'idle desire dropped');
+        assert.strictEqual(env.status().lockActive, true, 'run lock persists');
+        delete env.runningChatIds.c1;
+        env.AgentEvents.emit('runFinished', { chatId: 'c1' });
+        assert.strictEqual(env.status().lockActive, false, 'released once the run ends');
+        assert.strictEqual(env.lastSent(), false);
+        // Without a run, active releases straight away.
+        env.idle.fire('idle');
+        assert.strictEqual(env.status().lockActive, true);
+        env.idle.fire('active');
+        assert.strictEqual(env.status().lockActive, false);
+    }, { tags: ['unit'], timeout: 3000 });
+
+    test('chrome.idle locked -> no idle hold (screen is locked), run lock untouched', async function() {
+        var env = await loadWithIdle();
+        env.idle.fire('idle');
+        assert.strictEqual(env.status().lockActive, true);
+        env.idle.fire('locked');
+        assert.strictEqual(env.status().idleActivated, false);
+        assert.strictEqual(env.status().lockActive, false, 'locked releases the idle hold');
+        env.startRun('c1');
+        env.idle.fire('active'); env.idle.fire('locked');
+        assert.strictEqual(env.status().lockActive, true, 'run lock is independent of idle state');
+    }, { tags: ['unit'], timeout: 3000 });
+
+    test('IDLE-NOTICE: idle while an agent run holds the lock still shows the notice', async function() {
+        var env = await loadWithIdle();
+        env.startRun('c1');
+        assert.strictEqual(env.status().lockActive, true, 'run lock');
+        assert.strictEqual(typeof env.clicks['.ka-session'], 'undefined', 'no notice before idle');
+        env.idle.fire('idle');
+        assert.strictEqual(env.status().idleActivated, true);
+        assert.strictEqual(typeof env.clicks['.ka-session'], 'function', 'notice rendered during a run');
+    }, { tags: ['unit'], timeout: 3000 });
+
+    test('already idle at load -> holds without a state-change event', async function() {
+        var env = await loadWithIdle({ initial: 'idle' });
+        assert.strictEqual(env.status().lockActive, true);
+    }, { tags: ['unit'], timeout: 3000 });
+
+    test('no chrome.idle -> old page-activity timer fallback', async function() {
+        var env = await loadKeepAwake(); // no subscribeOsIdleState global
+        assert.strictEqual(env.status().osIdleMode, false);
+        var armed = armedIdleTimers(env);
+        assert.strictEqual(armed.length, 1, 'fallback timer armed');
+        assert.strictEqual(armed[0].ms, 5 * 60 * 1000);
+        armed[0].fn();
+        assert.strictEqual(env.status().lockActive, true, 'timer fires -> hold');
+        // ui/220 loaded without chrome.idle refuses subscribers -> same fallback.
+        var noop = function() {};
+        var n = await loadModules(['src/js/ui/220-notification-system.js'], { globals: {
+            document: { hidden: false, hasFocus: function() { return true; }, addEventListener: noop },
+            window: { addEventListener: noop, chrome: {} } } });
+        assert.strictEqual(n.subscribeOsIdleState(function() {}), false);
+    }, { tags: ['unit'], timeout: 3000 });
+
+    test('disabled (forever or session) -> chrome.idle never holds', async function() {
+        var env = await loadWithIdle({ foreverDisabled: true });
+        assert.strictEqual(env.status().foreverDisabled, true);
+        env.idle.fire('idle');
+        assert.strictEqual(env.status().lockActive, false, 'forever-disabled');
+        assert.notStrictEqual(env.lastSent(), true);
+        var env2 = await loadWithIdle();
+        env2.idle.fire('idle');
+        env2.clicks['.ka-session']();
+        env2.idle.fire('active'); env2.idle.fire('idle');
+        assert.strictEqual(env2.status().lockActive, false, 'session-disabled');
+    }, { tags: ['unit'], timeout: 3000 });
+
+    // NOTICE-CONSISTENCY cases.
+    function pageEvent(env, type, extra) {
+        var ev = { type: type, target: {}, isTrusted: true };
+        for (var k in (extra || {})) ev[k] = extra[k];
+        (env.win._listeners[type] || []).forEach(function(f) { f(ev); });
+    }
+    function liveFades(env) { return env.timeouts.filter(function(t) { return !t.cleared && t.ms === 10000; }); }
+
+    test('NOTICE-CONSISTENCY: streaming auto-scroll / synthetic mousemove while OS idle keep the notice', async function() {
+        var env = await loadWithIdle();
+        env.startRun('c1');
+        env.idle.fire('idle');
+        assert.strictEqual(env.status().noticeVisible, true, 'notice shown');
+        pageEvent(env, 'scroll'); pageEvent(env, 'mousemove'); pageEvent(env, 'click', { isTrusted: false });
+        assert.strictEqual(env.status().idleActivated, true, 'passive events do not clear the idle hold');
+        assert.strictEqual(env.status().noticeVisible, true);
+        assert.strictEqual(liveFades(env).length, 0, 'no 10 s fade armed');
+        // Real input still counts (chrome.idle will also flip to active).
+        pageEvent(env, 'mousedown');
+        assert.strictEqual(env.status().idleActivated, false, 'trusted mousedown clears the idle hold');
+        assert.strictEqual(liveFades(env).length, 1, 'grace fade armed');
+        // Next idle period re-holds and re-shows (fade cancelled).
+        env.idle.fire('active'); env.idle.fire('idle');
+        assert.strictEqual(env.status().idleActivated, true);
+        assert.strictEqual(env.status().noticeVisible, true);
+    }, { tags: ['unit'], timeout: 3000 });
+
+    test('NOTICE-CONSISTENCY: dismissed notice returns next idle period without page events', async function() {
+        var env = await loadWithIdle();
+        env.idle.fire('idle');
+        assert.strictEqual(env.status().noticeVisible, true);
+        env.clicks['.ka-close']();
+        assert.strictEqual(env.status().noticeDismissed, true);
+        assert.strictEqual(env.status().noticeVisible, false);
+        // User works in another window: chrome.idle active -> idle, no page events.
+        env.idle.fire('active');
+        assert.strictEqual(env.status().noticeDismissed, false, 'reset on the OS active transition');
+        env.idle.fire('idle');
+        assert.strictEqual(env.status().noticeVisible, true, 'notice shown again');
+    }, { tags: ['unit'], timeout: 3000 });
+
+    test('NOTICE-CONSISTENCY: panel shown again while still OS idle re-holds and re-shows', async function() {
+        var env = await loadWithIdle();
+        env.idle.fire('idle');
+        env.doc.hidden = true;
+        env.doc._listeners.visibilitychange.forEach(function(f) { f(); });
+        assert.strictEqual(env.status().lockActive, false, 'hidden drops the idle hold');
+        assert.strictEqual(env.status().noticeVisible, false);
+        env.doc.hidden = false;
+        env.doc._listeners.visibilitychange.forEach(function(f) { f(); });
+        assert.strictEqual(env.status().lockActive, true, 'visible + still idle -> hold again');
+        assert.strictEqual(env.status().noticeVisible, true);
+        // Idle fired while hidden (activateLock bails) -> held once visible.
+        var env2 = await loadWithIdle();
+        env2.doc.hidden = true;
+        env2.idle.fire('idle');
+        assert.strictEqual(env2.status().lockActive, false);
+        env2.doc.hidden = false;
+        env2.doc._listeners.visibilitychange.forEach(function(f) { f(); });
+        assert.strictEqual(env2.status().lockActive, true);
+        assert.strictEqual(env2.status().noticeVisible, true);
+    }, { tags: ['unit'], timeout: 3000 });
+});

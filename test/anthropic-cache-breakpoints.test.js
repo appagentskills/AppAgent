@@ -5,13 +5,12 @@
 // REAL sources (core/030-config, app/010, background.js).
 'use strict';
 
+var EX = await runFile('test/extract.js', { i18n: false });
 function _cb_cutFn(source, name) {
-    var start = 'function ' + name + '(';
-    var a = source.indexOf(start);
-    if (a < 0) throw new Error('Source extraction failed: ' + name);
-    var b = source.indexOf('\n}\n', a);
-    if (b < 0) throw new Error('Source extraction failed (end): ' + name);
-    return source.slice(a, b + 3);
+    var f = EX.findFunction(source, name, { includeAsync: false });
+    if (!f) throw new Error('Source extraction failed: ' + name);
+    if (!(f.end > f.start)) throw new Error('Source extraction failed (end): ' + name);
+    return source.slice(f.start, f.end) + '\n';
 }
 function _cb_cutVar(source, name) {
     var re = new RegExp('^var ' + name + ' = [^\\n]*$', 'm');

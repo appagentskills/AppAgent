@@ -2452,8 +2452,8 @@ function _isChatViewFocused(chatId) {
     // UNREAD-MISS: being ON the chat view is not enough — the user can't see
     // the chat when the panel tab is hidden or the window lost focus (side
     // panels stay document-visible on window switch, so check hasFocus too —
-    // same away-rule as _agentEventsMarkAllRunningHidden in
-    // app/036-agent-event-handlers-page.js). Without this, activity landing
+    // same away-rule as isUserAwayFromPanel in
+    // ui/220-notification-system.js). Without this, activity landing
     // while the user is in another tab/window re-stamped lastViewedAt via
     // markChatActivity's focused branch, so the chat NEVER read as unread
     // (no bold title in the jobs rows) even though the user never saw it.

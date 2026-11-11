@@ -70,6 +70,42 @@
 .model-name.connected:hover { background: var(--success-light); }
 .model-name.disconnected { color: var(--danger-hover); background: var(--danger-lighter); border-color: var(--danger-light); }
 .model-name.disconnected:hover { background: var(--danger-light); }
+/* Notifications pill (Silent / Notify / With sound): header #header-notif-mode /
+   #home-header-notif-mode, between the Active chats pill and the gear. Icon
+   only (state in title + aria-label); click opens #notif-mode-menu, which REUSES the model
+   menu component (.header-menu chrome + .model-menu rows / icon / check), same
+   fixed end-aligned positioning 4px under the pill. Logic: ui/240-layout.js.
+   Box = .jobs-badge (23-actions.css): padding, radius-xl, body-sm, medium.
+   Flat state tints = the neighbours' exact tokens (no gradients):
+     silent = .model-name idle:      --bg-code / --border / --text-secondary
+     notify = .jobs-badge:           --primary-lighter / --primary-light / --primary
+     sound  = .model-name.connected: --success-lighter / --success-light / --success-hover
+     blocked (Chrome denied, mode != silent) = .model-name.disconnected:
+                                     --danger-lighter / --danger-light / --danger-hover
+   Hover = each neighbour's own hover. Symmetric padding = compact pill around
+   the icon; the zero-width ::before strut keeps the neighbours' text line
+   height so the pill is exactly as tall as them. */
+.notif-mode-pill { display: inline-flex; align-items: center; gap: 0; padding: var(--space-2) var(--space-3); background: var(--bg-code); color: var(--text-secondary); border: 1px solid var(--border); border-radius: var(--radius-xl); cursor: pointer; font-size: var(--text-body-sm); font-weight: var(--font-medium); white-space: nowrap; flex-shrink: 0; transition: background 0.15s, color 0.15s, border-color 0.15s; }
+.notif-mode-pill[data-mode="silent"]:hover { background: var(--bg-hover); color: var(--text-primary); border-color: var(--border-dark); }
+.notif-mode-pill[data-mode="notify"] { background: var(--primary-lighter); color: var(--primary); border-color: var(--primary-light, var(--primary-lighter)); }
+.notif-mode-pill[data-mode="notify"]:hover { filter: brightness(0.97); }
+.notif-mode-pill[data-mode="sound"] { background: var(--success-lighter); color: var(--success-hover); border-color: var(--success-light); }
+.notif-mode-pill[data-mode="sound"]:hover { background: var(--success-light); }
+.notif-mode-pill.notif-mode-blocked { background: var(--danger-lighter); color: var(--danger-hover); border-color: var(--danger-light); }
+.notif-mode-pill.notif-mode-blocked:hover { background: var(--danger-light); filter: none; }
+.notif-mode-pill::before { content: '\200b'; width: 0; overflow: hidden; }
+.notif-mode-pill:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.notif-mode-icon-slot { display: inline-flex; align-items: center; }
+.notif-mode-icon-slot svg { width: 14px; height: 14px; }
+.notif-mode-ring .notif-mode-icon-slot svg { animation: notif-bell-wiggle .5s ease-in-out .1s; transform-origin: 50% 15%; }
+@keyframes notif-bell-wiggle { 0%, 100% { transform: rotate(0); } 20% { transform: rotate(16deg); } 40% { transform: rotate(-14deg); } 60% { transform: rotate(9deg); } 80% { transform: rotate(-5deg); } }
+/* Menu: only sizing + keyboard focus on top of the reused model-menu rows. */
+.notif-mode-menu { width: auto; min-width: 200px; }
+.notif-mode-menu .model-menu-row:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
+.notif-mode-menu .notif-mode-blocked-row { background: var(--danger-lighter); }
+.notif-mode-menu .notif-mode-blocked-row .model-row-icon, .notif-mode-menu .notif-mode-blocked-row .model-row-title { color: var(--danger-hover); }
+.notif-mode-select { font-size: var(--text-body-sm); }
+@media (prefers-reduced-motion: reduce) { .notif-mode-pill { transition: none; } .notif-mode-ring .notif-mode-icon-slot svg { animation: none; } }
 .model-status-dot { width: 7px; height: 7px; min-width: 7px; min-height: 7px; border-radius: 50%; flex-shrink: 0; transition: background 0.3s; }
 .model-status-dot.connected { background: var(--success); }
 .model-status-dot.disconnected { background: var(--danger); }
@@ -466,16 +502,23 @@
 .message.user .user-cached-toggle .ui-icon { width: 12px; height: 12px; transition: transform var(--transition-fast, 0.15s ease); }
 .message.user .user-cached-toggle.expanded .ui-icon { transform: rotate(180deg); }
 .msg-actions { display: flex; flex-direction: row; gap: var(--space-1); opacity: 0; transition: opacity var(--transition-normal); align-items: center; }
-.message.user:hover .msg-actions { opacity: 1; }
+.message.user:hover .msg-actions, .message.user:focus-within .msg-actions { opacity: 1; }
 
 /* Optimistic user bubble — message sent during streaming, rendered instantly and
    styled IDENTICALLY to a real user bubble (no badge, no dashed border) while the
    service worker flushes it into the real history. Only the attachment count line
    keeps a dedicated style. */
 .message.user.queued .queued-attachments { margin-top: var(--space-2); font-size: 11px; color: var(--text-secondary, #666); }
-.copy-msg-btn, .edit-msg-btn { background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: var(--text-body-sm); padding: var(--space-2) var(--space-3); border-radius: var(--radius-sm); display: flex; align-items: center; justify-content: center; }
-.copy-msg-btn:hover, .edit-msg-btn:hover { background: var(--border); color: var(--text-primary); }
-.copy-msg-btn .ui-icon, .edit-msg-btn .ui-icon { width: 14px; height: 14px; }
+.copy-msg-btn, .edit-msg-btn, .user-msg-nav-btn { background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: var(--text-body-sm); padding: var(--space-2) var(--space-3); border-radius: var(--radius-sm); display: flex; align-items: center; justify-content: center; }
+.copy-msg-btn:hover, .edit-msg-btn:hover, .user-msg-nav-btn:hover { background: var(--border); color: var(--text-primary); }
+.copy-msg-btn .ui-icon, .edit-msg-btn .ui-icon, .user-msg-nav-btn .ui-icon { width: 14px; height: 14px; }
+/* USER-MSG-NAV (250-message-render.js): first/last bubble edge state. */
+.user-msg-nav-btn[aria-disabled="true"] { opacity: 0.35; cursor: default; }
+.user-msg-nav-btn[aria-disabled="true"]:hover { background: none; color: var(--text-muted); }
+.user-msg-nav-btn:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
+.message.user.user-msg-nav-flash .message-content { animation: user-msg-nav-flash 1.2s ease-out; }
+@keyframes user-msg-nav-flash { 0%, 30% { box-shadow: 0 0 0 3px var(--primary); } 100% { box-shadow: 0 0 0 3px transparent; } }
+@media (prefers-reduced-motion: reduce) { .message.user.user-msg-nav-flash .message-content { animation: none; outline: 2px solid var(--primary); } }
 
 /* Modern flat UI icons */
 .ui-icon { width: 16px; height: 16px; flex-shrink: 0; vertical-align: middle; }

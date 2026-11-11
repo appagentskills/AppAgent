@@ -8,6 +8,7 @@
 // composer handler (history, later the picker) ever ran in the chat composer.
 // These tests drive the REAL delegate functions from the source files, so any
 // copy of 040/030 that stops delegating fails here.
+var EX = await runFile('test/extract.js', { i18n: false });
 describe('composer keydown wiring (markup -> delegate -> registered handlers)', function() {
     function key(k, o) {
         var e = Object.assign({ key: k, shiftKey: false, altKey: false, ctrlKey: false, metaKey: false,
@@ -24,11 +25,10 @@ describe('composer keydown wiring (markup -> delegate -> registered handlers)', 
     }
     // Extract one top-level `function name(...) { ... }` declaration.
     function extractFn(src, name) {
-        var start = src.indexOf('function ' + name + '(');
-        assert.ok(start !== -1, name + ' declared');
-        var end = src.indexOf('\n}\n', start);
-        assert.ok(end !== -1, name + ' closed');
-        return src.slice(start, end + 2);
+        var f = EX.findFunction(src, name, { includeAsync: false });
+        assert.ok(f, name + ' declared');
+        assert.ok(f.end > f.start, name + ' closed');
+        return src.slice(f.start, f.end);
     }
     async function setup(messages) {
         var input = ta('message-input', '');

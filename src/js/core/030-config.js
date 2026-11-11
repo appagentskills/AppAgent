@@ -224,14 +224,16 @@ var DEFAULT_API_PROVIDERS = [
         model: 'claude-opus-5-5',
         endpoint: 'https://api.anthropic.com/v1/messages',
         apiKey: 'oauth',
-        // xhigh is supported on Opus 5.5 and is the documented recommended
-        // starting point for coding/agentic work
-        effort: 'xhigh',
+        // Nov 2026: default effort is medium (the model's own default; xhigh
+        // remains selectable). Untouched seeded copies are retuned once by
+        // retuneSeedEffortToMedium (core/130-indexeddb.js).
+        effort: 'medium',
         isClaudeOAuth: true
     },
     // Sept 2026 tidy-up: the 'Opus 5' (claude-opus-5) and 'Opus-4-8'
     // (claude-opus-4-8) seeds were removed → 'Opus 5.5', and 'Fable 5'
-    // (claude-fable-5) → 'Fable 5.1'. Untouched copies are migrated by
+    // (claude-fable-5) → 'Fable 5.1' (Nov 2026: → 'Fable 5.2', see the
+    // Fable 5.2 seed below). Untouched copies are migrated by
     // loadApiProviders (core/130-indexeddb.js); stale selections / tier
     // aliases / chat pins follow PROVIDER_RENAMES below.
     {
@@ -262,19 +264,28 @@ var DEFAULT_API_PROVIDERS = [
         isClaudeOAuth: true
     },
     {
-        // Fable 5.1 (Sept 2026) — dateless pinned id, 1M context, 128k max
-        // output. Thinking is always-on adaptive (effort via output_config,
-        // same as Fable 5); the SW additionally opts this model into the
-        // thinking-display-updates + thinking-binding-controls betas and the
-        // block_binding drop_block opt-out — see FABLE_5_1_PLUS_RE below
-        // (shared with the SW via WORKER_SHARED_FILES). Existing installs pick this
-        // entry up via the name-keyed default merge in
-        // loadApiProviders (core/130-indexeddb.js).
-        name: 'Fable 5.1',
-        model: 'claude-fable-5-1',
+        // Fable 5.2 (2026-11-09) — dateless id (no dated snapshot), 1M
+        // context, 128k max output; replaces the 'Fable 5.1' seed (untouched
+        // copies migrate via PROVIDER_RENAMES + loadApiProviders in
+        // core/130-indexeddb.js). Thinking is always-on adaptive (effort via
+        // output_config, default high, same as 5.1); the SW additionally opts
+        // this model into the thinking-display-updates +
+        // thinking-binding-controls betas and the block_binding drop_block
+        // opt-out — see FABLE_5_1_PLUS_RE below (shared with the SW via
+        // WORKER_SHARED_FILES). 5.2 enforces the thinking-block prefix check
+        // for ALL accounts (a tool-list change counts as an edit), so that
+        // opt-out is what keeps replays after a tools/system change from
+        // 400ing. Existing installs pick this entry up via the name-keyed
+        // default merge in loadApiProviders (core/130-indexeddb.js).
+        // Docs: https://platform.claude.com/docs/en/models/fable-5-2/migration-guide
+        // Requires Claude Code >= 2.1.290 (claude-cli UA floor CLAUDE_CLI_VERSION
+        // in background.js). Default effort medium since Nov 2026 (untouched
+        // seeded copies retuned once by retuneSeedEffortToMedium).
+        name: 'Fable 5.2',
+        model: 'claude-fable-5-2',
         endpoint: 'https://api.anthropic.com/v1/messages',
         apiKey: 'oauth',
-        effort: 'high',
+        effort: 'medium',
         isClaudeOAuth: true
     },
     // --- ChatGPT subscription (OAuth) ---
@@ -731,7 +742,8 @@ function isAdaptiveOnlyClaude(model) {
     return ADAPTIVE_ONLY_CLAUDE_RE.test(String(model || '').toLowerCase());
 }
 
-// Fable 5.1+ / Mythos 5.1+ (Sept 2026) — the preserved-thinking models. Their
+// Fable 5.1+ / Mythos 5.1+ (Sept 2026; includes Fable 5.2, Nov 2026, which
+// enforces the prefix check for all accounts) — the preserved-thinking models. Their
 // thinking blocks are bound to the exact system/tools/prior-message prefix AND
 // chained to each other across turns: the client must replay EVERY assistant
 // thinking block unchanged on every request (including turn-final ones and
@@ -874,10 +886,13 @@ var PROVIDER_RENAMES = {
     'haiku-4.5': 'Opus 5.5',
     'Proxy': 'Opus 5.5',
     // Sept 2026 tidy-up: Opus 5 / Opus-4-8 retired → Opus 5.5; Fable 5 →
-    // Fable 5.1
+    // Fable 5.1 (chain-collapsed straight to 'Fable 5.2': the 'Fable 5.1'
+    // seed was retired in Nov 2026)
     'Opus 5': 'Opus 5.5',
     'Opus-4-8': 'Opus 5.5',
-    'Fable 5': 'Fable 5.1',
+    'Fable 5': 'Fable 5.2',
+    // Nov 2026: Fable 5.2 supersedes the Fable 5.1 seed
+    'Fable 5.1': 'Fable 5.2',
     // Sept 2026: Sonnet 5 → Sonnet 5.5 (OpenRouter + OAuth seeds)
     'sonnet-5': 'sonnet-5.5',
     'Sonnet 5': 'Sonnet 5.5',

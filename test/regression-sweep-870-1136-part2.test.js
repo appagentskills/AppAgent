@@ -4,12 +4,11 @@
 // Run: run_tests { pattern: 'regression-sweep-870-1136-part2' }
 'use strict';
 
+var EX = await runFile('test/extract.js', { i18n: false });
 function decl(src, name) {
-    var start = src.indexOf('function ' + name + '(');
-    if (start < 0) throw new Error('missing declaration ' + name);
-    if (src.slice(start - 6, start) === 'async ') start -= 6;
-    var end = src.indexOf('\n}', start);
-    var code = src.slice(start, end + 2);
+    var f = EX.findFunction(src, name);   // includes a leading 'async '
+    if (!f) throw new Error('missing declaration ' + name);
+    var code = src.slice(f.start, f.end);
     new Function(code);
     return code;
 }

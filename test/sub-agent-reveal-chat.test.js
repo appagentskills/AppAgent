@@ -38,8 +38,18 @@ describe('revealSubAgentChat', function() {
         var m = await _loadReveal({ chats: {}, SubAgents: { getById: function() { return null; } },
             selectChat: function(id) { sel.push(id); }, pull: function() {}, snack: function() { snacks++; } });
         m.reveal('gone');
-        await sleep(m.setTimeoutMs + 600);
+        // The timeout is counted in setTimeout hops (waitedMs += POLL_MS), not wall
+        // time, so under main-thread load (dense parallel test shards) the snackbar
+        // can land well after setTimeoutMs. Poll for it with a generous deadline
+        // instead of a fixed sleep with thin slack.
+        await sleep(m.setTimeoutMs);
+        var deadline = Date.now() + 10000;
+        while (snacks === 0 && Date.now() < deadline) await sleep(100);
         assert.strictEqual(snacks, 1);
         assert.deepStrictEqual(sel, []);
-    }, { tags: ['unit'], timeout: 8000 });
+        // No duplicate snackbar / late select after the poll chain ended.
+        await sleep(300);
+        assert.strictEqual(snacks, 1);
+        assert.deepStrictEqual(sel, []);
+    }, { tags: ['unit'], timeout: 20000 });
 });

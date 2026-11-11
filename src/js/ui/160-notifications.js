@@ -788,12 +788,24 @@ function updateModelDisplay() {
 }
 
 function updateModelConnectionDot() {
+    var provider = getProviderById(currentProvider);
+    // Show the provider's brand icon (same one as its section in the model
+    // menu: OpenAI / Claude / OpenRouter / Hugging Face ...) instead of a
+    // plain status dot; falls back to the dot when no icon resolves.
+    var providerIcon = '';
+    try {
+        if (provider && typeof _modelSectionFor === 'function') providerIcon = (_modelSectionFor(provider) || {}).icon || '';
+    } catch (e) { providerIcon = ''; }
     var dots = [document.getElementById('model-status-dot'), document.getElementById('home-model-status-dot')];
     dots.forEach(function(dot) {
         if (!dot) return;
-        dot.className = 'model-status-dot ' + llmConnectionStatus;
+        dot.className = 'model-status-dot ' + llmConnectionStatus + (providerIcon ? ' has-provider-icon' : '');
+        if (dot._providerIcon !== providerIcon) {
+            dot.innerHTML = providerIcon;
+            dot._providerIcon = providerIcon;
+        }
+        dot.setAttribute('aria-hidden', 'true');
     });
-    var provider = getProviderById(currentProvider);
     var isOAuth = provider && (provider.isClaudeOAuth || provider.isChatGPTOAuth);
     var isDisconnected = llmConnectionStatus === 'disconnected' || llmConnectionStatus === 'unknown';
     var els = [document.getElementById('model-name'), document.getElementById('home-model-name')];

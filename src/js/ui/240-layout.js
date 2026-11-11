@@ -64,6 +64,267 @@ function syncApiStatsCheckboxes() {
     });
 }
 
+// Notifications pill (Silent / Notify / With sound). Default 'notify'. The
+// single store is chrome.storage.local.notificationMode because the service
+// worker (background.js appagentCreateNotification, the central gate) reads it
+// and cannot reach appStorage/IndexedDB. Header pills (#header-notif-mode,
+// #home-header-notif-mode, static in body.html between the Active chats pill
+// and the gear) are icon-only (state in title + aria-label); clicking opens #notif-mode-menu,
+// which reuses the model menu component (.header-menu.model-menu rows, icon,
+// check; fixed, end-aligned 4px under the pill) and joins closeAllHeaderMenus /
+// syncHeaderMenuExpanded. The Settings page row is a native <select>
+// (notificationModeSwitchHtml). All copies stay in sync via
+// syncNotificationModeControls.
+var NOTIFICATION_MODE_VALUES = ['silent', 'notify', 'sound'];
+var NOTIFICATION_MODE_LABELS = { silent: 'Silent', notify: 'Notify', sound: 'With sound' };
+var notificationMode = 'notify';
+// Extractor markers (build/i18n-extract.js sees N_ literals; tr() is a local alias).
+var _NM_I18N_KEYS = typeof N_ === 'function' ? [N_('Silent'), N_('Notify'), N_('With sound'), N_('Blocked by Chrome'),
+    N_('Open Chrome settings to allow notifications'), N_('Notifications are blocked by Chrome — click to see how to enable them')] : null;
+function _notificationModeStore() {
+    return (typeof chrome !== 'undefined' && chrome && chrome.storage && chrome.storage.local) ? chrome.storage.local : null;
+}
+function normalizeNotificationMode(d) {
+    var m = d && d.notificationMode;
+    if (NOTIFICATION_MODE_VALUES.indexOf(m) !== -1) return m;
+    if (d && d.approvalSoundEnabled === true) return 'sound';
+    return 'notify';
+}
+// Inline stroke icons (same 24px / stroke 2 / round-cap style as the app's icons).
+var NOTIFICATION_MODE_ICONS = {
+    silent: '<svg class="notif-mode-icon" data-value="silent" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8.7 3A6 6 0 0 1 18 8a21.3 21.3 0 0 0 .6 5"/><path d="M17 17H3s3-2 3-9a4.67 4.67 0 0 1 .3-1.7"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/><path d="m2 2 20 20"/></svg>',
+    notify: '<svg class="notif-mode-icon" data-value="notify" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>',
+    sound: '<svg class="notif-mode-icon" data-value="sound" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/><path d="M4 2C2.8 3.7 2 5.7 2 8"/><path d="M22 8c0-2.3-.8-4.3-2-6"/></svg>'
+};
+// Bell with an exclamation mark: Chrome blocked the extension's notifications.
+var NOTIFICATION_BLOCKED_ICON = '<svg class="notif-mode-icon" data-value="blocked" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/><path d="M12 7v4"/><path d="M12 14h.01"/></svg>';
+var NOTIFICATION_BLOCKED_TITLE = 'Notifications are blocked by Chrome — click to see how to enable them';
+var NOTIFICATION_SETTINGS_URL = 'chrome://settings/content/notifications';
+// Chrome-level permission for this extension: 'granted' | 'denied' | null
+// (unknown = never shown as blocked). Read directly on the page with
+// chrome.notifications.getPermissionLevel (extension page + the manifest's
+// "notifications" permission; no service-worker round trip needed). Refreshed
+// at startup, on window focus / visibilitychange, when the menu opens, and on
+// chrome.notifications.onPermissionLevelChanged.
+// NOTE: OS-level blocking (macOS Focus / Do Not Disturb, Chrome notifications
+// turned off in the OS settings) is NOT detectable here: Chrome still reports
+// 'granted', so the pill cannot show it.
+var notificationPermissionLevel = null;
+function _notificationPermissionApi() {
+    var n = (typeof chrome !== 'undefined' && chrome) ? chrome.notifications : null;
+    return (n && typeof n.getPermissionLevel === 'function') ? n : null;
+}
+function isNotificationBlocked() {
+    return notificationPermissionLevel === 'denied' && notificationMode !== 'silent';
+}
+function _setNotificationPermissionLevel(level) {
+    level = (level === 'granted' || level === 'denied') ? level : null;
+    if (level === notificationPermissionLevel) return;
+    notificationPermissionLevel = level;
+    syncNotificationModeControls();
+}
+function refreshNotificationPermission() {
+    var api = _notificationPermissionApi();
+    if (!api) return;
+    try {
+        api.getPermissionLevel(function(level) {
+            try { void chrome.runtime.lastError; } catch (e) {}
+            _setNotificationPermissionLevel(level);
+        });
+    } catch (e) {}
+}
+var _notifPermissionWatching = false;
+function _watchNotificationPermission() {
+    if (_notifPermissionWatching) return;
+    _notifPermissionWatching = true;
+    var api = _notificationPermissionApi();
+    if (api && api.onPermissionLevelChanged && typeof api.onPermissionLevelChanged.addListener === 'function') {
+        try { api.onPermissionLevelChanged.addListener(function(level) { _setNotificationPermissionLevel(level); }); } catch (e) {}
+    }
+    if (typeof window !== 'undefined' && window && typeof window.addEventListener === 'function') window.addEventListener('focus', refreshNotificationPermission);
+    if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+        document.addEventListener('visibilitychange', function() { if (document.visibilityState === 'visible') refreshNotificationPermission(); });
+    }
+}
+// Blocked row: opens Chrome's notification settings (extension pages may open
+// chrome:// URLs via chrome.tabs.create).
+function openNotificationPermissionSettings() {
+    _closeNotificationModeMenu(true);
+    try {
+        if (typeof chrome !== 'undefined' && chrome && chrome.tabs && typeof chrome.tabs.create === 'function') chrome.tabs.create({ url: NOTIFICATION_SETTINGS_URL });
+    } catch (e) {}
+}
+// Tooltip on every pill: "Notifications: <state>" (existing i18n keys), or the
+// blocked explanation when Chrome denies the permission.
+function _notificationModeTitle(tr) {
+    tr = typeof tr === 'function' ? tr : (typeof t === 'function' ? t : function(s) { return s; });
+    if (isNotificationBlocked()) return tr(NOTIFICATION_BLOCKED_TITLE);
+    return tr('Notifications') + ': ' + tr(NOTIFICATION_MODE_LABELS[notificationMode]);
+}
+function _nmTr() { return typeof t === 'function' ? t : function(s) { return s; }; }
+function _nmEsc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+// Settings-page control: a native select kept in sync with the header pills.
+function notificationModeSwitchHtml(id, tr) {
+    tr = typeof tr === 'function' ? tr : function(s) { return s; };
+    var opts = NOTIFICATION_MODE_VALUES.map(function(v) {
+        return '<option value="' + v + '"' + (v === notificationMode ? ' selected' : '') + '>' + _nmEsc(tr(NOTIFICATION_MODE_LABELS[v])) + '</option>';
+    }).join('');
+    return '<select class="notif-mode-select" id="' + id + '" aria-label="' + _nmEsc(tr('Notifications')) + '" onchange="setNotificationMode(this.value)">' + opts + '</select>';
+}
+var _NM_CHECK_SVG = '<span class="model-row-check"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg></span>';
+function _notificationModeMenuRowsHtml(tr) {
+    tr = tr || _nmTr();
+    var blocked = isNotificationBlocked() ? '<div class="model-menu-row notif-mode-blocked-row" role="menuitem" tabindex="-1" data-value="blocked" onclick="openNotificationPermissionSettings()">' +
+            '<span class="model-row-icon">' + NOTIFICATION_BLOCKED_ICON + '</span>' +
+            '<span class="model-row-main"><span class="model-row-title">' + _nmEsc(tr('Blocked by Chrome')) + '</span><div class="model-row-sub">' + _nmEsc(tr('Open Chrome settings to allow notifications')) + '</div></span>' +
+        '</div>' : '';
+    return blocked + NOTIFICATION_MODE_VALUES.map(function(v) {
+        var on = v === notificationMode;
+        return '<div class="model-menu-row' + (on ? ' selected' : '') + '" role="menuitemradio" aria-checked="' + on + '" tabindex="-1" data-value="' + v + '" onclick="selectNotificationModeFromMenu(\'' + v + '\')">' +
+            '<span class="model-row-icon">' + NOTIFICATION_MODE_ICONS[v] + '</span>' +
+            '<span class="model-row-main"><span class="model-row-title">' + _nmEsc(tr(NOTIFICATION_MODE_LABELS[v])) + '</span></span>' +
+            (on ? _NM_CHECK_SVG : '') +
+        '</div>';
+    }).join('');
+}
+function syncNotificationModeControls() {
+    if (typeof document === 'undefined') return;
+    var tr = _nmTr(), title = _notificationModeTitle(tr), blocked = isNotificationBlocked();
+    var iconKey = blocked ? 'blocked' : notificationMode;
+    var pills = document.querySelectorAll('.notif-mode-wrap');
+    for (var i = 0; i < pills.length; i++) {
+        var p = pills[i], prev = p.getAttribute('data-mode');
+        p.setAttribute('data-mode', notificationMode);
+        p.classList.toggle('notif-mode-blocked', blocked);
+        p.setAttribute('title', title);
+        p.setAttribute('aria-label', title);
+        var slot = p.querySelector('.notif-mode-icon-slot');
+        if (slot && slot.getAttribute('data-value') !== iconKey) { slot.innerHTML = blocked ? NOTIFICATION_BLOCKED_ICON : NOTIFICATION_MODE_ICONS[notificationMode]; slot.setAttribute('data-value', iconKey); }
+        if (!blocked && prev && prev !== notificationMode && notificationMode === 'sound') {
+            // Re-trigger the one-shot bell wiggle (CSS honours prefers-reduced-motion).
+            p.classList.remove('notif-mode-ring'); void p.offsetWidth; p.classList.add('notif-mode-ring');
+        }
+    }
+    var sels = document.querySelectorAll('.notif-mode-select');
+    for (var j = 0; j < sels.length; j++) sels[j].value = notificationMode;
+    var menu = document.getElementById('notif-mode-menu');
+    if (menu) menu.innerHTML = _notificationModeMenuRowsHtml(tr);
+}
+function setNotificationMode(mode) {
+    if (NOTIFICATION_MODE_VALUES.indexOf(mode) === -1) return;
+    var changed = mode !== notificationMode;
+    notificationMode = mode;
+    syncNotificationModeControls();
+    var store = _notificationModeStore();
+    if (store) { try { store.set({ notificationMode: mode }); } catch (e) {} }
+    // Preview: one chime when "With sound" is picked (background.js plays it
+    // via the offscreen helper without the setting check).
+    if (changed && mode === 'sound' && typeof chrome !== 'undefined' && chrome && chrome.runtime && typeof chrome.runtime.sendMessage === 'function') {
+        try {
+            chrome.runtime.sendMessage({ type: 'preview-notification-sound' }, function() { try { void chrome.runtime.lastError; } catch (e) {} });
+        } catch (e) {}
+    }
+}
+// Menu (same lifecycle as toggleModelMenu, ui/160-notifications.js).
+var _notifModeMenuAnchor = null;
+function _notifModeMenuItems() {
+    var m = document.getElementById('notif-mode-menu');
+    return m ? Array.prototype.slice.call(m.querySelectorAll('[role="menuitem"], [role="menuitemradio"]')) : [];
+}
+function _focusNotifModeItem(idx) {
+    var items = _notifModeMenuItems();
+    if (!items.length) return;
+    idx = (idx + items.length) % items.length;
+    items.forEach(function(it, k) { it.setAttribute('tabindex', k === idx ? '0' : '-1'); });
+    items[idx].focus();
+}
+function toggleNotificationModeMenu(event, focusItem) {
+    if (event) { event.stopPropagation(); if (event.preventDefault) event.preventDefault(); }
+    if (document.getElementById('notif-mode-menu')) { _closeNotificationModeMenu(); return; }
+    if (typeof closeAllHeaderMenus === 'function') closeAllHeaderMenus('notif');
+    var anchor = (event && event.currentTarget && event.currentTarget.classList && event.currentTarget.classList.contains('notif-mode-pill'))
+        ? event.currentTarget : (document.getElementById('header-notif-mode') || document.getElementById('home-header-notif-mode'));
+    _notifModeMenuAnchor = anchor;
+    var menu = document.createElement('div');
+    menu.id = 'notif-mode-menu';
+    menu.className = 'header-menu model-menu notif-mode-menu';
+    menu.setAttribute('role', 'menu');
+    menu.setAttribute('aria-label', _nmTr()('Notifications'));
+    menu.innerHTML = _notificationModeMenuRowsHtml();
+    menu.addEventListener('keydown', notificationModeMenuKeydown);
+    document.body.appendChild(menu);
+    if (anchor && anchor.getBoundingClientRect) {
+        var r = anchor.getBoundingClientRect();
+        menu.style.position = 'fixed';
+        menu.style.top = (r.bottom + 4) + 'px';
+        if (typeof i18nDir === 'function' && i18nDir() === 'rtl') menu.style.left = Math.max(8, r.left) + 'px';
+        else menu.style.right = Math.max(8, window.innerWidth - r.right) + 'px';
+    }
+    if (typeof syncHeaderMenuExpanded === 'function') syncHeaderMenuExpanded();
+    if (focusItem) _focusNotifModeItem(focusItem === 'last' ? -1 : Math.max(0, NOTIFICATION_MODE_VALUES.indexOf(notificationMode)) + (isNotificationBlocked() ? 1 : 0));
+    refreshNotificationPermission();
+    setTimeout(function() { document.addEventListener('click', _closeNotificationModeMenuOnOutside); }, 0);
+}
+function _closeNotificationModeMenuOnOutside(e) {
+    var menu = document.getElementById('notif-mode-menu');
+    if (menu && !menu.contains(e.target) && !(e.target.closest && e.target.closest('.notif-mode-pill'))) _closeNotificationModeMenu();
+}
+function _closeNotificationModeMenu(returnFocus) {
+    var menu = document.getElementById('notif-mode-menu');
+    if (menu) menu.remove();
+    document.removeEventListener('click', _closeNotificationModeMenuOnOutside);
+    if (typeof syncHeaderMenuExpanded === 'function') syncHeaderMenuExpanded();
+    if (returnFocus && _notifModeMenuAnchor && _notifModeMenuAnchor.focus) _notifModeMenuAnchor.focus();
+}
+function selectNotificationModeFromMenu(mode) {
+    setNotificationMode(mode);
+    _closeNotificationModeMenu(true);
+}
+// Pill keys: Enter / Space / ArrowDown open on the current mode, ArrowUp on the
+// last item; Esc closes. (Handled here, so the native button click is suppressed.)
+function notificationModeKeydown(event) {
+    var k = event && event.key;
+    if (k === 'Enter' || k === ' ' || k === 'ArrowDown' || k === 'ArrowUp') {
+        event.preventDefault();
+        if (document.getElementById('notif-mode-menu')) { if (k === 'Enter' || k === ' ') _closeNotificationModeMenu(); else _focusNotifModeItem(k === 'ArrowUp' ? -1 : 0); return; }
+        toggleNotificationModeMenu(event, k === 'ArrowUp' ? 'last' : 'current');
+    } else if (k === 'Escape' && document.getElementById('notif-mode-menu')) {
+        event.preventDefault(); event.stopPropagation();
+        _closeNotificationModeMenu(true);
+    }
+}
+// Menu keys (role=menu): Up/Down move (wrap), Home/End, Enter/Space select,
+// Esc closes and returns focus to the pill, Tab closes.
+function notificationModeMenuKeydown(event) {
+    var k = event.key, items = _notifModeMenuItems();
+    var cur = items.indexOf(document.activeElement);
+    if (k === 'ArrowDown' || k === 'ArrowUp') { event.preventDefault(); _focusNotifModeItem(cur < 0 ? 0 : cur + (k === 'ArrowDown' ? 1 : -1)); }
+    else if (k === 'Home') { event.preventDefault(); _focusNotifModeItem(0); }
+    else if (k === 'End') { event.preventDefault(); _focusNotifModeItem(-1); }
+    else if (k === 'Enter' || k === ' ') {
+        event.preventDefault();
+        if (cur < 0) return;
+        var v = items[cur].getAttribute('data-value');
+        if (v === 'blocked') openNotificationPermissionSettings(); else selectNotificationModeFromMenu(v);
+    }
+    else if (k === 'Escape') { event.preventDefault(); event.stopPropagation(); _closeNotificationModeMenu(true); }
+    else if (k === 'Tab') { _closeNotificationModeMenu(); }
+}
+// Startup (core/120-init.js): loads the stored mode into the header pills.
+function loadNotificationModeSetting() {
+    syncNotificationModeControls();
+    _watchNotificationPermission();
+    refreshNotificationPermission();
+    var store = _notificationModeStore();
+    if (!store) return;
+    try {
+        store.get(['notificationMode', 'approvalSoundEnabled'], function(d) {
+            notificationMode = normalizeNotificationMode(d);
+            syncNotificationModeControls();
+        });
+    } catch (e) {}
+}
+
 // Toggle compact tool calls display
 function toggleCompactToolCalls() {
     compactToolCalls = !compactToolCalls;
@@ -135,6 +396,7 @@ function closeAllHeaderMenus(except) {
     if (except !== 'workspace' && typeof hideWorkspaceDropdown === 'function') hideWorkspaceDropdown();
     if (except !== 'usage' && typeof hideUsageTooltipNow === 'function') hideUsageTooltipNow();
     if (except !== 'instances' && typeof window.hideInstancePicker === 'function') window.hideInstancePicker();
+    if (except !== 'notif' && typeof _closeNotificationModeMenu === 'function') _closeNotificationModeMenu();
     if (typeof syncHeaderMenuExpanded === 'function') syncHeaderMenuExpanded();
 }
 
@@ -150,6 +412,7 @@ function syncHeaderMenuExpanded() {
     set('.settings-btn', !!(panel && panel.classList.contains('visible')));
     set('#model-name, #home-model-name', !!document.getElementById('model-menu'));
     set('#ws-header-status, #home-ws-header-status', typeof _wsDropdown !== 'undefined' && !!_wsDropdown);
+    set('.notif-mode-pill', !!document.getElementById('notif-mode-menu'));
     document.querySelectorAll('.jobs-badge').forEach(function(b) {
         var w = b.closest('.jobs-badge-wrapper');
         var dd = w && w.querySelector('.jobs-dropdown');
@@ -235,6 +498,10 @@ function getSystemPromptTokenCount() {
     return totalLen > 0 ? Math.ceil(totalLen / 4) : 0;
 }
 
+// Context % above which the ring expands into the labeled
+// "Continue in a new chat" pill (strictly greater than).
+var CONTEXT_CONTINUE_THRESHOLD = 50;
+
 // Update context usage indicator using actual token count from API metrics
 function updateContextIndicator() {
     var indicator = document.getElementById('context-indicator');
@@ -289,6 +556,31 @@ function updateContextIndicator() {
     indicator.className = 'context-indicator';
     if (percentage >= 90) indicator.classList.add('danger');
     else if (percentage >= 70) indicator.classList.add('warning');
+
+    // Past CONTEXT_CONTINUE_THRESHOLD % the icon-only ring grows into a labeled
+    // "Continue in a new chat" pill (same click/Enter/Space handler →
+    // summarizeAndStartNewChat). At or below it: ring only, as before.
+    var showContinue = percentage > CONTEXT_CONTINUE_THRESHOLD;
+    var label = document.getElementById('context-label');
+    var continueText = t('Continue in a new chat');
+    if (showContinue) indicator.classList.add('continue-cta');
+    if (label) {
+        label.textContent = showContinue ? continueText : '';
+        label.hidden = !showContinue;
+    }
+    // Pill mode shows the % as plain text (no hover overlay) and, on narrow
+    // widths, a short "New chat" label instead of the full one (CSS swaps them).
+    var pct = document.getElementById('context-pct');
+    if (pct) {
+        pct.textContent = showContinue ? percentage + '%' : '';
+        pct.hidden = !showContinue;
+    }
+    var shortLabel = document.getElementById('context-label-short');
+    if (shortLabel) {
+        shortLabel.textContent = showContinue ? t('New chat') : '';
+        shortLabel.hidden = !showContinue;
+    }
+    indicator.setAttribute('aria-label', showContinue ? continueText : t('Summarize and start new chat'));
 
     // Show percentage and token count in tooltip
     var tokenDisplay = totalTokens >= 1000 ? Math.round(totalTokens / 1000) + 'k' : totalTokens;

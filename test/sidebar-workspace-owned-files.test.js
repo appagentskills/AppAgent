@@ -1,3 +1,4 @@
+var EX = await runFile('test/extract.js', { i18n: false });
 describe('sidebar persisted workspace ownership', function() {
     var path = 'src/js/ui/115-workspace-files-sidebar.js';
     async function setup(opts) {
@@ -7,8 +8,9 @@ describe('sidebar persisted workspace ownership', function() {
         // Execute the REAL production helper against a request/transaction fake.
         // The fake exposes raw rows only; blob access is a hard test failure.
         var core = await loadFile('src/js/core/130-indexeddb.js');
-        var a = core.indexOf('async function getWorkspaceOwnedFileSummaries() {');
-        var b = core.indexOf('\n}\n', a);
+        var fx = EX.findFunction(core, 'getWorkspaceOwnedFileSummaries');   // code-mask cut (test/extract.js)
+        var a = fx ? fx.start : -1;
+        var b = fx ? fx.end - 2 : -1;
         var reader = new Function('openDatabase', 'workspaceMetaStoreName', 'workspaceFilesStoreName', core.slice(a, b + 2) + '\nreturn getWorkspaceOwnedFileSummaries;')(
             async function() {
                 if (state.failOpen) throw new Error('open failed');

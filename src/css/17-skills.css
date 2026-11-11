@@ -25,6 +25,14 @@
 .skills-action-btn.danger { background: var(--danger-light); border-color: var(--danger-light); color: var(--danger); }
 .skills-action-btn.danger:hover { background: var(--danger-lighter); }
 .skills-action-btn .action-icon { width: 14px; height: 14px; }
+/* All / Built-in / Edited filter (ui/012-skills-filter.js) — same active look as the Rows/Gallery toggle (19b) */
+.segmented-toggle.skills-filter-toggle { background: var(--bg-white); flex-shrink: 0; }
+.segmented-toggle.skills-filter-toggle button.active { background: var(--primary-lighter); color: var(--primary); font-weight: var(--font-semibold); box-shadow: inset 0 0 0 1px var(--primary); }
+.skills-filter-btn { white-space: nowrap; }
+#skills-toolbar-slot { flex-wrap: wrap; row-gap: var(--space-4); }
+.skills-filter-count { font-size: var(--text-caption, 11px); color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.skills-filter-count:empty { display: none; }
+.skills-filter-btn.active .skills-filter-count { color: var(--primary); }
 .skills-list { padding: var(--space-8); width: 100%; box-sizing: border-box; display: flex; flex-direction: column; gap: var(--space-4); }
 .skills-empty { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; color: var(--text-muted); text-align: center; padding: var(--space-12); }
 .skills-empty-icon { width: 48px; height: 48px; margin-bottom: var(--space-8); opacity: 0.5; }

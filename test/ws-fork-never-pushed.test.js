@@ -4,14 +4,14 @@
 // src/js/tools/020-tool-execution.js (same pattern as
 // test/chat-eviction-tools-020.test.js) with stubbed collaborators.
 
+var EX = await runFile('test/extract.js', { i18n: false });
 function _cutFns(src, names) {
+    var mask = EX.codeMask(src);
     return names.map(function(name) {
-        var re = new RegExp('^(async )?function ' + name + '\\(', 'm');
-        var m = re.exec(src);
-        if (!m) throw new Error('function not found: ' + name);
-        var end = src.indexOf('\n}\n', m.index);
-        if (end === -1) throw new Error('function end not found: ' + name);
-        return src.slice(m.index, end + 2);
+        var f = EX.findFunction(src, name, { mask: mask });
+        if (!f) throw new Error('function not found: ' + name);
+        if (!(f.end > f.start)) throw new Error('function end not found: ' + name);
+        return src.slice(f.start, f.end);
     }).join('\n');
 }
 

@@ -9,6 +9,7 @@
 //   none (idle sub-agent: parked subs are not in the page's pausedChats) >
 //   resume (paused, idle) > retry (error, idle) >
 //   continue (interrupted tail) > none.
+var EX = await runFile('test/extract.js', { i18n: false });
 var T = { tags: ['unit'], timeout: 15000 };
 var quiet = { log: function() {}, warn: function() {}, error: function() {}, info: function() {}, debug: function() {} };
 
@@ -157,7 +158,7 @@ describe('syncChatControlsUI derive (app/020-api-messages.js)', function() {
         var src = await loadFile('src/js/ui/040-tools-settings.js');
         var start = src.indexOf('function showChatView() {');
         assert.strictEqual(start >= 0, true, 'showChatView found');
-        var body = src.slice(start, src.indexOf('\n}\n', start));
+        var body = src.slice(start, EX.blockFrom(src, start).close);
         assert.strictEqual(body.indexOf("if (typeof syncChatControlsUI === 'function') syncChatControlsUI(") >= 0, true, 'derive call inside showChatView');
     }, T);
 

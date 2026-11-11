@@ -1,4 +1,5 @@
 // Composer item 7 (history recall) + item 8 (large pastes, draft size) — ui/246-composer.js.
+var EX = await runFile('test/extract.js', { i18n: false });
 describe('composer history recall + large paste / draft size', function() {
     function fakeDoc(els, active) {
         return { body: { id: 'body' }, documentElement: {}, activeElement: active || null,
@@ -127,8 +128,7 @@ describe('composer history recall + large paste / draft size', function() {
 
     test('7: kbdCanPause yields Esc while composer history is browsing', async function() {
         var src = await loadFile('src/js/ui/320-keyboard-shortcuts.js');
-        var fn = src.slice(src.indexOf('function kbdCanPause'));
-        fn = fn.slice(0, fn.indexOf('\n}\n') + 2);
+        var fn = EX.extractFunction(src, 'kbdCanPause', { includeAsync: false });
         assert.ok(/composerIsBrowsingHistory\(\)\) return false;/.test(fn));
         assert.ok(fn.indexOf('composerIsBrowsingHistory') < fn.indexOf("_chatControlsState(currentChatId) === 'pause'"));
     }, { tags: ['unit'], timeout: 5000 });
@@ -227,8 +227,7 @@ describe('composer history recall + large paste / draft size', function() {
         var c = await liveComposer(input); var m = c.m;
         input.dispatchEvent = function() { m.composerHistoryNoteInput(input); };
         var src = await loadFile('src/js/ui/320-keyboard-shortcuts.js');
-        var fn = src.slice(src.indexOf('function kbdCanPause'));
-        fn = fn.slice(0, fn.indexOf('\n}\n') + 2);
+        var fn = EX.extractFunction(src, 'kbdCanPause', { includeAsync: false });
         var canPause = new Function('togglePause', '_chatControlsState', 'currentChatId', 'kbdOverlayOpen', 'kbdMenuOpen',
             'composerIsBrowsingHistory', 'document', 'kbdIsTextField', fn + '\nreturn kbdCanPause();');
         function run() { return canPause(function() {}, function() { return 'pause'; }, 'c1', function() { return false; },

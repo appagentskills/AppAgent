@@ -4,6 +4,7 @@
 // `data:,` (toDataURL on a 0x0 canvas) was persisted and sent as an image block
 // with media_type '' -> Anthropic 400 on EVERY later send (chat bricked).
 
+var EX = await runFile('test/extract.js', { i18n: false });
 var PNG_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
 var JPEG_B64 = '/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDA==';
 var GIF_B64 = 'R0lGODlhAQABAAAAACw=';
@@ -57,8 +58,9 @@ describe('image media-type sanitizer', function() {
 
     test('js_eval producer gate drops invalid rows and reports _images_rejected', async function() {
         var src = await loadFile('src/js/tools/020-tool-execution.js');
-        var start = src.indexOf('async function _validModelImageRows(');
-        var end = src.indexOf('\n}\n', start) + 3;
+        var fx = EX.findFunction(src, '_validModelImageRows');   // code-mask cut (test/extract.js)
+        var start = fx ? fx.start : -1;
+        var end = fx ? fx.end + 1 : -1;   // + 1 keeps the trailing newline
         assert.ok(start > 0 && end > start);
         var make = new Function('sanitizeModelImageUrl', 'convertImageDataUrlToPng', src.slice(start, end) + '\nreturn _validModelImageRows;');
         var gate = make(fs.sanitizeModelImageUrl, async function() { return null; });

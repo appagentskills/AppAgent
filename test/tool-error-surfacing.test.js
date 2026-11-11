@@ -13,6 +13,7 @@
 // So the chain SW error -> js_eval result -> run_tests result is end-to-end.
 // No live tool calls, no writes, no real timers.
 
+var EX = await runFile('test/extract.js', { i18n: false });
 var HINT = 'Hint: Reload the extension; if the problem persists, check chrome://extensions \u2192 AppAgent \u2192 Errors.';
 var CODES = ['OFFSCREEN_CLOSE_TIMEOUT', 'OFFSCREEN_PROBE_TIMEOUT', 'OFFSCREEN_CREATE_TIMEOUT', 'OFFSCREEN_CREATE_FAILED'];
 var FALLBACK = 'js_eval failed without an error message (the sandbox may be unavailable).\n' + HINT;
@@ -66,7 +67,7 @@ async function swRealm(mode, opts) {
     opts = opts || {};
     var bg = await tesSource('src/platform/extension/background.js');
     var code = 'var _swOffscreenCreating = null, _swOffscreenClosing = null, _swOffscreenIdleSince = 0, _swOffscreenLastError = null;\n' +
-        tesCut(bg, '\nfunction ensureOffscreenDocument() {', '\n}\n') + '\n}\n' +
+        EX.extractFrom(bg, '\nfunction ensureOffscreenDocument() {') + '\n' +   // code-mask cut (test/extract.js)
         tesCut(bg, 'function swTestPolicyStartupError()', '// Called by the SW runtime') +
         tesCut(bg, 'async function callOffscreenHelper(', '// Expose to the imported SW bundle.') +
         '\nreturn { ensure: ensureOffscreenDocument, call: callOffscreenHelper, lastError: function() { return _swOffscreenLastError; } };';

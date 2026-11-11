@@ -3,6 +3,7 @@
 // THAT instance (absolute URL + its token), refuse without a token, and never
 // mix records from different instances. Behavioural: real modules, fake fetch.
 
+var EX = await runFile('test/extract.js', { i18n: false });
 var ACTIVE = 'https://active.service-now.com', OTHER = 'https://other.service-now.com';
 var SID = 'a'.repeat(32), VB = 'b'.repeat(32), VA = 'c'.repeat(32), VO = 'd'.repeat(32), VO2 = 'e'.repeat(32);
 var FILES = ['src/js/core/150-record-helpers.js', 'src/js/ui/090-version-history.js', 'src/js/ui/110-version-sidebar.js'];
@@ -130,8 +131,9 @@ describe('trackRecordMutation stamps a normalized instanceUrl', function() {
     test('other instance kept (normalized); active instance stored as its normalized origin', async function() {
         var h = await loadModules(['src/js/core/150-record-helpers.js'], { globals: { Platform: { instanceUrl: ACTIVE } } });
         var src = await loadFile('src/js/tools/020-tool-execution.js');
-        var start = src.indexOf('function trackRecordMutation(evt)');
-        var end = src.indexOf('\n}\n', start) + 3;
+        var fx = EX.findFunction(src, 'trackRecordMutation', { includeAsync: false });   // code-mask cut (test/extract.js)
+        var start = fx ? fx.start : -1;
+        var end = fx ? fx.end + 1 : -1;   // + 1 keeps the trailing newline
         var chats = { c1: { versionHistory: [] } };
         var fn = new Function('chats', 'AgentEvents', 'saveChatsToStorage', 'recordInstanceKey', 'recordStoredInstanceUrl', src.slice(start, end) + '\nreturn trackRecordMutation;')(
             chats, { emit: function() {} }, function() {}, h.recordInstanceKey, h.recordStoredInstanceUrl);
@@ -199,8 +201,9 @@ describe('sys_ui_page Open/Screenshot target the entry instance', function() {
     test('_uiPageUrl: relative for active/legacy, absolute origin for another instance', async function() {
         var h = await loadModules(['src/js/core/150-record-helpers.js'], { globals: { Platform: { instanceUrl: ACTIVE } } });
         var src = await loadFile('src/js/ui/270-iframe-panel.js');
-        var start = src.indexOf('function _uiPageUrl(');
-        var end = src.indexOf('\n}\n', start) + 3;
+        var fx = EX.findFunction(src, '_uiPageUrl', { includeAsync: false });   // code-mask cut (test/extract.js)
+        var start = fx ? fx.start : -1;
+        var end = fx ? fx.end + 1 : -1;   // + 1 keeps the trailing newline
         var fn = new Function('recordInstanceKey', src.slice(start, end) + '\nreturn _uiPageUrl;')(h.recordInstanceKey);
         assert.strictEqual(fn('my_page', ''), '/my_page.do');
         assert.strictEqual(fn('my_page', ACTIVE), '/my_page.do');

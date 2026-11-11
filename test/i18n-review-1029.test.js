@@ -1,5 +1,6 @@
 // PR #1029 (i18n) review follow-ups: real source, stubs only for host effects.
 // Run: run_tests { files: ['test/i18n-review-1029.test.js'] }
+var EX = await runFile('test/extract.js', { i18n: false });
 var WS = args.workspace;
 var CORE = 'src/js/core/025-i18n.js';
 function load(globals) { return loadModules([CORE], { workspace: WS, globals: globals || {} }); }
@@ -15,11 +16,9 @@ function fetchMap(map) {
 }
 // Pull one top-level function out of a source file (for helpers that are not exported).
 async function fnOf(path, name) {
-    var src = await loadFile(path, WS), at = src.indexOf('function ' + name + '(');
-    if (at < 0) throw new Error(name + ' not found in ' + path);
-    var i = src.indexOf('{', at), depth = 0;
-    for (; i < src.length; i++) { if (src[i] === '{') depth++; else if (src[i] === '}' && --depth === 0) break; }
-    return new Function('return (' + src.slice(at, i + 1) + ');')();
+    var src = await loadFile(path, WS), f = EX.findFunction(src, name, { includeAsync: false });
+    if (!f) throw new Error(name + ' not found in ' + path);
+    return new Function('return (' + src.slice(f.start, f.end) + ');')();
 }
 
 describe('i18n core › tn with non-number counts (fix 4)', function() {

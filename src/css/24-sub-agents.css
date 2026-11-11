@@ -53,6 +53,12 @@
     font-weight: var(--font-semibold, 600);
     cursor: pointer;
     padding: var(--space-2, 4px) 0;
+    /* Narrow panels: name + status/model pills + "Open chat" can exceed the
+       card width. Wrap onto a second line instead of pushing the (non-
+       shrinking) button past the card's right edge. */
+    flex-wrap: wrap;
+    row-gap: var(--space-2, 4px);
+    min-width: 0;
     /* Removed margin-bottom — when collapsed the summary should fit on one
        line; when open the body has its own top margin. */
 }
@@ -73,7 +79,10 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    flex: 1 1 auto;
+    /* Basis 0 (not auto): with the header now flex-wrap, an auto basis
+       (= full preview text width) would force the preview onto its own
+       line. Basis 0 keeps it on the first line, growing into free space. */
+    flex: 1 1 0;
     min-width: 0;
 }
 .message.sub-report[open] > summary .sub-report-preview { display: none; }
@@ -244,7 +253,7 @@
     margin-bottom: 4px;
 }
 
-.sub-report-name { color: var(--text-primary, #1f2328); }
+.sub-report-name { color: var(--text-primary, #1f2328); min-width: 0; overflow-wrap: anywhere; }
 .sub-report-status {
     font-size: var(--text-caption, 11px);
     font-weight: var(--font-normal, 400);
@@ -659,6 +668,12 @@
     background: var(--bg-light, #f6f8fa);
 }
 .worker-card-progress[hidden] { display: none; }
+/* The expanded panel continues the header's state border so the card reads as
+   ONE bordered container (header + progress + footer), not a green header
+   over a grey-bordered panel. Mirrors the .worker-card.worker-<state> rules. */
+.worker-card.worker-running + .worker-card-progress { border-color: var(--success, #2da44e); }
+.worker-card.worker-errored + .worker-card-progress { border-color: var(--danger, #cf222e); }
+.worker-card.worker-queued + .worker-card-progress { border-style: dashed; border-top: none; border-color: var(--text-muted, #8a93a6); }
 .worker-card-progress .sub-report-action-state { margin: 0; }
 .worker-progress-empty {
     font-size: var(--text-xs, 11px);
@@ -754,6 +769,12 @@
     border-color: var(--border-dark, #3b3f48);
     background: var(--bg-secondary, #1a1d24);
 }
+/* Dark: keep the expanded panel's border in the header's state colour (same
+   overrides as .worker-card above, incl. the neutral nested-depth border). */
+:root[data-theme="dark"] .worker-card.worker-running + .worker-card-progress { border-color: var(--success, #2da44e); }
+:root[data-theme="dark"] .worker-card.worker-errored + .worker-card-progress { border-color: var(--danger, #cf222e); }
+:root[data-theme="dark"] .worker-card-wrap[data-depth="2"] .worker-card + .worker-card-progress,
+:root[data-theme="dark"] .worker-card-wrap[data-depth="3"] .worker-card + .worker-card-progress { border-color: var(--border, #2e3138); }
 :root[data-theme="dark"] .worker-chip[data-depth="2"],
 :root[data-theme="dark"] .worker-chip[data-depth="3"] {
     border-color: var(--border, #2e3138);
@@ -1129,11 +1150,25 @@
 .sub-notice-header {
     display: flex;
     align-items: center;
-    gap: var(--space-4, 8px);
+    /* Wrap instead of squeezing: in a narrow card the non-shrinking badge +
+       "View agent" button used to crush the name (overflow-wrap:anywhere,
+       min-width:0) down to one character per line. Now the badge/button
+       drop to the next line and the name keeps a single ellipsized line. */
+    flex-wrap: wrap;
+    gap: var(--space-3, 6px) var(--space-4, 8px);
     min-width: 0;
     font-weight: var(--font-semibold, 600);
 }
 .sub-notice-header .sub-report-icon { flex-shrink: 0; }
+.sub-notice-header .sub-report-name {
+    flex: 0 1 auto;
+    min-width: 0;
+    max-width: 100%;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    overflow-wrap: normal;
+}
 /* Kind badge — FILLED for final reports (status-colored), outline/muted for
    mid-flight progress updates and inbound parent messages. */
 .sub-notice-badge {

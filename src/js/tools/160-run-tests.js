@@ -81,9 +81,36 @@ function rtSelectTestFiles(entries, pattern) {
 }
 
 // The js_eval program. `cfg` is embedded as JSON; everything else runs in the sandbox.
+// Per-frame source cache (perf). Profiled 2026-11-09 on the full suite (305 files,
+// 4352 tests, 1 shard): 11,879 loadFile round-trips for only 349 distinct paths
+// (060-ui-constants.js alone 680x, 020-tool-execution.js 486 KB x 250). Each one
+// crossed frame -> host gate -> run_js_file -> workspace read and back, and all
+// shard frames share ONE renderer main thread (measured: four 3 s busy-loop files
+// on 4 shards ran strictly back-to-back), so those round-trips dominated: 145 s
+// -> 65 s with the cache emulated. Installed BEFORE H.install so every wrapper
+// (harness i18n, runFile, loadModules) reads through it. Only successful reads
+// are kept (a failed or host-denied read is evicted and re-asks the host gate);
+// the workspace is read-only for the whole run (host isolation snapshot), and
+// the cache dies with this exact frame.
+var RT_SOURCE_CACHE_CODE = [
+    '(function(w) {',
+    '  var orig = w.loadFile, cache = new Map();',
+    '  if (typeof orig !== "function") return;',
+    '  w.loadFile = function(path, workspace) {',
+    '    var k = JSON.stringify([String(path), workspace == null ? null : String(workspace)]);',
+    '    if (cache.has(k)) return cache.get(k);',
+    '    var p = Promise.resolve(orig.apply(this, arguments));',
+    '    cache.set(k, p);',
+    '    p.then(function(v) { if (typeof v !== "string") cache.delete(k); }, function() { cache.delete(k); });',
+    '    return p;',
+    '  };',
+    '})(window);'
+].join('\n');
+
 function rtBuildSandboxCode(cfg) {
     return [
         'var cfg = ' + JSON.stringify(cfg) + ';',
+        RT_SOURCE_CACHE_CODE,
         'var H = await evalModule(cfg.harness_source, cfg.harness, {});',
         'H.install(window);',
         'var guard = H.installToolGuard(window, { workspace: cfg.workspace });',

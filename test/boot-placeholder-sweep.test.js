@@ -2,6 +2,7 @@
 // app/030-agent-loop.js sweepStrandedPlaceholders, flag
 // P4_BOOT_PLACEHOLDER_SWEEP; call sites in worker/130-port-bridge.js
 // resumeRunningCheckpoints and worker/190-entry.js empty-list boot path).
+var EX = await runFile('test/extract.js', { i18n: false });
 describe('#6a boot placeholder sweep (app/030-agent-loop.js)', function() {
     var M = null;
     async function load() {
@@ -179,7 +180,7 @@ describe('#6a boot placeholder sweep (app/030-agent-loop.js)', function() {
         // into runAgent(id) on both arms.
         assert.ok(body.indexOf('_swResumeRunAgent(cp.chatId)', iMark) > iMark, 'mark precedes the runAgent chains');
         var iWrap = bridge.indexOf('function _swResumeRunAgent(');
-        var wrap = bridge.slice(iWrap, bridge.indexOf('\n}', iWrap));
+        var wrap = bridge.slice(iWrap, EX.blockFrom(bridge, iWrap).close);
         assert.ok(iWrap > 0 && wrap.split('return runAgent(id)').length === 3, '_swResumeRunAgent funnels both arms into runAgent(id)');
         var entry = await loadFile('src/js/worker/190-entry.js');
         var iEmpty = entry.indexOf('if (!checkpoints || checkpoints.length === 0) {');

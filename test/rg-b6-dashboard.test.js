@@ -14,6 +14,7 @@
 var WS = args.workspace; // resolved workspace, passed in by run_tests
 var U = await runFile('test/ui-helpers.js', { workspace: WS }, WS);
 
+var EX = await runFile('test/extract.js', { i18n: false });
 var WG_FILES = ['src/js/core/060-ui-constants.js', 'src/js/ui/180-search.js', 'src/js/core/135-widget-store.js', 'src/js/ui/070-dashboard-ui.js',
     'src/js/tools/080-widget-tools.js'];
 var W1 = { id: 'widget_a', title: 'Sales board', html: '<div>hi</div>', contentVersion: 2, msgIndex: 3, lastHeight: 120 };
@@ -234,7 +235,7 @@ describe('RG-B6 › TA-10 the expanded view of a stopped widget mounts no iframe
 // test/permissions-reset-confirm.test.js) and run over in-memory maps.
 async function realReset(getHost, confirmResult) {
     var src = await loadFile('src/js/ui/070-dashboard-ui.js', WS);
-    var a = src.indexOf('\nasync function resetAllPermissionsToDefaults(') + 1, b = src.indexOf('\n}\n', a);
+    var a = src.indexOf('\nasync function resetAllPermissionsToDefaults(') + 1, b = a > 0 ? EX.blockFrom(src, a).end - 2 : -1;   // code-mask cut (test/extract.js)
     assert.ok(a > 0 && b > a, 'resetAllPermissionsToDefaults found');
     var S = { host: getHost, confirm: confirmResult, dialogs: [], saves: 0,
         inst: { 'a.service-now.com': { tier: 'autonomous', tools: { iw: 'allow' } }, 'b.service-now.com': { tier: 'full', tools: { iw: 'allow' } } } };
@@ -311,7 +312,7 @@ function tb7Idb(S, fail) {
 async function realDashboardSave(S) {
     var s20 = await loadFile('src/js/ui/020-dashboard.js', WS), s70 = await loadFile('src/js/ui/070-dashboard-ui.js', WS);
     var a = s20.indexOf('\nvar DASHBOARD_CONTENT_FIELDS') + 1, b = s20.indexOf('\nasync function deleteDashboardWidget(', a);
-    var c = s70.indexOf('\nasync function importDashboard(') + 1, d = s70.indexOf('\n}\n', c);
+    var c = s70.indexOf('\nasync function importDashboard(') + 1, d = c > 0 ? EX.blockFrom(s70, c).end - 2 : -1;   // code-mask cut (test/extract.js)
     assert.ok(a > 0 && b > a && c > 0 && d > c, 'saveDashboardWidget and importDashboard found');
     return new Function('S',
         'var dashboardWidgets = S.dw, dashboardWidgetsStoreName = "dashboardWidgets", console = S.console;\n' +

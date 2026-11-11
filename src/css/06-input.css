@@ -113,6 +113,25 @@
 .context-circle .context-fill { fill: none; stroke: var(--primary); stroke-width: 3; stroke-linecap: round; transition: stroke-dasharray 0.3s ease; }
 .context-indicator.warning .context-fill { stroke: var(--warning); }
 .context-indicator.danger .context-fill { stroke: var(--danger); }
+/* > 50% context: the ring grows into a compact "[ring] 63% · Continue in a new chat" pill
+   (240-layout.js updateContextIndicator). Same height/border weight as #attach-btn; the % is
+   plain text inside the pill, so the ring-only hover overlay (::after) is off in pill mode and
+   the native title is the only tooltip. --radius-pill (not --radius-full = 50%, which turns a
+   wide box into an ellipse). */
+.context-pct, .context-label, .context-label-short { display: none; }
+.context-indicator.continue-cta { width: auto; height: 36px; gap: var(--space-3); padding-block: 0; padding-inline: var(--space-4) var(--space-6); border-radius: var(--radius-pill); border: 1px solid var(--primary); background: var(--primary-lighter); color: var(--primary); font-size: var(--text-body-sm); font-weight: var(--font-medium); line-height: 1; white-space: nowrap; cursor: pointer; transition: background var(--transition-fast); }
+.context-indicator.continue-cta .context-circle { width: 16px; height: 16px; flex-shrink: 0; }
+.context-indicator.continue-cta .context-circle .context-bg, .context-indicator.continue-cta .context-circle .context-fill { stroke-width: 4; }
+.context-indicator.continue-cta .context-pct { display: inline-flex; align-items: center; gap: var(--space-3); font-weight: var(--font-semibold); font-variant-numeric: tabular-nums; }
+.context-indicator.continue-cta .context-pct::after { content: '\00B7'; font-weight: var(--font-medium); opacity: 0.6; }
+.context-indicator.continue-cta .context-label { display: inline; overflow: hidden; text-overflow: ellipsis; max-width: 180px; }
+.context-indicator.continue-cta.warning { background: var(--warning-lighter); border-color: var(--warning); color: var(--warning-text); }
+.context-indicator.continue-cta.danger { background: var(--danger-lighter); border-color: var(--danger); color: var(--danger-hover); }
+.context-indicator.continue-cta:hover, .context-indicator.continue-cta:focus-visible { opacity: 1; background: var(--primary-light); }
+.context-indicator.continue-cta.warning:hover, .context-indicator.continue-cta.warning:focus-visible { background: var(--warning-light); }
+.context-indicator.continue-cta.danger:hover, .context-indicator.continue-cta.danger:focus-visible { background: var(--danger-light); }
+.context-indicator.continue-cta:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.context-indicator.continue-cta:hover::after { content: none; }
 
 /* Executing tool spinner */
 .tool-executing { display: flex; align-items: center; gap: var(--space-4); padding: var(--space-4) var(--space-6); background: var(--warning-lighter); border: 1px solid var(--warning-light); border-radius: var(--radius-md); margin-top: var(--space-4); font-size: var(--text-body); color: var(--warning-hover); }

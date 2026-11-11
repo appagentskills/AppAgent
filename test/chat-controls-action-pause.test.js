@@ -16,6 +16,7 @@
 // leaves the chat paused to halt the loop; that halt is not a user pause, so the
 // stopped chat shows no control, running or idle. A send / Resume clears the pause
 // and the normal rules apply again.
+var EX = await runFile('test/extract.js', { i18n: false });
 var T = { tags: ['unit'], timeout: 20000 };
 var quiet = { log: function() {}, warn: function() {}, error: function() {}, info: function() {}, debug: function() {} };
 var FILES = ['src/js/core/030-config.js', 'src/js/app/020-api-messages.js', 'src/js/tools/120-actions.js'];
@@ -418,7 +419,7 @@ describe('chat controls x action pause (tools/120-actions.js)', function() {
         var src = await loadFile('src/js/tools/120-actions.js');
         var start = src.indexOf('async function stopAction(actionId) {');
         assert.strictEqual(start >= 0, true, 'stopAction found');
-        var body = src.slice(start, src.indexOf('\n}\n', start) + 2);
+        var body = src.slice(start, EX.blockFrom(src, start).end);
         var w = body.indexOf("a.state = 'stopped';"), d = body.indexOf('_syncChatPagePauseUIForChat(a.chatId);'), p = body.indexOf('await persistActionState(actionId);');
         assert.strictEqual(w >= 0 && p >= 0, true, 'stopped write and persist await found');
         assert.strictEqual(w < d && d < p, true, 'order: stopped write < derive < persist await (w=' + w + ' d=' + d + ' p=' + p + ')');
@@ -428,7 +429,7 @@ describe('chat controls x action pause (tools/120-actions.js)', function() {
         var src = await loadFile('src/js/tools/120-actions.js');
         var start = src.indexOf('function _syncChatPagePauseUIForChat(chatId) {');
         assert.strictEqual(start >= 0, true, 'function found');
-        var body = src.slice(start, src.indexOf('\n}\n', start) + 2);
+        var body = src.slice(start, EX.blockFrom(src, start).end);
         assert.strictEqual(body.indexOf("if (!chatId || typeof currentChatId === 'undefined' || chatId !== currentChatId) return;") >= 0, true, 'displayed-chat guard');
         assert.strictEqual(body.indexOf("if (typeof syncChatControlsUI === 'function') syncChatControlsUI(chatId);") >= 0, true, 'typeof-guarded derive');
         assert.strictEqual(body.indexOf("else if (typeof syncPauseButtonUI === 'function') syncPauseButtonUI(chatId);") >= 0, true, 'label-only fallback');

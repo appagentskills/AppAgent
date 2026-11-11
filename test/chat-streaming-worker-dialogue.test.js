@@ -2,6 +2,7 @@
 // Executes extracted production functions in a private fake DOM/registry.
 // No live events, runtime state, network, deployment or transport mocks as proof of delivery.
 'use strict';
+var EX = await runFile('test/extract.js', { i18n: false });
 function runChatStreamingWorkerDialogueTests(sources, domDocument) {
     var results = [];
     var render = sources['src/js/ui/250-message-render.js'];
@@ -12,11 +13,10 @@ function runChatStreamingWorkerDialogueTests(sources, domDocument) {
     var i18nCore = sources['src/js/core/025-i18n.js'];
     function check(ok, message) { if (!ok) throw new Error(message); }
     function test(name, fn) { try { fn(); results.push({name:name, passed:true}); } catch(e) { results.push({name:name, passed:false, error:e.message}); } }
-    function declaration(source, name, indent) {
-        var start = source.indexOf('function ' + name + '(');
-        var end = source.indexOf('\n' + (indent || '') + '}', start);
-        check(start >= 0 && end > start, 'Missing source declaration ' + name);
-        return source.slice(start, end + (indent || '').length + 2);
+    function declaration(source, name, indent) {   // indent: kept for callers; the code mask finds the real closing brace
+        var f = EX.findFunction(source, name, { includeAsync: false });
+        check(!!f && f.end > f.start, 'Missing source declaration ' + name);
+        return source.slice(f.start, f.end);
     }
     function load(env, parts, names) {
         check(typeof i18nCore === 'string' && i18nCore.indexOf('function t(') >= 0, 'missing i18n core source');

@@ -6,6 +6,7 @@
 // _reopenStorageSet (the background.js write path) and fake timers: a timer
 // only fires when a test calls timers.fire() (settle() does so between
 // microtask rounds, i.e. for steps that hang), so no test waits on real time.
+var EX = await runFile('test/extract.js', { i18n: false });
 describe('F6 SW boot crumbs: swBootCrumb ring (worker/185-boot-crumbs-sw.js)', function() {
     var KEY = 'appagentBootCrumbsSW';
     var MOD = 'src/js/worker/185-boot-crumbs-sw.js';
@@ -222,14 +223,10 @@ describe('F6 SW boot crumbs: swBootCrumb ring (worker/185-boot-crumbs-sw.js)', f
 
     test('real background.js _reopenCall/_reopenStorageSet at importScripts time (REOPEN_APP_TAB_CALL_MS unset): ring lands, no timer armed without ms', async function() {
         function extractFn(text, sig) {
-            var a = text.indexOf(sig);
-            if (a < 0) throw new Error('background.js no longer defines ' + sig + ' (worker/185 writes through it)');
-            var depth = 0;
-            for (var i = text.indexOf('{', a); i < text.length; i++) {
-                if (text[i] === '{') depth++;
-                else if (text[i] === '}') { depth--; if (depth === 0) return text.slice(a, i + 1); }
+            try { return EX.extractFrom(text, sig); } catch (e) {
+                if (/anchor not found/.test(e.message)) throw new Error('background.js no longer defines ' + sig + ' (worker/185 writes through it)');
+                throw new Error('unterminated ' + sig);
             }
-            throw new Error('unterminated ' + sig);
         }
         var bg = await loadFile('src/platform/extension/background.js');
         var fns = extractFn(bg, 'function _reopenCall(') + '\n' + extractFn(bg, 'function _reopenStorageSet(');

@@ -2,17 +2,12 @@
 // live session. Evaluates the REAL background.js helpers (extracted by name and
 // evaluated together) against fake tabs / fetch / chrome.storage.
 
+var EX = await runFile('test/extract.js', { i18n: false });
 function extractFn(src, name) {
-    var re = new RegExp('(async\\s+)?function\\s+' + name + '\\s*\\(');
-    var m = re.exec(src);
-    if (!m) throw new Error('function not found: ' + name);
-    var i = src.indexOf('{', m.index), depth = 0;
-    for (var j = i; j < src.length; j++) {
-        var ch = src[j];
-        if (ch === '{') depth++;
-        else if (ch === '}') { depth--; if (depth === 0) return src.slice(m.index, j + 1); }
-    }
-    throw new Error('unbalanced: ' + name);
+    var f = EX.findFunction(src, name);
+    if (!f) throw new Error('function not found: ' + name);
+    if (!(f.end > f.start)) throw new Error('unbalanced: ' + name);
+    return src.slice(f.start, f.end);
 }
 
 var FNS = ['snTimeoutMs', 'snWithTimeout', 'snFetchWithTimeout', 'snProbeTabTokenUser', 'snFetchUserName', 'snFetchUserRoles', 'snCollectTabTokens',

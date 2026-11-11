@@ -2,6 +2,7 @@
 // wait used to await Platform.refreshInstances() (and per-tab probes / content
 // script pings) with no bound. Real src/js/tools/010-iframe-tool.js and the real
 // background.js probe helpers, with NEVER-resolving stubs.
+var EX = await runFile('test/extract.js', { i18n: false });
 var NEVER = function() { return new Promise(function() {}); };
 
 describe('navigate never hangs on a stuck registry refresh / tab', function() {
@@ -87,15 +88,10 @@ describe('navigate never hangs on a stuck registry refresh / tab', function() {
 
 describe('background probes are bounded (list_instances / refreshInstances)', function() {
     function extractFn(src, name) {
-        var re = new RegExp('(async\\s+)?function\\s+' + name + '\\s*\\(');
-        var mm = re.exec(src);
-        if (!mm) throw new Error('function not found: ' + name);
-        var i = src.indexOf('{', mm.index), depth = 0;
-        for (var j = i; j < src.length; j++) {
-            if (src[j] === '{') depth++;
-            else if (src[j] === '}') { depth--; if (depth === 0) return src.slice(mm.index, j + 1); }
-        }
-        throw new Error('unbalanced: ' + name);
+        var f = EX.findFunction(src, name);
+        if (!f) throw new Error('function not found: ' + name);
+        if (!(f.end > f.start)) throw new Error('unbalanced: ' + name);
+        return src.slice(f.start, f.end);
     }
     var FNS = ['snTimeoutMs', 'snWithTimeout', 'snFetchWithTimeout', 'snProbeTabTokenUser', 'snFetchUserName', 'snFetchUserRoles',
         'snCollectTabTokens', 'snResolveInstanceSession', 'snRememberInstanceToken', 'snUpdateInstanceTokens', 'snGetInstancesDetailed', 'probeTab'];

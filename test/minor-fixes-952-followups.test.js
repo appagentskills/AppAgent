@@ -1,4 +1,5 @@
 // Follow-ups to sweep #952: F1-F5 minor fixes.
+var EX = await runFile('test/extract.js', { i18n: false });
 describe('#952 follow-ups (F1-F5)', function() {
     function sliceFn(src, sig) {
         var i = src.indexOf(sig);
@@ -58,8 +59,9 @@ describe('#952 follow-ups (F1-F5)', function() {
     // Behavioral: evaluate the REAL _watchJoinedRun source with stubbed deps.
     async function makeWatch(answers, chatsMap) {
         var pg = await loadFile('src/js/app/045-agent-port-bridge-page.js');
-        var i = pg.indexOf('function _watchJoinedRun(');
-        var end = pg.indexOf('\n}\n', i) + 3;
+        var fx = EX.findFunction(pg, '_watchJoinedRun', { includeAsync: false });   // code-mask cut (test/extract.js)
+        var i = fx ? fx.start : -1;
+        var end = fx ? fx.end + 1 : -1;   // + 1 keeps the trailing newline
         var env = { running: { c1: true }, pending: {}, chats: chatsMap, runs: [], timers: [], renders: 0 };
         var q = answers.slice();
         var fn = new Function('runningChatIds', '_pendingRunAgents', 'chats', '_queryRunningOnSW', 'runAgent',
