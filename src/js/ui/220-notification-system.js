@@ -343,6 +343,92 @@ function shouldSendOsNotification() {
     return isUserAwayFromPanel() || isMachineIdleOrLocked();
 }
 
+// IDLE-REPLAY: the rule above runs ONCE, at arrival. An approval or finish
+// that lands while the user is present (panel visible + focused, idle < 15 s)
+// gets no OS notification, and if the user then walks away it never does. On
+// the transition to idle/locked (the same chrome.idle moment the Keep-awake
+// popup appears) replay ONE coalesced OS notification for every item that is
+// still pending/unseen and was never OS-notified. Dedup across panels: every
+// OS send stamps a per-item marker in localStorage (shared by all extension
+// pages of this origin) and the replay skips stamped items, so N panels
+// seeing the same idle event never fire N toasts. Approvals only replay from
+// the PRIMARY copy (osEligible: opts.osNotify !== false at arrival), same as
+// the arrival dedup. Mode (Silent/Notify/Sound) stays gated in background.js.
+var OS_NOTIFIED_STORE_KEY = 'appagentOsNotified';
+var OS_NOTIFIED_TTL_MS = 24 * 60 * 60 * 1000;
+var OS_NOTIFIED_FINISH_SLACK_MS = 5000; // a finish marker covers a bell stamped within this window
+var _osNotifiedMem = {};
+function _readOsNotifiedStore() {
+    try {
+        if (typeof localStorage === 'undefined' || !localStorage) return null;
+        var raw = localStorage.getItem(OS_NOTIFIED_STORE_KEY);
+        var o = raw ? JSON.parse(raw) : {};
+        return (o && typeof o === 'object') ? o : {};
+    } catch (e) { return null; }
+}
+function noteOsNotified(key) {
+    if (!key) return;
+    var now = Date.now();
+    _osNotifiedMem[key] = now;
+    var store = _readOsNotifiedStore();
+    if (!store) return;
+    store[key] = now;
+    Object.keys(store).forEach(function(k) { if (!(now - store[k] < OS_NOTIFIED_TTL_MS)) delete store[k]; });
+    try { localStorage.setItem(OS_NOTIFIED_STORE_KEY, JSON.stringify(store)); } catch (e) {}
+}
+function _osNotifiedAt(key) {
+    var at = _osNotifiedMem[key] || 0;
+    var store = _readOsNotifiedStore();
+    if (store && store[key] > at) at = store[key];
+    return at;
+}
+function _approvalOsKey(n) {
+    return 'approval:' + n.chatId + ':' + (n.toolCallId || n.approvalIndex);
+}
+function _osChatTitle(chatId) {
+    var c = (typeof chats === 'object' && chats) ? chats[chatId] : null;
+    if (!c || !c.title) return t('Chat');
+    return c.title === 'New Chat' ? t('New Chat') : c.title;
+}
+function replayMissedOsNotifications() {
+    var items = [];
+    try {
+        var pending = Array.isArray(currentApprovalNotification) ? currentApprovalNotification.slice() : [];
+        pending = pending.concat(approvalNotificationQueue);
+        pending.forEach(function(n) {
+            if (!n || !n.osEligible || n.osNotified) return;
+            if (_dismissedApprovalKeys[n.chatId + ':' + n.approvalIndex]) return;
+            var key = _approvalOsKey(n);
+            if (_osNotifiedAt(key)) { n.osNotified = true; return; }
+            items.push({ key: key, rank: 0, chatId: n.chatId, entry: n,
+                title: t('Tool needs approval'),
+                message: (n.statusMessage || t(n.toolName)) + ' — ' + (n.chatTitle === 'New Chat' ? t('New Chat') : n.chatTitle) });
+        });
+    } catch (e) {}
+    try {
+        var bells = (typeof listUnseenFinishedChats === 'function') ? listUnseenFinishedChats() : [];
+        bells.forEach(function(b) {
+            var key = 'finish:' + b.chatId;
+            if (_osNotifiedAt(key) >= (b.at || 0) - OS_NOTIFIED_FINISH_SLACK_MS) return;
+            items.push({ key: key, rank: b.hasError ? 1 : 2, chatId: b.chatId,
+                title: b.hasError ? t('Agent stopped — error') : t('Agent finished'),
+                message: _osChatTitle(b.chatId) });
+        });
+    } catch (e) {}
+    if (!items.length) return 0;
+    items.sort(function(a, b) { return a.rank - b.rank; });
+    items.forEach(function(it) { noteOsNotified(it.key); if (it.entry) it.entry.osNotified = true; });
+    var lines = items.slice(0, 4).map(function(it) { return it.message; });
+    if (items.length > 4) lines.push('…');
+    try {
+        Platform.sendNotification({ title: items[0].title, message: lines.join('\n'), chatId: items[0].chatId });
+    } catch (e) {}
+    return items.length;
+}
+subscribeOsIdleState(function(state) {
+    if (state === 'idle' || state === 'locked') replayMissedOsNotifications();
+});
+
 // Show notification for tool approval with action button to go to the chat
 function showApprovalNotification(chatTitle, toolName, chatId, statusMessage, approvalIndex, args, opts) {
     // Check if this approval is already in the queue or currently showing
@@ -354,6 +440,13 @@ function showApprovalNotification(chatTitle, toolName, chatId, statusMessage, ap
             return n.chatId === chatId && n.approvalIndex === approvalIndex;
         });
     if (alreadyQueued || alreadyShowing) {
+        // IDLE-REPLAY: a primary copy landing on an existing fan-out entry
+        // makes it eligible for the idle replay (arrival send is skipped).
+        if (!(opts && opts.osNotify === false)) {
+            approvalNotificationQueue.concat(Array.isArray(currentApprovalNotification) ? currentApprovalNotification : []).forEach(function(n) {
+                if (n.chatId === chatId && n.approvalIndex === approvalIndex) n.osEligible = true;
+            });
+        }
         return;
     }
 
@@ -370,7 +463,8 @@ function showApprovalNotification(chatTitle, toolName, chatId, statusMessage, ap
         var apRow = (apChat && Array.isArray(apChat.messages)) ? apChat.messages[approvalIndex] : null;
         if (apRow && apRow.role === 'approval' && apRow.toolCallId) toolCallId = apRow.toolCallId;
     } catch (eTci) { toolCallId = null; }
-    var newNotification = { chatTitle: chatTitle, toolName: toolName, chatId: chatId, statusMessage: statusMessage, approvalIndex: approvalIndex, toolCallId: toolCallId, args: args };
+    var newNotification = { chatTitle: chatTitle, toolName: toolName, chatId: chatId, statusMessage: statusMessage, approvalIndex: approvalIndex, toolCallId: toolCallId, args: args,
+        osEligible: !(opts && opts.osNotify === false), osNotified: false };
 
     // OS notification so the user knows a tool needs approval: shared rule
     // (away = hidden OR window unfocused OR machine idle/locked >= 15 s).
@@ -388,6 +482,8 @@ function showApprovalNotification(chatTitle, toolName, chatId, statusMessage, ap
                 message: (statusMessage || t(toolName)) + ' — ' + (chatTitle === 'New Chat' ? t('New Chat') : chatTitle),
                 chatId: chatId
             });
+            newNotification.osNotified = true;
+            noteOsNotified(_approvalOsKey(newNotification));
         }
     }
     if (document.hidden) {

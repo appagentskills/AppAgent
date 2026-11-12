@@ -7336,6 +7336,14 @@ var _swOffscreenLastError = null;         // B2: {code, message, at} of the last
 var _swOffscreenIdleSince = 0;            // ms when last run finished; 0 = busy or unknown
 var _swOffscreenReadyResolvers = [];      // Awaiters that need offscreen up + handlers registered
 var OFFSCREEN_IDLE_GRACE_MS = 60 * 1000;  // close offscreen 60s after the last run ends
+// Helper calls (js_eval / skill sandbox / image) currently awaiting an offscreen
+// response. Chat-less callers (the SW-served Reload pre-check run_tests shards)
+// never appear in runningChatIds, so the idle-close MUST also see these: closing
+// the document mid-call kills the listener that returned `true`, and every
+// in-flight sendMessage rejects with "A listener indicated an asynchronous
+// response by returning true, but the message channel closed before a response
+// was received" (the intermittent "Checks need attention" shard errors).
+var _swOffscreenInFlight = 0;
 
 // B2 (post-Reload wedge: js_eval / run_tests silently never ran). Every await
 // below is capped at 5s (closing wait, hasDocument/getContexts probe,
@@ -7583,7 +7591,23 @@ self.checkOffscreenResponsive = function(reason) {
 
 // Wait until the offscreen doc is up AND has connected its keep-alive
 // port (== handlers are registered). Resolves to true if ready.
-function waitForOffscreenReady(timeoutMs) {
+function waitForOffscreenReady(timeoutMs, _afterClose) {
+    // A document being CLOSED is not ready, even while its keep-alive port is
+    // still set (the port is only reset once closeDocument settles): a dispatch
+    // sent now lands on a listener that dies mid-call ("message channel closed").
+    // Await the close (bounded 5s; a wedged close is dropped like ensure does),
+    // then re-check once, so the call recreates/joins a FRESH document.
+    // typeof guard: some test slices run without the module-level slot.
+    var closingNow = !_afterClose && typeof _swOffscreenClosing !== 'undefined' ? _swOffscreenClosing : null;
+    if (closingNow) {
+        var settledClose = typeof _swOffscreenWithin === 'function'
+            ? _swOffscreenWithin(function() { return closingNow; }, 5000)
+            : Promise.resolve(closingNow).then(function() { return {}; }, function() { return {}; });
+        return settledClose.then(function(cw) {
+            if (cw && cw.timedOut && _swOffscreenClosing === closingNow) _swOffscreenClosing = null;
+            return waitForOffscreenReady(timeoutMs, true);
+        });
+    }
     if (_swOffscreenKeepAlivePort) return Promise.resolve(true);
     // B2: fire-and-forget, but never an unhandled rejection — the coded error
     // is recorded in _swOffscreenLastError and surfaced by callOffscreenHelper.
@@ -7740,9 +7764,19 @@ async function callOffscreenHelper(type, payload, timeoutMs, signal) {
             // Test frames only: general js_eval keeps its chat-keyed watchdog.
             if (testKey && onActivity) _swSandboxActivityHooks[requestId] = onActivity;
         }
+        // Count this call as offscreen activity until it settles (see
+        // _swOffscreenInFlight). typeof guard: test slices run without it.
+        var countsInFlight = typeof _swOffscreenInFlight === 'number';
+        if (countsInFlight) { _swOffscreenInFlight++; _swOffscreenIdleSince = 0; }
         function finish(error, result) {
             if (settled) return;
             settled = true;
+            if (countsInFlight) {
+                _swOffscreenInFlight = Math.max(0, _swOffscreenInFlight - 1);
+                // Last call out restarts the idle grace when no chat run holds the
+                // document (a chat run marks idle itself when it finishes).
+                if (!_swOffscreenInFlight && !(typeof swAnyChatRunning === 'function' && swAnyChatRunning())) _swOffscreenIdleSince = Date.now();
+            }
             if (requestId) { TestRunPolicy.registry.unbind(requestId); delete _swSandboxActivityHooks[requestId]; }
             if (signal) signal.removeEventListener('abort', onAbort);
             if (error) reject(error);
@@ -7774,7 +7808,12 @@ async function callOffscreenHelper(type, payload, timeoutMs, signal) {
             if (signal.aborted) { onAbort(); return; }
             signal.addEventListener('abort', onAbort, { once: true });
         }
-        waitForOffscreenReady(timeoutMs || 5000).then(function(ready) {
+        // Item 5: a synchronous throw from waitForOffscreenReady must still
+        // reach finish() (in-flight counter, registry unbind, abort listener).
+        var readyP;
+        try { readyP = Promise.resolve(waitForOffscreenReady(timeoutMs || 5000)); }
+        catch (readyErr) { readyP = Promise.reject(readyErr); }
+        readyP.then(function(ready) {
             // An outer timeout may have won while readiness was pending. Its
             // cancelled invocation must NEVER spring to life when the helper wakes.
             if (settled) return;
@@ -7835,11 +7874,10 @@ self._swOffscreenDebug = function() {
 async function maybeCloseOffscreenIfIdle() {
     if (!_swOffscreenIdleSince) return;
     // Don't close while any agent run is active.
-    if (typeof runningChatIds === 'object' && runningChatIds) {
-        for (var c in runningChatIds) {
-            if (runningChatIds[c]) return;
-        }
-    }
+    if (swAnyChatRunning()) return;
+    // Never close under an in-flight helper call (chat-less run_tests shards,
+    // widget js_eval...): that is what closed the message channel mid-run.
+    if (typeof _swOffscreenInFlight === 'number' && _swOffscreenInFlight > 0) return;
     if (Date.now() - _swOffscreenIdleSince < OFFSCREEN_IDLE_GRACE_MS) return;
     // PERSIST-BUSY (root-cause fix): never reap the persistence realm while
     // IndexedDB work is in flight. Closing the offscreen doc drops the SW
@@ -7873,7 +7911,19 @@ async function maybeCloseOffscreenIfIdle() {
     _swOffscreenClosing = closing;
     return closing;
 }
-self.markOffscreenMaybeIdle = function() { _swOffscreenIdleSince = Date.now(); };
+// Kept inside the idle-close slice (tests cut from maybeCloseOffscreenIfIdle to
+// the heartbeat comment) so the slice stays self-contained.
+function swAnyChatRunning() {
+    if (typeof runningChatIds === 'object' && runningChatIds) {
+        for (var c in runningChatIds) {
+            if (runningChatIds[c]) return true;
+        }
+    }
+    return false;
+}
+// A chat run finishing never marks the document idle under an in-flight call;
+// the last call's finish restarts the grace instead.
+self.markOffscreenMaybeIdle = function() { if (!(typeof _swOffscreenInFlight === 'number' && _swOffscreenInFlight > 0)) _swOffscreenIdleSince = Date.now(); };
 
 // Offscreen→SW keep-alive port. Offscreen opens this in offscreen-helper.js
 // right after its onMessage handlers are registered. While the port is open,

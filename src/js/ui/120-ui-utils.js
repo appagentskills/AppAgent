@@ -243,6 +243,9 @@ function openVersionSidebar() {
     versionSidebarManuallyHidden = false;
     saveVersionSidebarState();
     updateVersionSidebarVisibility();
+    // Side-by-side split: shrink the widget pane (>= 25%) so the chat column
+    // keeps room next to the panel (ui/242-panel-resize.js).
+    if (typeof makeRoomForRightPanel === 'function') { try { makeRoomForRightPanel(); } catch (e) {} }
     resizeAllWidgets();
 }
 
@@ -267,6 +270,13 @@ function getLastBrowserUrl() {
                         var args = JSON.parse(tc.function.arguments);
                         if (args.action === 'navigate' && args.url) {
                             lastUrl = args.url;
+                            // Relative URL: resolve against THAT call's instance,
+                            // not whichever instance is active now.
+                            if (/^\//.test(lastUrl) && args.instance && typeof Platform !== 'undefined'
+                                && typeof Platform.resolveInstanceUrl === 'function') {
+                                var _base = Platform.resolveInstanceUrl(args.instance);
+                                if (_base) lastUrl = _base.replace(/\/$/, '') + lastUrl;
+                            }
                         }
                     } catch (e) {
                         // Ignore JSON parse errors for malformed tool call arguments
@@ -688,10 +698,21 @@ function _refreshSidebarPRStates(prs) {
 // opts.stopPropagation: the anchor swallows its click so a host that handles
 // clicks on an ancestor (the chat cards) is not toggled; the merge button
 // already stops propagation itself (mergeSidebarPR).
+// opts.modal (chat sidebar only): the whole row is a button that opens the
+// GitHub-style PR modal (wsfOpenPrModal, 115-workspace-files-sidebar.js;
+// files + inline diffs live there). Only the merge button stays on the row;
+// mergeSidebarPR stops propagation so it never opens the modal.
+// CSP-polyfill-safe handler: plain fn(this, event), no method chains.
 function renderPrSidebarItemHtml(pr, prState, opts) {
     opts = opts || {};
     var title = pr.title || pr.branch || ('PR #' + pr.number);
-    var html = '<a class="pr-sidebar-item" href="' + escapeHtml(pr.url) + '" target="_blank" rel="noopener noreferrer" title="' + escapeHtml(pr.url) + '"' + (opts.stopPropagation ? ' onclick="event.stopPropagation()"' : '') + '>';
+    var modal = !!opts.modal && typeof wsfOpenPrModal === 'function';
+    var html = '';
+    if (modal) {
+        html += '<div class="pr-sidebar-item pr-sidebar-item-clickable" role="button" tabindex="0" data-kbd-click data-pr-url="' + escapeHtml(pr.url) + '" data-pr-number="' + escapeHtml(String(pr.number || '')) + '" onclick="wsfOpenPrModal(this, event)" title="' + escapeHtml(t('Open pull request #{number}', { number: pr.number })) + '">';
+    } else {
+        html += '<a class="pr-sidebar-item" href="' + escapeHtml(pr.url) + '" target="_blank" rel="noopener noreferrer" title="' + escapeHtml(pr.url) + '"' + (opts.stopPropagation ? ' onclick="event.stopPropagation()"' : '') + '>';
+    }
     html += '<span class="pr-sidebar-icon">' + UI_ICONS.gitBranch + '</span>';
     html += '<span class="pr-sidebar-info">';
     html += '<span class="pr-sidebar-title">' + escapeHtml(title) + '</span>';
@@ -705,6 +726,10 @@ function renderPrSidebarItemHtml(pr, prState, opts) {
         html += '<span class="pr-sidebar-state closed" title="' + t('Closed without merging') + '">' + UI_ICONS.close + ' ' + t('Closed') + '</span>';
     } else {
         html += '<button class="pr-sidebar-merge-btn" data-pr-url="' + escapeHtml(pr.url) + '" onclick="mergeSidebarPR(event, this)" title="' + t('Merge PR #{number} and sync workspace', { number: escapeHtml(String(pr.number)) }) + '">' + UI_ICONS.gitMerge + '</button>';
+    }
+    if (modal) {
+        html += '</div>';
+        return html;
     }
     html += '<span class="pr-sidebar-open">' + UI_ICONS.externalLink + '</span>';
     html += '</a>';
@@ -966,7 +991,7 @@ function renderVersionSidebar() {
         html += '<div class="version-section-title">' + UI_ICONS.gitBranch + ' ' + t('Pull Requests ({count})', { count: pushedPRs.length }) + '</div>';
         html += '<div class="pr-sidebar-list">';
         pushedPRs.forEach(function(pr) {
-            html += renderPrSidebarItemHtml(pr, _sidebarPRState[pr.url] || 'open');
+            html += renderPrSidebarItemHtml(pr, _sidebarPRState[pr.url] || 'open', { modal: true });
         });
         html += '</div>';
         html += '</div>';

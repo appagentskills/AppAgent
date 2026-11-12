@@ -916,6 +916,10 @@ function trackRecordMutation(evt) {
     } catch (e) { /* stale port — the entry still lives in the page mirror + its IDB save above */ }
     evt.entryId = entry.id;
     evt.messageIndex = entry.messageIndex;
+    // Carry the stored origin so the page handler (app/036) keeps it —
+    // otherwise active-instance writes lose their instance and sidebar
+    // links later open on whatever instance is active.
+    if (entry.instanceUrl) evt.instanceUrl = entry.instanceUrl;
     AgentEvents.emit('recordMutated', evt);
 }
 
@@ -7212,6 +7216,46 @@ function _wsWorkflowScopeHint(res, treeEntries) {
     return ' — this commit touches .github/workflows/; the GitHub token likely lacks the `workflow` scope (required to create or update workflow files). Add the scope to the PAT or leave workflow files out of this push (files: [...]).';
 }
 
+// +/- line counts stored on each meta.prs[].files[] entry at push time so the
+// sidebar PR view renders them immediately (ui/115 _wsfStoredCounts).
+// Self-contained (wsPush also runs in the service-worker bundle, which has no
+// ui/090 computeDiff) but yields the SAME counts as computeDiff: common
+// prefix/suffix trimmed, LCS length on the middle (<= 4M cells), else the
+// positional fallback - so counts never change when a diff is expanded.
+// null (the view counts lazily) when either side exceeds
+// WS_PR_COUNT_MAX_CHARS (a .length cap: UTF-16 code units, not bytes).
+var WS_PR_COUNT_MAX_CHARS = 200000;
+// Deprecated alias (old name; it was never a byte count). Use _CHARS.
+var WS_PR_COUNT_MAX_BYTES = WS_PR_COUNT_MAX_CHARS;
+function _wsPrFileLineCounts(oldText, newText) {
+    var a = oldText == null ? '' : String(oldText), b = newText == null ? '' : String(newText);
+    if (a.length > WS_PR_COUNT_MAX_CHARS || b.length > WS_PR_COUNT_MAX_CHARS) return null;
+    try {
+        var A = a.replace(/\r\n?/g, '\n').split('\n'), B = b.replace(/\r\n?/g, '\n').split('\n');
+        var m = A.length, n = B.length, pre = 0, suf = 0;
+        while (pre < m && pre < n && A[pre] === B[pre]) pre++;
+        while (suf < m - pre && suf < n - pre && A[m - 1 - suf] === B[n - 1 - suf]) suf++;
+        var X = A.slice(pre, m - suf), Y = B.slice(pre, n - suf), xm = X.length, yn = Y.length;
+        if (!xm || !yn) return { adds: yn, dels: xm };
+        if (xm * yn <= 4000000) {
+            var prev = new Array(yn + 1).fill(0), cur = new Array(yn + 1).fill(0);
+            for (var i = 1; i <= xm; i++) {
+                for (var j = 1; j <= yn; j++) cur[j] = X[i - 1] === Y[j - 1] ? prev[j - 1] + 1 : Math.max(prev[j], cur[j - 1]);
+                var tmp = prev; prev = cur; cur = tmp;
+            }
+            var L = prev[yn];
+            return { adds: yn - L, dels: xm - L };
+        }
+        var adds = 0, dels = 0, max = Math.max(xm, yn);
+        for (var k = 0; k < max; k++) {
+            if (k >= xm) adds++;
+            else if (k >= yn) dels++;
+            else if (X[k] !== Y[k]) { adds++; dels++; }
+        }
+        return { adds: adds, dels: dels };
+    } catch (e) { return null; }
+}
+
 async function wsPush(wk, args, chatId, chatTitle) {
     var meta = await getWorkspaceMeta(wk);
     if (!meta) return { success: false, error: 'Repo not cloned. Use workspace clone first.' };
@@ -7741,6 +7785,14 @@ async function wsPush(wk, args, chatId, chatTitle) {
     var _prInfoTitle = (typeof args.pr_title === 'string' && args.pr_title !== '') ? args.pr_title
         : ((prReused && existingPr && existingPr.title) ? existingPr.title : '');
     var prInfo = { url: prUrl, number: prNumber, branch: args.branch_name, title: _prInfoTitle, chatId: chatId || null };
+    // Base branch of the PR, stored for the PR view header (head -> base).
+    var _prInfoBase = (prReused && existingPr && existingPr.base && existingPr.base.ref) ? existingPr.base.ref : baseBranch;
+    if (_prInfoBase) prInfo.base = String(_prInfoBase);
+    // PR description for the sidebar PR modal (capped; append pushes without
+    // pr_body keep the tracked body below).
+    var _prInfoBody = (typeof args.pr_body === 'string' && args.pr_body !== '') ? args.pr_body
+        : ((!prReused && typeof _newPrBody === 'string') ? _newPrBody : '');
+    if (_prInfoBody) prInfo.body = String(_prInfoBody).slice(0, 20000);
     // Durable parent attribution: when the pusher is a SUB-AGENT chat, its
     // chat row and registry record are reaped ~1h after it settles
     // (SUBAGENT_TOMBSTONE_TTL_MS, src/js/core/097-sub-agent-registry.js) —
@@ -7903,7 +7955,10 @@ async function wsPush(wk, args, chatId, chatTitle) {
                     _snapNewSha = blobShas[dirtyFiles[k].path] || await computeGitBlobSha(dirtyFiles[k].content);
                     await putWorkspaceBlob(_snapNewSha, dirtyFiles[k].content);
                 }
-                _prFiles.push({ path: dirtyFiles[k].path, old_sha: _snapOldSha, new_sha: _snapNewSha, deleted: !!dirtyFiles[k].deleted, is_new: dirtyFiles[k].original_content == null });
+                var _pfEntry = { path: dirtyFiles[k].path, old_sha: _snapOldSha, new_sha: _snapNewSha, deleted: !!dirtyFiles[k].deleted, is_new: dirtyFiles[k].original_content == null };
+                var _pfCounts = _wsPrFileLineCounts(dirtyFiles[k].original_content, dirtyFiles[k].deleted ? '' : dirtyFiles[k].content);
+                if (_pfCounts) { _pfEntry.adds = _pfCounts.adds; _pfEntry.dels = _pfCounts.dels; }
+                _prFiles.push(_pfEntry);
             } catch (_snapErr) { /* snapshot is best-effort */ }
         }
         // Attach AFTER the stamp loop: pushed_pr references the same prInfo
@@ -7949,6 +8004,7 @@ async function wsPush(wk, args, chatId, chatTitle) {
             // Append push without a pr_title: keep the previously tracked title
             // instead of wiping it (mirrors getPushedPRsForChat's message scan).
             if (!prInfo.title && meta.prs[_trackedIdx] && meta.prs[_trackedIdx].title) prInfo.title = meta.prs[_trackedIdx].title;
+            if (!prInfo.body && meta.prs[_trackedIdx] && meta.prs[_trackedIdx].body) prInfo.body = meta.prs[_trackedIdx].body;
             // Likewise keep a previously stamped root_chat_id when THIS push
             // couldn't resolve one (e.g. the parent itself appends to a PR its
             // sub opened, or the sub's registry record is already GC'd). The

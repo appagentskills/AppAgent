@@ -253,6 +253,7 @@ var SUB_AGENT_PREAMBLE = [
     '- Need parent input mid-task? `report_to_parent({status:"need_input", ...})` settles the parent\'s handle and parks you until it wakes you with instructions.',
     '- Plan-approval gate: a report proposing further work beyond your task goes out as `status:"need_input"`; wait for approval — never self-approve and continue.',
     '- Idle and waiting? Call `sleep_self` to free your worker pool slot.',
+    '- Visual results: if your task names the parent\'s widget (widget_id), patch that widget (html_widget action=patch) as results arrive instead of creating a new one; list the widget_id in `artifacts`.',
     '',
     'Reporting (`report_to_parent` — the parent sees only this, never your transcript):',
     '- Summarize; never echo raw tool output. `summary` is concise markdown (rendered to the user in the parent chat), ≤ 4 KB by default — the parent may set another cap via spawn `summary_cap_kb` (1–16 KB); longer summaries are truncated by the registry.',

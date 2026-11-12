@@ -486,6 +486,9 @@ function openChatFromHistory(chatId) {
         }
     }
     renderMessages();
+    // Split widget pane follows the displayed chat — same call as selectChat
+    // (ui/170-chat-management.js); this entry point bypasses it.
+    if (typeof renderSplitViewPane === 'function') { try { renderSplitViewPane(); } catch (e) {} }
     updateInputPosition();
     updateChatTitleHeader();
     updateAllButtonStates();

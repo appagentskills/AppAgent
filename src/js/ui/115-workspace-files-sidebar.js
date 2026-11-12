@@ -14,6 +14,16 @@
 var _wsfMutatingActions = { write: 1, edit: 1, delete: 1, copy: 1, discard: 1 };
 var _wsfSectionFiles = [];   // render-time registry so onclick handlers use indexes, not escaped paths
 var _wsfVersionState = null; // state backing the currently open versions modal
+// WSF-SCOPE: the Workspace Files section lists ONLY files that belong to no
+// PR (uncommitted modified / new / deleted, incl. edits made after a push).
+// Pushed files are listed under their PR in the Pull Requests section
+// (PR modal Files tab, see _wsfPrFilesTabHtml). _wsfWsFiles is the section's
+// own display list; _wsfSectionFiles is the list the open modal navigates
+// (the WS list, or one PR's file list — _wsfNavSource says which).
+var _wsfWsFiles = [];
+var _wsfNavSource = 'ws';
+// One change-kind glyph per row (VS Code SCM style); colors in 25-ws-files.css.
+var _wsfLetters = { modified: 'M', 'new': 'A', deleted: 'D' };
 
 // --- Extraction -------------------------------------------------------------
 
@@ -194,6 +204,9 @@ function getWsEditedFilesForChat(chat) {
         f.isDeleted = row.isDeleted;
         f.isDiscarded = false;
         if (row.pushedPr) f.pushedPr = row.pushedPr;
+        // WSF-STATUS: live row state (the workspace store is the source of
+        // truth for dirty vs pushed vs merged; chat history is not).
+        f.live = { dirty: row.dirty !== false, prMerged: !!row.prMerged, changedSincePush: !!row.changedSincePush };
     });
     return order.map(function(key) { return byKey[key]; });
 }
@@ -251,24 +264,201 @@ function _wsfPickSnap(list, wsKey) {
 // once. null = never loaded.
 var _wsfMergedSnaps = null;
 var _wsfMergedSnapsLoading = false;
+var _wsfMergedSnapsRerun = false;
+// WSF-STATUS: repo + '#' + PR number -> 'open' | 'merged' | 'closed', from
+// every workspace meta.prs entry (the same durable record the Pull Requests
+// section reads). One PR state for every file pushed to it, so files of the
+// same PR can no longer disagree (MERGED vs MODIFIED).
+var _wsfPrStates = {};
+// WSF-KIND: repo + '#' + PR number -> { path -> pushed file entry } for EVERY
+// tracked PR (open / merged / closed). Gives pushed rows their change kind
+// (A/D/M) and a diff source when the live record is clean after the push.
+var _wsfPrFiles = {};
+// WSF-PRMODAL: repo + '#' + PR number -> { url, number, title, body, branch,
+// base, state } from the durable meta.prs records (title/body stored by
+// wsPush). Feeds the PR modal header / description and the diff-modal chip.
+var _wsfPrInfos = {};
+
+function _wsfCollectPrInfos(metas) {
+    var out = {};
+    (metas || []).forEach(function(m) {
+        var wk = (m && m.repo && typeof parseWsKey === 'function') ? parseWsKey(m.repo) : null;
+        var repo = m ? (m.github_repo || (wk ? wk.repo : null)) : null;
+        ((m && Array.isArray(m.prs)) ? m.prs : []).forEach(function(pr) {
+            if (!pr || !pr.number) return;
+            var k = (repo || '') + '#' + pr.number;
+            var cur = out[k] || (out[k] = { url: pr.url || null, number: pr.number });
+            if (pr.title && !cur.title) cur.title = pr.title;
+            if (typeof pr.body === 'string' && pr.body && !cur.body) cur.body = pr.body;
+            if (pr.branch && !cur.branch) cur.branch = pr.branch;
+            // Stored at push time (wsPush prInfo.base); legacy: the ws branch.
+            if (pr.base && !cur.base) cur.base = pr.base;
+            if (!cur.base && wk && wk.branch && wk.branch !== pr.branch) cur.base = wk.branch;
+            if (pr.state && !cur.state) cur.state = pr.state;
+            if (pr.url && !cur.url) cur.url = pr.url;
+        });
+    });
+    return out;
+}
+
+// Install freshly collected meta.prs infos. Stored data must win over an
+// OLDER GitHub fetch: when a PR's stored title/body changed (e.g. a push with
+// a new pr_title / pr_body) and differs from the cached live detail, drop
+// that cached detail and its live-check TTL entry so the next open shows the
+// stored values and re-checks GitHub. A write-back of the live detail itself
+// (_wsfPersistPrDetail) stores the cached values, so it keeps the cache.
+function _wsfApplyPrInfos(next) {
+    var prev = _wsfPrInfos || {};
+    Object.keys(next || {}).forEach(function(k) {
+        var n = next[k], p = prev[k] || {};
+        var url = n && n.url;
+        if (!url || (n.title === p.title && n.body === p.body)) return;
+        var det = _wsfPrDetailCache[url];
+        if (det && (n.title || '') === (det.title || '') && (n.body || '') === (det.body || '')) return;
+        delete _wsfPrDetailCache[url];
+        delete _wsfPrLive[url];
+    });
+    _wsfPrInfos = next || {};
+}
+
+function _wsfCollectPrFiles(metas) {
+    var out = {};
+    (metas || []).forEach(function(m) {
+        var repo = m ? (m.github_repo || (typeof parseWsKey === 'function' && m.repo ? parseWsKey(m.repo).repo : null)) : null;
+        ((m && Array.isArray(m.prs)) ? m.prs : []).forEach(function(pr) {
+            if (!pr || !pr.number || !Array.isArray(pr.files)) return;
+            var k = (repo || '') + '#' + pr.number;
+            if (!out[k]) out[k] = {};
+            pr.files.forEach(function(pf) { if (pf && pf.path) out[k][pf.path] = pf; });
+        });
+    });
+    return out;
+}
+
+// Pushed file entry of f's PR (or null).
+function _wsfPrFileOf(f, prNumber, prUrl) {
+    if (!prNumber) return null;
+    var repo = null;
+    var m = prUrl && /github\.com\/([^/]+\/[^/]+)\/pull\//.exec(prUrl);
+    if (m) repo = m[1];
+    else if (f.wsKey && typeof parseWsKey === 'function') repo = parseWsKey(f.wsKey).repo;
+    var byPath = _wsfPrFiles[(repo || '') + '#' + prNumber];
+    return (byPath && byPath[f.path]) || null;
+}
+
+function _wsfCollectPrStates(metas) {
+    var out = {};
+    (metas || []).forEach(function(m) {
+        var repo = m ? (m.github_repo || (typeof parseWsKey === 'function' && m.repo ? parseWsKey(m.repo).repo : null)) : null;
+        ((m && Array.isArray(m.prs)) ? m.prs : []).forEach(function(pr) {
+            if (!pr || !pr.number) return;
+            var st = pr.state === 'merged' ? 'merged' : (pr.state === 'closed' ? 'closed' : 'open');
+            var k = (repo || '') + '#' + pr.number;
+            // merged beats closed beats open when several metas track the PR
+            var rank = { open: 0, closed: 1, merged: 2 };
+            if (!out[k] || rank[st] > rank[out[k]]) out[k] = st;
+        });
+    });
+    return out;
+}
 
 function _wsfRefreshMergedSnaps() {
-    if (_wsfMergedSnapsLoading) return;
+    // A refresh requested mid-load (e.g. the push / pr_merged event) used to
+    // be DROPPED, leaving stale badges until some unrelated mutation.
+    if (_wsfMergedSnapsLoading) { _wsfMergedSnapsRerun = true; return; }
     if (typeof getAllWorkspaceMetas !== 'function') return;
     _wsfMergedSnapsLoading = true;
+    _wsfMergedSnapsRerun = false;
     getAllWorkspaceMetas().then(function(metas) {
         var byPath = _wsfCollectMergedSnaps(metas);
+        var states = _wsfCollectPrStates(metas);
         function sig(map) {
             if (!map) return 'null';
             return JSON.stringify(Object.keys(map).sort().map(function(p) {
                 return [p].concat(map[p].map(function(s) { return [s.repo, s.file.old_sha, s.file.new_sha, s.pr.number]; }));
             }));
         }
-        var changed = sig(byPath) !== sig(_wsfMergedSnaps);
+        var prFiles = _wsfCollectPrFiles(metas);
+        var changed = sig(byPath) !== sig(_wsfMergedSnaps) || JSON.stringify(states) !== JSON.stringify(_wsfPrStates) || JSON.stringify(prFiles) !== JSON.stringify(_wsfPrFiles);
         _wsfMergedSnaps = byPath;
+        _wsfPrStates = states;
+        _wsfPrFiles = prFiles;
+        _wsfApplyPrInfos(_wsfCollectPrInfos(metas));
         _wsfMergedSnapsLoading = false;
         if (changed && typeof renderVersionSidebar === 'function') renderVersionSidebar();
-    }).catch(function() { _wsfMergedSnapsLoading = false; });
+        if (_wsfMergedSnapsRerun) _wsfRefreshMergedSnaps();
+    }).catch(function() {
+        _wsfMergedSnapsLoading = false;
+        if (_wsfMergedSnapsRerun) _wsfRefreshMergedSnaps();
+    });
+}
+
+// Live PR state for a file's PR ref: the Pull Requests section's in-memory
+// GitHub state (_sidebarPRState, 120-ui-utils.js) wins, then meta.prs.
+// Returns null when the PR states are loaded but no workspace record knows
+// this PR (e.g. dropped with a deleted workspace) - the caller decides; while
+// the states are still loading it assumes 'open' (no flicker).
+function _wsfPrState(pr, wsKey) {
+    if (!pr) return null;
+    var live = (pr.url && typeof _sidebarPRState !== 'undefined' && _sidebarPRState) ? _sidebarPRState[pr.url] : null;
+    if (live === 'merged' || live === 'closed' || live === 'open') return live;
+    var repo = null;
+    var m = pr.url && /github\.com\/([^/]+\/[^/]+)\/pull\//.exec(pr.url);
+    if (m) repo = m[1];
+    else if (wsKey && typeof parseWsKey === 'function') repo = parseWsKey(wsKey).repo;
+    var st = pr.number ? _wsfPrStates[(repo || '') + '#' + pr.number] : null;
+    if (st) return st;
+    return _wsfMergedSnaps === null ? 'open' : null;
+}
+
+// Single source of truth for a row's status. Precedence:
+//   1. explicit later local action: DELETED / DISCARDED
+//   2. live workspace row is dirty with edits NOT in a PR (or edited since
+//      the push - even when that PR has since merged) -> MODIFIED / NEW
+//   3. pushed to a PR -> that PR's state: MERGED / CLOSED / IN PR (open)
+//      (a dirty row stamped pushed_pr_merged is merged work whose base has
+//      not synced yet -> MERGED)
+//   4. no PR evidence: a merged-PR snapshot touching the path -> MERGED,
+//      but only when the live row is not dirty
+//   5. fallback MODIFIED / NEW
+// Returns {key, label, title, pr, prNumber, prUrl} (prNumber/prUrl: the PR
+// shown as the row's #chip — the pushed PR, or a merged snapshot's PR).
+function _wsfStatusOf(f) {
+    var s = _wsfStatusOfRaw(f);
+    if (s.prNumber === undefined) s.prNumber = (s.pr && s.pr.number) || null;
+    if (s.prUrl === undefined) s.prUrl = (s.pr && s.pr.url) || null;
+    return s;
+}
+function _wsfStatusOfRaw(f) {
+    var live = f.live || null;
+    var pr = f.pushedPr && (f.pushedPr.url || f.pushedPr.number) ? f.pushedPr : null;
+    function edited() {
+        return f.isNew ? { key: 'new', label: t('NEW'), title: t('Uncommitted changes'), pr: pr }
+            : { key: 'modified', label: t('MODIFIED'), title: t('Uncommitted changes'), pr: pr };
+    }
+    if (f.isDeleted) return { key: 'deleted', label: t('DELETED'), title: '', pr: pr };
+    if (f.isDiscarded) return { key: 'discarded', label: t('DISCARDED'), title: '', pr: null };
+    // Edits after the push win over the merged marker: reconcile keeps
+    // pushed_pr_merged on dirty rows and later write/edit set
+    // changed_since_push, so the content is NOT what merged.
+    if (live && live.dirty && live.changedSincePush) return edited();
+    if (live && live.dirty && live.prMerged) {
+        return { key: 'merged', label: t('MERGED'), title: t('Merged in PR #{number}', { number: (pr && pr.number) || '' }), pr: pr };
+    }
+    if (live && live.dirty && !pr) return edited();
+    if (pr) {
+        var st = _wsfPrState(pr, f.wsKey);
+        // PR unknown to every workspace record: a dirty row is just edited.
+        if (!st && live && live.dirty) return edited();
+        if (st === 'merged') return { key: 'merged', label: t('MERGED'), title: t('Merged in PR #{number}', { number: pr.number || '' }), pr: pr };
+        if (st === 'closed') return { key: 'closed', label: t('CLOSED'), title: t('PR #{number}', { number: pr.number || '' }), pr: pr };
+        return { key: 'pr', label: t('IN PR'), title: t('PR #{number}', { number: pr.number || '' }), pr: pr };
+    }
+    if (!(live && live.dirty)) {
+        var snap = _wsfMergedSnapFor(f.path, f.wsKey);
+        if (snap) return { key: 'merged', label: t('MERGED'), title: t('Merged in PR #{number}', { number: snap.pr.number }), pr: null, prNumber: snap.pr.number || null, prUrl: snap.pr.url || null, snapFile: snap.file };
+    }
+    return edited();
 }
 
 // Sync lookup for render time; kicks the first load when never loaded.
@@ -277,15 +467,642 @@ function _wsfMergedSnapFor(path, wsKey) {
     return _wsfPickSnap(_wsfMergedSnaps[path], wsKey);
 }
 
+// --- Per-row +/- line counts (WSF-COUNTS) -----------------------------------
+// renderWorkspaceFilesSection is synchronous; contents live in IndexedDB. So
+// counts are computed async and cached per wsKey+path: render reads the cache
+// (a stale value stays visible until the refresh lands) and queues a load for
+// rows never loaded or invalidated since (workspaceMutated bumps
+// _wsfCountsGen). One batched async pass per render; it re-renders ONCE and
+// only when a row's visible counts changed, and each entry is stamped with the
+// generation it was loaded at so the follow-up render queues nothing (no loop).
+// Each entry also keeps a content signature (lengths + cheap hash) so an
+// unchanged file skips computeDiff on re-validation.
+// Entry: { gen, sig, adds, dels } — adds/dels null = no counts (stub, too big,
+// unresolvable, or no diff source).
+var _wsfCounts = Object.create(null);
+var _wsfCountsGen = 0;
+var _wsfCountsQueue = [];
+var _wsfCountsRunning = false;
+var _WSF_COUNT_MAX = 200 * 1024; // skip counting files larger than this (chars)
+
+// PR-file entries (f.prKey) count the PR's pushed diff, not the live one, so
+// they get their own cache slot.
+function _wsfCountKey(f) { return (f.prKey ? 'pr:' + f.prKey + '\u0000' : '') + String(f.wsKey || '') + '\u0000' + f.path; }
+
+function _wsfHash(s) {
+    var h = 5381;
+    for (var i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+    return s.length + ':' + (h >>> 0).toString(36);
+}
+
+function _wsfLineCount(s) {
+    if (!s) return 0;
+    var n = s.split('\n').length;
+    return s.charAt(s.length - 1) === '\n' ? n - 1 : n;
+}
+
+function _wsfInvalidateCounts() { _wsfCountsGen++; }
+
+// Sync render-time lookup; queues an async load when missing or stale.
+function _wsfCountsFor(f) {
+    var k = _wsfCountKey(f);
+    var e = _wsfCounts[k];
+    if ((!e || e.gen !== _wsfCountsGen) && !_wsfCountsQueue.some(function(q) { return q.k === k; })) {
+        _wsfCountsQueue.push({ k: k, f: f });
+    }
+    return e || null;
+}
+
+// Diff source for a row, mirroring wsfOpenDiff: a dirty live record wins,
+// else the merged-PR snapshot (fork auto-deleted / synced past the merge),
+// else the (clean) live record. Returns {oldText, newText} or null.
+async function _wsfCountSource(f) {
+    // PR-file entry: the PR's pushed snapshot (base → pushed blob) wins.
+    if (f.prFile) {
+        var ps = await _wsfPrSnapTexts(f.prFile);
+        if (ps) return ps;
+    }
+    if (typeof getWorkspaceFile !== 'function' && typeof getAllWorkspaceMetas !== 'function') return null;
+    var res = await _wsfResolve(f);
+    var rec = res && res.rec;
+    if (rec && rec.dirty) {
+        if (rec.stub && rec.content == null) return null;
+        return { oldText: rec.original_content != null ? rec.original_content : '', newText: rec.deleted ? '' : (rec.content || '') };
+    }
+    // Clean live record (pushed then synced, or fork gone): the row's own PR
+    // file entry (open / merged / closed), else a merged-PR snapshot.
+    if (typeof getWorkspaceBlobsBySha === 'function') {
+        var st = f._status || {};
+        var pf = _wsfPrFileOf(f, st.prNumber, st.prUrl);
+        if (!(pf && (pf.old_sha || pf.new_sha)) && _wsfMergedSnaps) {
+            var snap = _wsfPickSnap(_wsfMergedSnaps[f.path], f.wsKey);
+            pf = snap ? snap.file : null;
+        }
+        if (pf && (pf.old_sha || pf.new_sha)) {
+            var shas = [];
+            if (pf.old_sha) shas.push(pf.old_sha);
+            if (pf.new_sha) shas.push(pf.new_sha);
+            var blobs = await getWorkspaceBlobsBySha(shas);
+            if (!(pf.old_sha && blobs[pf.old_sha] == null) && !(pf.new_sha && blobs[pf.new_sha] == null)) {
+                return { oldText: pf.old_sha ? blobs[pf.old_sha] : '', newText: pf.new_sha ? blobs[pf.new_sha] : '' };
+            }
+        }
+    }
+    if (rec && !(rec.stub && rec.content == null)) {
+        return { oldText: rec.original_content != null ? rec.original_content : (rec.content || ''), newText: rec.deleted ? '' : (rec.content || '') };
+    }
+    return null;
+}
+
+async function _wsfRunCountQueue() {
+    if (_wsfCountsRunning || !_wsfCountsQueue.length) return;
+    _wsfCountsRunning = true;
+    var changed = false;
+    try {
+        while (_wsfCountsQueue.length) {
+            var job = _wsfCountsQueue.shift();
+            var gen = _wsfCountsGen;
+            var prev = _wsfCounts[job.k] || null;
+            var next = { gen: gen, sig: null, adds: null, dels: null };
+            try {
+                var src = await _wsfCountSource(job.f);
+                var o = src ? String(src.oldText == null ? '' : src.oldText) : '';
+                var n = src ? String(src.newText == null ? '' : src.newText) : '';
+                if (src && o.length <= _WSF_COUNT_MAX && n.length <= _WSF_COUNT_MAX && typeof computeDiff === 'function') {
+                    next.sig = _wsfHash(o) + '|' + _wsfHash(n);
+                    if (prev && prev.sig === next.sig && prev.adds != null) {
+                        next.adds = prev.adds; next.dels = prev.dels;
+                    } else if (o === '' || n === '') {
+                        // New / deleted file: computeDiff('' , x) also reports
+                        // the empty side's lone '' line as a change — count lines.
+                        next.adds = _wsfLineCount(n); next.dels = _wsfLineCount(o);
+                    } else {
+                        var adds = 0, dels = 0;
+                        computeDiff(o, n).forEach(function(d) {
+                            if (d.type === 'add') adds++;
+                            else if (d.type === 'remove') dels++;
+                        });
+                        next.adds = adds; next.dels = dels;
+                    }
+                }
+            } catch (e) { /* no counts for this row */ }
+            _wsfCounts[job.k] = next;
+            if (!prev || prev.adds !== next.adds || prev.dels !== next.dels) changed = true;
+        }
+    } finally {
+        _wsfCountsRunning = false;
+    }
+    if (changed && typeof renderVersionSidebar === 'function') renderVersionSidebar();
+}
+
+// Snapshot texts for a pushed PR file entry ({old_sha, new_sha}); null when
+// the entry has no shas or a referenced blob is gone.
+async function _wsfPrSnapTexts(pf) {
+    if (!pf || !(pf.old_sha || pf.new_sha) || typeof getWorkspaceBlobsBySha !== 'function') return null;
+    var shas = [];
+    if (pf.old_sha) shas.push(pf.old_sha);
+    if (pf.new_sha) shas.push(pf.new_sha);
+    var blobs = await getWorkspaceBlobsBySha(shas);
+    if (pf.old_sha && blobs[pf.old_sha] == null) return null;
+    if (pf.new_sha && blobs[pf.new_sha] == null) return null;
+    return { oldText: pf.old_sha ? blobs[pf.old_sha] : '', newText: pf.new_sha ? blobs[pf.new_sha] : '' };
+}
+
+// Kick the batched async count pass for entries queued by _wsfCountsFor.
+function _wsfKickCounts() {
+    if (_wsfCountsQueue.length && !_wsfCountsRunning) {
+        try { setTimeout(function() { _wsfRunCountQueue(); }, 0); } catch (e) { /* not fatal */ }
+    }
+}
+
+// Shared file-line markup (Workspace Files rows + PR file lists): name, dim
+// dir, right-aligned GitHub-style diffstat (+N / \u2212M, a zero side is
+// omitted) and the M / A / D change letter.
+function _wsfFileLineHtml(f, kind, onclick, tipExtra) {
+    var name = f.path.split('/').pop();
+    var dir = f.path.slice(0, f.path.length - name.length).replace(/\/$/, '');
+    var kindLabel = kind === 'new' ? t('NEW') : (kind === 'deleted' ? t('DELETED') : t('MODIFIED'));
+    var tip = [f.path, kindLabel].concat(tipExtra || []);
+    var c = _wsfCountsFor(f);
+    var hasCounts = !!(c && c.adds != null && (c.adds || c.dels));
+    if (hasCounts) tip.push(t('Lines added: {added}, removed: {removed}', { added: c.adds, removed: c.dels }));
+    var meta = '';
+    if (hasCounts) {
+        meta += '<span class="wsf-counts">'
+            + (c.adds ? '<span class="wsf-diff-add">+' + c.adds + '</span>' : '')
+            + (c.dels ? '<span class="wsf-diff-del">\u2212' + c.dels + '</span>' : '')
+            + '</span>';
+    }
+    return '<div class="wsf-card wsf-st-' + kind + '" data-status="' + kind + '" role="button" tabindex="0" data-kbd-click onclick="' + onclick + '" title="' + escapeHtml(tip.join('\n')) + '">'
+        + '<span class="wsf-name">' + escapeHtml(name) + '</span>'
+        + (dir ? '<span class="wsf-dir">' + escapeHtml(dir) + '</span>' : '')
+        + '<span class="wsf-meta">' + meta
+        + '<span class="wsf-letter wsf-k-' + kind + '" aria-label="' + escapeHtml(kindLabel) + '">' + _wsfLetters[kind] + '</span></span>'
+        + '</div>';
+}
+
+// True when a row belongs to no PR: uncommitted edits (incl. edits made
+// after a push - changedSincePush resolves to MODIFIED / NEW), or a deletion
+// that was not pushed. Pushed / merged / closed / discarded rows are out.
+function _wsfIsUncommitted(f, st) {
+    if (st.key === 'modified' || st.key === 'new') return true;
+    if (st.key === 'deleted') return !(f.pushedPr && !(f.live && f.live.changedSincePush));
+    return false;
+}
+
+// WS row click: the modal navigates the Workspace Files list.
+function wsfOpenWsFile(i) {
+    _wsfNavSource = 'ws';
+    _wsfSectionFiles = _wsfWsFiles;
+    return wsfOpenDiff(i);
+}
+
+// --- Pull Requests: per-PR file lists (WSF-PRFILES) --------------------------
+// pr url -> file entries rendered in the PR modal's "Files changed" tab
+// (onclick handlers use indexes).
+var _wsfPrLists = Object.create(null);
+
+function _wsfPrRepoKey(pr) {
+    var m = pr && pr.url && /github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/.exec(pr.url);
+    if (m) return m[1] + '#' + m[2];
+    return pr && pr.number ? '#' + pr.number : null;
+}
+
+// Files a PR contains. Sources, merged by path: (1) the durable
+// meta.prs[].files snapshot written by wsPush (open, merged and closed PRs),
+// (2) this chat's (and its workers') push results / ownership rows whose
+// pushedPr matches. Returns null when neither knows the PR's files.
+function _wsfFilesForPr(pr, chat) {
+    if (_wsfMergedSnaps === null) _wsfRefreshMergedSnaps();
+    var key = _wsfPrRepoKey(pr);
+    var byPath = Object.create(null), order = [];
+    function add(path, wsKey, pf, isNew, isDeleted) {
+        if (!path) return;
+        var e = byPath[path];
+        if (!e) { e = byPath[path] = { path: path, wsKey: wsKey || null, prKey: key, prUrl: pr.url, prNumber: pr.number, prFile: null, isNew: false, isDeleted: false, changes: [] }; order.push(path); }
+        if (pf && !e.prFile) e.prFile = pf;
+        if (wsKey && !e.wsKey) e.wsKey = wsKey;
+        if (isNew) e.isNew = true;
+        if (isDeleted) e.isDeleted = true;
+    }
+    var snap = key ? _wsfPrFiles[key] : null;
+    if (!snap && key && key.charAt(0) !== '#') {
+        // URL-less legacy lookups keyed '#N' only.
+        snap = _wsfPrFiles['#' + pr.number] || null;
+    }
+    if (snap) Object.keys(snap).forEach(function(p) { add(p, null, snap[p], false, false); });
+    var chatsToScan = [];
+    if (chat) chatsToScan.push(chat);
+    if (chat && chat.id && typeof getSubAgentChatsForChat === 'function') {
+        (getSubAgentChatsForChat(chat.id) || []).forEach(function(sc) { if (sc && sc.chat) chatsToScan.push(sc.chat); });
+    }
+    chatsToScan.forEach(function(c) {
+        var list = [];
+        try { list = getWsEditedFilesForChat(c) || []; } catch (e) { list = []; }
+        list.forEach(function(f) {
+            var p = f.pushedPr;
+            if (!p) return;
+            var same = (p.url && pr.url && p.url === pr.url) || (!p.url && p.number && p.number === pr.number);
+            if (same) add(f.path, f.wsKey, null, !!f.isNew, !!f.isDeleted);
+        });
+    });
+    if (!order.length) return null;
+    return order.map(function(p) { return byPath[p]; });
+}
+
+function _wsfPrKindOf(f) {
+    var pf = f.prFile;
+    if (pf) {
+        if (pf.deleted === true || pf.status === 'removed' || (pf.old_sha && !pf.new_sha)) return 'deleted';
+        if (pf.is_new === true || pf.isNew === true || pf.status === 'added' || (pf.new_sha && !pf.old_sha)) return 'new';
+        return 'modified';
+    }
+    if (f.isDeleted) return 'deleted';
+    if (f.isNew) return 'new';
+    return 'modified';
+}
+
+// "Files changed" tab of the PR modal: GitHub-style file headers (chevron,
+// path, +N / -M diffstat, M / A / D letter). Clicking a header expands its
+// diff INLINE below it (accordion) — no stacked overlay. Diffs load lazily on
+// first expand (_wsfPrFileDiff) and stay loaded while the modal is open.
+// CSP-polyfill-safe handlers only: fn(this, N).
+function _wsfPrFilesTabHtml(pr, files) {
+    _wsfPrLists[pr.url] = files || [];
+    if (!files || !files.length) return '<div class="wsf-empty">' + escapeHtml(t('Files not recorded')) + '</div>';
+    var html = '<div class="wsf-pr-files-bar"><button type="button" class="wsf-pr-toggle-all" aria-expanded="false" onclick="wsfPrToggleAll(this)">' + escapeHtml(t('Expand all')) + '</button></div>';
+    html += '<div class="wsf-pr-file-list">';
+    files.forEach(function(f, idx) {
+        var kind = _wsfPrKindOf(f);
+        var kindLabel = kind === 'new' ? t('NEW') : (kind === 'deleted' ? t('DELETED') : t('MODIFIED'));
+        var c = _wsfStoredCounts(f) || _wsfCountsFor(f);
+        html += '<div class="wsf-pr-file wsf-st-' + kind + '">'
+            + '<div class="wsf-pr-file-head" role="button" tabindex="0" data-kbd-click aria-expanded="false" data-idx="' + idx + '" onclick="wsfTogglePrFileDiff(this, ' + idx + ')" title="' + escapeHtml(f.path) + '">'
+            + '<span class="wsf-pr-file-chev" aria-hidden="true">' + ((typeof UI_ICONS !== 'undefined' && UI_ICONS.chevronRight) || '\u203a') + '</span>'
+            + '<span class="wsf-pr-file-path">' + escapeHtml(f.path) + '</span>'
+            + '<span class="wsf-meta">' + _wsfCountsHtml(c && c.adds != null ? c : null)
+            + '<span class="wsf-letter wsf-k-' + kind + '" aria-label="' + escapeHtml(kindLabel) + '">' + _wsfLetters[kind] + '</span></span>'
+            + '</div>'
+            + '<div class="wsf-pr-file-body" hidden></div>'
+            + '</div>';
+    });
+    html += '</div>';
+    _wsfKickCounts();
+    return html;
+}
+
+// +/- counts stored by wsPush on the PR file entry (meta.prs[].files[].adds /
+// .dels) so the PR view renders them immediately; null for legacy entries or
+// files too large to count at push time.
+function _wsfStoredCounts(f) {
+    var pf = f && f.prFile;
+    if (!pf || typeof pf.adds !== 'number' || typeof pf.dels !== 'number') return null;
+    return { adds: pf.adds, dels: pf.dels };
+}
+
+// Compact GitHub-style diffstat (+N \u2212M, a zero side omitted); an empty
+// .wsf-counts placeholder when unknown (filled once the diff loads).
+function _wsfCountsHtml(c) {
+    if (!c || !(c.adds || c.dels)) return '<span class="wsf-counts"></span>';
+    return '<span class="wsf-counts">'
+        + (c.adds ? '<span class="wsf-diff-add">+' + c.adds + '</span>' : '')
+        + (c.dels ? '<span class="wsf-diff-del">\u2212' + c.dels + '</span>' : '')
+        + '</span>';
+}
+
+// Diff for a PR file entry. Sources, in order: the PR's pushed snapshot
+// (base -> pushed blobs), the merged-PR snapshot when the live record is gone
+// or clean, then the live workspace record. Resolves { html, adds, dels } or
+// null when nothing resolves.
+async function _wsfPrFileDiff(f) {
+    var tx = null, note = '';
+    try { if (f.prFile) tx = await _wsfPrSnapTexts(f.prFile); } catch (e) { tx = null; }
+    if (!tx) {
+        var res = await _wsfResolve(f);
+        if (!res || !(res.rec && res.rec.dirty)) {
+            try { tx = await _wsfMergedSnapTexts(f); } catch (e) { tx = null; }
+        }
+        if (!tx && res && res.rec) {
+            tx = { oldText: res.rec.original_content != null ? res.rec.original_content : '', newText: res.rec.deleted ? '' : (res.rec.content || '') };
+            if (!res.rec.dirty) note = '<div class="wsf-file-meta">' + t('File has no uncommitted changes \u2014 it matches its base.') + '</div>';
+        }
+    }
+    if (!tx) return null;
+    var out = {};
+    var html = note + _wsfRenderDiffHtml(tx.oldText, tx.newText, out);
+    return { html: html, adds: out.adds || 0, dels: out.dels || 0 };
+}
+
+var _WSF_SPINNER_DELAY_MS = 300;
+
+// Lazy-load one file's inline diff (once per modal; the promise is cached on
+// the .wsf-pr-file element). Resolves true when a diff rendered.
+function _wsfLoadPrFileDiff(item, f) {
+    if (item._wsfLoad) return item._wsfLoad;
+    var body = item.querySelector('.wsf-pr-file-body');
+    // Local blobs resolve in a few ms: show "Loading..." only if the diff is
+    // still pending after a short delay (no spinner flash on open).
+    var settled = false, spin = null;
+    try {
+        spin = setTimeout(function() { if (!settled) body.innerHTML = '<div class="wsf-empty">' + escapeHtml(t('Loading...')) + '</div>'; }, _WSF_SPINNER_DELAY_MS);
+    } catch (e) { spin = null; }
+    function done() { settled = true; if (spin) { try { clearTimeout(spin); } catch (e) {} } }
+    item._wsfLoad = Promise.resolve().then(function() { return _wsfPrFileDiff(f); }).then(function(d) {
+        done();
+        if (!d) {
+            body.innerHTML = '<div class="wsf-empty">' + escapeHtml(_wsfNotFoundText(f)) + '</div>';
+            return false;
+        }
+        body.innerHTML = d.html;
+        var counts = item.querySelector('.wsf-pr-file-head .wsf-counts');
+        if (counts && counts.parentNode) counts.outerHTML = _wsfCountsHtml(d);
+        return true;
+    }).catch(function(e) {
+        done();
+        item._wsfLoad = null; // allow a retry on the next expand
+        body.innerHTML = '<div class="wsf-empty">' + escapeHtml((e && e.message) || String(e)) + '</div>';
+        return false;
+    });
+    return item._wsfLoad;
+}
+
+// Header click: expand/collapse the file's diff in place. el = the
+// .wsf-pr-file-head. Resolves the new expanded state.
+function wsfTogglePrFileDiff(el, idx) {
+    el = el && el.closest ? el.closest('.wsf-pr-file-head') : null;
+    var item = el ? el.parentNode : null;
+    var host = el ? el.closest('.wsf-pr-modal-files') : null;
+    var url = host ? host.getAttribute('data-pr-url') : null;
+    var f = url && _wsfPrLists[url] ? _wsfPrLists[url][idx] : null;
+    var body = item && item.querySelector ? item.querySelector('.wsf-pr-file-body') : null;
+    if (!f || !body) return Promise.resolve(false);
+    var open = el.getAttribute('aria-expanded') !== 'true';
+    el.setAttribute('aria-expanded', open ? 'true' : 'false');
+    item.classList.toggle('open', open);
+    body.hidden = !open;
+    if (!open) return Promise.resolve(false);
+    return _wsfLoadPrFileDiff(item, f).then(function() { return true; });
+}
+
+// "Expand all" / "Collapse all": expands every file when any is collapsed,
+// else collapses all. btn = the .wsf-pr-toggle-all button.
+function wsfPrToggleAll(btn) {
+    btn = btn && btn.closest ? btn.closest('.wsf-pr-toggle-all') : null;
+    var host = btn ? btn.closest('.wsf-pr-modal-files') : null;
+    if (!host) return false;
+    var heads = Array.prototype.slice.call(host.querySelectorAll('.wsf-pr-file-head'));
+    var expand = heads.some(function(h) { return h.getAttribute('aria-expanded') !== 'true'; });
+    heads.forEach(function(h) {
+        if ((h.getAttribute('aria-expanded') === 'true') !== expand) wsfTogglePrFileDiff(h, parseInt(h.getAttribute('data-idx'), 10));
+    });
+    btn.textContent = expand ? t('Collapse all') : t('Expand all');
+    btn.setAttribute('aria-expanded', expand ? 'true' : 'false');
+    return expand;
+}
+
+// --- PR modal (WSF-PRMODAL): GitHub-style title / state / branches header,
+// Conversation (markdown description) + Files changed tabs. Reuses the
+// standard _wsfOverlay modal; file diffs expand inline (_wsfPrFilesTabHtml).
+var _wsfPrDetailCache = Object.create(null); // pr url -> fetched detail
+
+function _wsfIcon(name) { return (typeof UI_ICONS !== 'undefined' && UI_ICONS && UI_ICONS[name]) || ''; }
+
+function _wsfPrInfoOf(pr) {
+    var key = _wsfPrRepoKey(pr);
+    var info = (key && _wsfPrInfos[key]) || {};
+    var det = (pr && pr.url && _wsfPrDetailCache[pr.url]) || {};
+    var live = (typeof _sidebarPRState !== 'undefined' && pr && pr.url) ? _sidebarPRState[pr.url] : null;
+    var st = (live === 'merged' || live === 'closed' || live === 'open') ? live : (det.state || info.state || (key && _wsfPrStates[key]) || (pr && pr.state) || 'open');
+    return { url: pr.url || info.url || null, number: pr.number || info.number || null, title: det.title || info.title || pr.title || '', body: typeof det.body === 'string' ? det.body : (info.body || null), head: det.head || info.branch || null, base: det.base || info.base || null, state: st };
+}
+
+function _wsfPrStateBadgeHtml(state) {
+    var st = state === 'merged' ? 'merged' : (state === 'closed' ? 'closed' : 'open');
+    var icon = st === 'merged' ? _wsfIcon('gitMerge') : (st === 'closed' ? _wsfIcon('close') : _wsfIcon('gitBranch'));
+    var label = st === 'merged' ? t('MERGED') : (st === 'closed' ? t('CLOSED') : t('OPEN'));
+    return '<span class="wsf-pr-state wsf-pr-state-' + st + '">' + icon + '<span>' + escapeHtml(label) + '</span></span>';
+}
+
+// Diff/view modal PR reference: a button-styled chip (icon + title + muted
+// #N + state badge) that opens the PR modal. extra: optional muted suffix.
+function _wsfPrChipLineHtml(pr, extra) {
+    var info = _wsfPrInfoOf(pr || {});
+    var title = info.title || t('Pull request');
+    return '<div class="wsf-file-meta wsf-pr-chip-line"><button type="button" class="wsf-pr-chip" data-pr-url="' + escapeHtml(info.url || '') + '" data-pr-number="' + escapeHtml(String(info.number || '')) + '" onclick="wsfOpenPrModal(this, event)" title="' + escapeHtml(t('Open pull request #{number}', { number: info.number || '' })) + '">'
+        + '<span class="wsf-pr-chip-icon">' + _wsfIcon('gitBranch') + '</span>'
+        + '<span class="wsf-pr-chip-title">' + escapeHtml(title) + '</span>'
+        + '<span class="wsf-pr-chip-num">#' + escapeHtml(String(info.number || '')) + '</span>'
+        + _wsfPrStateBadgeHtml(info.state) + '</button>'
+        + (extra ? '<span class="wsf-pr-chip-extra">' + escapeHtml(extra) + '</span>' : '') + '</div>';
+}
+
+function _wsfPrHeadHtml(info) {
+    var br = (info.head || info.base) ? '<span class="wsf-pr-branches">' + (info.head ? '<code>' + escapeHtml(info.head) + '</code>' : '') + (info.base ? ' \u2192 <code>' + escapeHtml(info.base) + '</code>' : '') + '</span>' : '';
+    return '<div class="wsf-pr-head"><div class="wsf-pr-title-row"><span class="wsf-pr-title">' + escapeHtml(info.title || t('Pull request')) + '</span> <span class="wsf-pr-num">#' + escapeHtml(String(info.number || '')) + '</span></div>'
+        + '<div class="wsf-pr-sub">' + _wsfPrStateBadgeHtml(info.state) + br
+        + (info.url ? '<a class="sn-artifact-icon-btn wsf-pr-gh" href="' + escapeHtml(info.url) + '" target="_blank" rel="noopener noreferrer" title="' + escapeHtml(t('Open on GitHub')) + '" aria-label="' + escapeHtml(t('Open on GitHub')) + '">' + _wsfIcon('externalLink') + '</a>' : '')
+        + '</div></div>';
+}
+
+function _wsfPrDescHtml(body) {
+    if (!body || !String(body).trim()) return '<div class="wsf-empty">' + escapeHtml(t('No description provided.')) + '</div>';
+    var html = typeof fvRenderMarkdown === 'function' ? fvRenderMarkdown(String(body)) : '<pre class="wsf-code">' + escapeHtml(String(body)) + '</pre>';
+    return '<div class="wsf-pr-desc fv-md message-content">' + html + '</div>';
+}
+
+// Description: stored meta.prs body first, else GitHub GET /pulls/N (cached
+// per url on success). Resolves the detail object or null.
+async function _wsfFetchPrDetail(pr) {
+    var info = _wsfPrInfoOf(pr);
+    if (info.body != null) return info;
+    var parsed = typeof parsePrUrl === 'function' && pr.url ? parsePrUrl(pr.url) : null;
+    if (!parsed || typeof githubApi !== 'function') return info;
+    var res = await githubApi('GET', '/repos/' + parsed.repo + '/pulls/' + parsed.number);
+    if (!res || !res.ok || !res.body || typeof res.body !== 'object') throw new Error((res && (res.error || res.status)) || 'request failed');
+    var b = res.body;
+    _wsfPrDetailCache[pr.url] = { title: b.title || '', body: b.body || '', state: b.merged ? 'merged' : (b.state === 'closed' ? 'closed' : 'open'), head: b.head && b.head.ref, base: b.base && b.base.ref };
+    return _wsfPrInfoOf(pr);
+}
+
+// PR reference from a clicked element (sidebar row / chip): {url, number,
+// title} or null. el carries data-pr-url / data-pr-number or sits inside an
+// element that does (.pr-sidebar-entry).
+function _wsfPrFromEl(el) {
+    var src = el && el.getAttribute && el.getAttribute('data-pr-url') ? el : (el && el.closest ? el.closest('[data-pr-url]') : null);
+    var url = src ? src.getAttribute('data-pr-url') : null;
+    if (!url) return null;
+    var titleEl = src.querySelector ? src.querySelector('.pr-sidebar-title') : null;
+    return { url: url, number: parseInt(src.getAttribute('data-pr-number'), 10) || _wsfPrNumberOfUrl(url), title: titleEl ? titleEl.textContent : '' };
+}
+
+function _wsfPrNumberOfUrl(url) {
+    var m = url && /\/pull\/(\d+)/.exec(url);
+    return m ? parseInt(m[1], 10) : null;
+}
+
+// PR modal body: Conversation + Files changed
+// tabs. Renders synchronously from stored data (meta.prs: title, body,
+// head/base, files with shas and +/- counts).
+function _wsfPrViewParts(pr) {
+    var info = _wsfPrInfoOf(pr);
+    var chat = (typeof chats !== 'undefined' && typeof currentChatId !== 'undefined') ? chats[currentChatId] : null;
+    var files = _wsfFilesForPr(pr, chat);
+    var filesHtml = '<div class="wsf-pr-modal-files" data-pr-url="' + escapeHtml(pr.url) + '">' + _wsfPrFilesTabHtml(pr, files) + '</div>';
+    var body = '<div class="wsf-pr-tabs" role="tablist">'
+        + '<button type="button" role="tab" class="wsf-pr-tab active" aria-selected="true" data-tab="conv" onclick="wsfPrModalTab(this, \'conv\')">' + escapeHtml(t('Conversation')) + '</button>'
+        + '<button type="button" role="tab" class="wsf-pr-tab" aria-selected="false" data-tab="files" onclick="wsfPrModalTab(this, \'files\')">' + escapeHtml(t('Files changed')) + ' <span class="wsf-pr-count">' + (files ? files.length : 0) + '</span></button></div>'
+        + '<div class="wsf-pr-pane" data-pane="conv" role="tabpanel">' + (info.body != null ? _wsfPrDescHtml(info.body) : '<div class="wsf-empty">' + escapeHtml(t('Loading...')) + '</div>') + '</div>'
+        + '<div class="wsf-pr-pane" data-pane="files" role="tabpanel" hidden>' + filesHtml + '</div>';
+    return { info: info, headHtml: _wsfPrHeadHtml(info), bodyHtml: body };
+}
+
+// After render: legacy PRs (no stored body) fetch with a visible loading
+// state; PRs with stored data get a SILENT live check (_wsfPrLiveCheck).
+// root = the PR modal overlay.
+function _wsfPrAfterRender(root, pr, info) {
+    if (info.body == null) {
+        _wsfFetchPrDetail(pr).then(function(d) {
+            var pane = root.querySelector('[data-pane="conv"]');
+            if (pane) pane.innerHTML = _wsfPrDescHtml(d.body);
+            var head = root.querySelector('.wsf-pr-head');
+            if (head) head.outerHTML = _wsfPrHeadHtml(d);
+        }).catch(function(e) {
+            var pane = root.querySelector('[data-pane="conv"]');
+            if (pane) pane.innerHTML = '<div class="wsf-empty">' + escapeHtml(t('Could not load the PR description: {error}', { error: (e && e.message) || String(e) })) + '</div>';
+        });
+        return null;
+    }
+    return _wsfPrLiveCheck(root, pr, info);
+}
+
+// --- Silent live check (stored data shown first) ---------------------------
+// GET /pulls/N at most once per url per _WSF_PR_LIVE_TTL_MS (deduped while in
+// flight). Only REAL changes are applied, in place: the state badge, the
+// title text and the description node. Never re-renders the view, so
+// expanded diffs, scroll position and the active tab are kept. Failures are
+// silent (the stored data stays).
+var _WSF_PR_LIVE_TTL_MS = 60000;
+var _wsfPrLive = Object.create(null); // url -> { at, promise }
+
+function _wsfPrLiveFetch(pr) {
+    var url = pr && pr.url;
+    var parsed = url && typeof parsePrUrl === 'function' ? parsePrUrl(url) : null;
+    if (!parsed || typeof githubApi !== 'function') return Promise.resolve(null);
+    var e = _wsfPrLive[url];
+    var now = Date.now();
+    if (e && (e.inflight || now - e.at < _WSF_PR_LIVE_TTL_MS)) return e.promise;
+    e = _wsfPrLive[url] = { at: now, inflight: true, promise: null };
+    e.promise = Promise.resolve().then(function() {
+        return githubApi('GET', '/repos/' + parsed.repo + '/pulls/' + parsed.number);
+    }).then(function(res) {
+        e.inflight = false;
+        if (!res || !res.ok || !res.body || typeof res.body !== 'object') return null;
+        var b = res.body;
+        var det = { title: b.title || '', body: b.body || '', state: b.merged ? 'merged' : (b.state === 'closed' ? 'closed' : 'open'), head: b.head && b.head.ref, base: b.base && b.base.ref };
+        // Invalidated meanwhile (_wsfApplyPrInfos): don't resurrect the cache.
+        if (_wsfPrLive[url] === e) _wsfPrDetailCache[url] = det;
+        return det;
+    }, function() { e.inflight = false; return null; });
+    return e.promise;
+}
+
+function _wsfPrLiveCheck(root, pr, shown) {
+    return _wsfPrLiveFetch(pr).then(function(det) {
+        if (!det || !root) return { changed: [] };
+        var changed = [];
+        if (det.state && det.state !== shown.state) {
+            var badge = root.querySelector('.wsf-pr-head .wsf-pr-state');
+            if (badge) { badge.outerHTML = _wsfPrStateBadgeHtml(det.state); changed.push('state'); }
+        }
+        if (det.title && det.title !== shown.title) {
+            var te = root.querySelector('.wsf-pr-head .wsf-pr-title');
+            if (te) { te.textContent = det.title; changed.push('title'); }
+        }
+        if (typeof det.body === 'string' && det.body !== (shown.body || '')) {
+            var conv = root.querySelector('[data-pane="conv"]');
+            if (conv) { conv.innerHTML = _wsfPrDescHtml(det.body); changed.push('body'); }
+        }
+        if (changed.length) {
+            shown.state = det.state || shown.state;
+            shown.title = det.title || shown.title;
+            shown.body = det.body;
+            _wsfPersistPrDetail(pr, det);
+        }
+        return { changed: changed };
+    }).catch(function() { return { changed: [] }; }); // silent: stored data stays
+}
+
+// Best effort: write a changed title / body back to the meta.prs entries of
+// that PR (state is left to the sidebar's merge lifecycle).
+function _wsfPersistPrDetail(pr, det) {
+    if (typeof getAllWorkspaceMetas !== 'function' || typeof patchWorkspaceMeta !== 'function') return;
+    try {
+        getAllWorkspaceMetas().then(function(metas) {
+            (metas || []).forEach(function(m) {
+                var hit = (m && Array.isArray(m.prs)) && m.prs.some(function(p) { return p && p.url === pr.url; });
+                if (!hit) return;
+                patchWorkspaceMeta(m.repo, function(cur) {
+                    var dirty = false;
+                    (cur.prs || []).forEach(function(p) {
+                        if (!p || p.url !== pr.url) return;
+                        if (det.title && p.title !== det.title) { p.title = det.title; dirty = true; }
+                        if (typeof det.body === 'string' && p.body !== det.body) { p.body = det.body.slice(0, 20000); dirty = true; }
+                    });
+                    return dirty ? undefined : false;
+                }).catch(function() {});
+            });
+        }).catch(function() {});
+    } catch (e) { /* not fatal */ }
+}
+
+// Entry point (sidebar PR rows, diff-modal PR chip): the GitHub-style PR
+// modal, rendered from stored data then silently live-checked. CSP-
+// polyfill-safe handler: onclick="wsfOpenPrModal(this, event)".
+function wsfOpenPrModal(el, ev) {
+    if (ev && typeof ev.stopPropagation === 'function') ev.stopPropagation();
+    if (ev && typeof ev.preventDefault === 'function') ev.preventDefault();
+    var pr = _wsfPrFromEl(el);
+    if (!pr) return null;
+    var url = pr.url;
+    // Already open (e.g. the PR chip of a diff modal): bring it to the top
+    // and focus it instead of stacking a second PR modal.
+    var existing = _wsfFindPrOverlay(url);
+    if (existing) {
+        document.body.appendChild(existing);
+        var cb = existing.querySelector('.wsf-modal-close');
+        if (cb && typeof cb.focus === 'function') cb.focus();
+        return existing;
+    }
+    var parts = _wsfPrViewParts(pr);
+    var overlay = _wsfOverlay(parts.headHtml, parts.bodyHtml, { returnFocus: el && el.focus ? el : null });
+    overlay.classList.add('wsf-pr-overlay');
+    overlay.setAttribute('data-pr-url', url);
+    _wsfPrAfterRender(overlay, pr, parts.info);
+    return overlay;
+}
+
+function _wsfFindPrOverlay(url) {
+    if (typeof document === 'undefined' || !document.querySelectorAll) return null;
+    var all = document.querySelectorAll('.wsf-pr-overlay');
+    for (var i = 0; i < all.length; i++) if (all[i].getAttribute('data-pr-url') === url) return all[i];
+    return null;
+}
+
+function wsfPrModalTab(btn, which) {
+    var modal = btn && btn.closest ? btn.closest('.wsf-modal') : null;
+    if (!modal) return;
+    modal.querySelectorAll('.wsf-pr-tab').forEach(function(b) { var on = b.getAttribute('data-tab') === which; b.classList.toggle('active', on); b.setAttribute('aria-selected', on ? 'true' : 'false'); });
+    modal.querySelectorAll('.wsf-pr-pane').forEach(function(p) { p.hidden = p.getAttribute('data-pane') !== which; });
+}
+
 // --- Sidebar section renderer (called from renderVersionSidebar) ------------
 
 function renderWorkspaceFilesSection(chat) {
     var files = getWsEditedFilesForChat(chat);
     // Sub-agent aggregation: files edited from this chat's sub-agent chats
-    // surface in the parent sidebar too, attributed with a worker-name chip
-    // (f.workers). De-duped by workspace and path — when both the parent and a worker
-    // touched the same workspace/path the change lists are merged (change-count badge
-    // includes both) but the parent's status flags win: cross-chat ordering
+    // surface in the parent sidebar too, attributed to the worker in the row
+    // tooltip (f.workers). De-duped by workspace and path — when both the parent and a worker
+    // touched the same workspace/path the change lists are merged but the parent's status flags win: cross-chat ordering
     // is not derivable from per-chat message indexes. Uses the global
     // currentChatId (renderVersionSidebar always passes chats[currentChatId]);
     // getSubAgentChatsForChat (120-ui-utils.js) never returns siblings, so
@@ -309,6 +1126,7 @@ function renderWorkspaceFilesSection(chat) {
                     own.changes = own.changes.concat(sf.changes);
                     if (sf.isNew) own.isNew = true;
                     if (sf.pushedPr && !own.pushedPr) own.pushedPr = sf.pushedPr;
+                    if (sf.live && !own.live) own.live = sf.live;
                     if (!own.workers) own.workers = [];
                     if (own.workers.indexOf(sc.name) === -1) own.workers.push(sc.name);
                 } else {
@@ -319,45 +1137,49 @@ function renderWorkspaceFilesSection(chat) {
             });
         });
     }
-    _wsfSectionFiles = files;
-    if (files.length === 0) return '';
+    if (files.length === 0) { _wsfWsFiles = []; if (_wsfNavSource !== 'pr') _wsfSectionFiles = []; return ''; }
+
+    // WSF-SCOPE: only files that belong to no PR (see _wsfIsUncommitted).
+    if (_wsfMergedSnaps === null) _wsfRefreshMergedSnaps(); // status needs PR states + live rows
+    var groups = [], byWs = Object.create(null), shown = [];
+    files.forEach(function(f) {
+        f._status = _wsfStatusOf(f);
+        if (!_wsfIsUncommitted(f, f._status)) return;
+        var g = String(f.wsKey || '');
+        if (!byWs[g]) { byWs[g] = { wsKey: f.wsKey || null, files: [] }; groups.push(byWs[g]); }
+        byWs[g].files.push(f);
+    });
+    groups.forEach(function(g) { shown = shown.concat(g.files); });
+    _wsfWsFiles = shown;
+    // Keep an open PR-file modal's navigation list across re-renders.
+    var prModalOpen = _wsfNavSource === 'pr' && typeof document !== 'undefined' && document.querySelector && document.querySelector('.wsf-overlay');
+    if (!prModalOpen) { _wsfNavSource = 'ws'; _wsfSectionFiles = shown; }
+    if (!shown.length) return '';
+
+    var i = -1;
+    function row(f) {
+        i++;
+        var tipExtra = [];
+        if (f.wsKey) tipExtra.push(f.wsKey);
+        (f.workers || []).forEach(function(w) { tipExtra.push(t('Edited by worker {name}', { name: w })); });
+        return _wsfFileLineHtml(f, f._status.key, 'wsfOpenWsFile(' + i + ')', tipExtra);
+    }
 
     var html = '<div class="version-wsfiles-section">';
-    html += '<div class="version-section-title">' + t('Workspace Files ({count})', { count: files.length }) + '</div>';
-    html += '<div class="version-files-list">';
-    files.forEach(function(f, i) {
-        var name = f.path.split('/').pop();
-        var dir = f.path.slice(0, f.path.length - name.length).replace(/\/$/, '');
-        var badge;
-        // A merged-PR snapshot overrides MODIFIED/NEW (the edit landed — that
-        // is the more useful state), but never DELETED/DISCARDED which reflect
-        // an explicit later local action.
-        var mergedSnap = (!f.isDeleted && !f.isDiscarded) ? _wsfMergedSnapFor(f.path, f.wsKey) : null;
-        if (f.isDeleted) badge = '<span class="sn-status-badge sn-status-deleted">' + t('DELETED') + '</span>';
-        else if (f.isDiscarded) badge = '<span class="sn-status-badge sn-status-reverted">' + t('DISCARDED') + '</span>';
-        else if (mergedSnap) badge = '<span class="sn-status-badge sn-status-merged" title="' + escapeHtml(t('Merged in PR #{number}', { number: mergedSnap.pr.number })) + '">' + t('MERGED') + '</span>';
-        else if (f.isNew) badge = '<span class="sn-status-badge sn-status-new">' + t('NEW') + '</span>';
-        else badge = '<span class="sn-status-badge sn-status-modified">' + t('MODIFIED') + '</span>';
-        var changesBadge = f.changes.length > 1 ? '<span class="sn-changes-badge">' + tn(f.changes.length, '{count} change', '{count} changes') + '</span>' : '';
-        var wsLabel = f.wsKey ? escapeHtml(f.wsKey.split('/').pop()) : '';
-        var workerChips = (f.workers && f.workers.length)
-            ? f.workers.map(function(w) { return '<span class="wsf-ws" title="' + escapeHtml(t('Edited by worker {name}', { name: w })) + '">' + escapeHtml(w) + '</span>'; }).join('')
-            : '';
-
-        // Diff-first: the most useful view of an edited file is what changed.
-        html += '<div class="sn-artifact-card sidebar-card wsf-card" role="button" tabindex="0" data-kbd-click onclick="wsfOpenDiff(' + i + ')" title="' + escapeHtml(f.path) + '">';
-        html += '<div class="sn-artifact-content">';
-        html += '<div class="sn-artifact-name">' + escapeHtml(name) + '</div>';
-        // WSF-PR: link the PR the file was pushed to (own or worker push).
-        var prChip = (f.pushedPr && f.pushedPr.url)
-            ? '<a class="wsf-ws wsf-pr" href="' + escapeHtml(f.pushedPr.url) + '" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="' + escapeHtml(t('PR #{number}', { number: f.pushedPr.number || '' })) + '">' + escapeHtml('#' + (f.pushedPr.number || 'PR')) + '</a>'
-            : '';
-        html += '<div class="sn-artifact-meta">' + (dir ? '<span class="wsf-dir">' + escapeHtml(dir) + '</span>' : '') + (wsLabel ? '<span class="wsf-ws">' + wsLabel + '</span>' : '') + workerChips + badge + prChip + changesBadge + '</div>';
-        html += '</div>';
+    html += '<div class="version-section-title">' + t('Workspace Files ({count})', { count: shown.length }) + '</div>';
+    // Label groups only when >1 KNOWN workspace has files (rows whose call
+    // omitted `workspace` form an unlabelled group otherwise).
+    var labelled = groups.filter(function(g) { return g.wsKey; }).length > 1;
+    groups.forEach(function(g) {
+        if (labelled) {
+            html += '<div class="wsf-group-label"' + (g.wsKey ? ' title="' + escapeHtml(g.wsKey) + '">' + escapeHtml(g.wsKey.split('/').pop()) : '>' + escapeHtml(t('workspace'))) + '</div>';
+        }
+        html += '<div class="wsf-list">';
+        g.files.forEach(function(f) { html += row(f); });
         html += '</div>';
     });
     html += '</div>';
-    html += '</div>';
+    _wsfKickCounts();
     return html;
 }
 
@@ -500,7 +1322,8 @@ function wsfNavFile(i, act) {
 // mounted — closing it first left a gap with no modal at all, which made the
 // dialog visibly flash (close + reopen) on every header icon / next click.
 function wsfHeaderAction(i, act) {
-    var old = Array.prototype.slice.call(document.querySelectorAll('.wsf-overlay'));
+    // The PR modal (.wsf-pr-overlay) under a stacked diff stays open.
+    var old = Array.prototype.slice.call(document.querySelectorAll('.wsf-overlay:not(.wsf-pr-overlay)'));
     function closeOld() { old.forEach(function(o) { o._wsfClose ? o._wsfClose() : o.remove(); }); }
     if (act === 'discard') {
         // Discard opens a confirm dialog, not a replacement wsf modal — close
@@ -535,7 +1358,8 @@ async function wsfOpenViewer(i) {
     var res = await _wsfResolve(f);
     if (!res) {
         // Live record gone (fork auto-deleted on merge, repo re-cloned) —
-        // show the merged PR's pushed content when a snapshot exists.
+        // show the PR entry's pushed snapshot, else the merged PR's pushed
+        // content when a snapshot exists.
         if (await _wsfOpenMergedView(f, i)) return true;
         _wsfNotFoundMsg(f); return false;
     }
@@ -557,7 +1381,8 @@ async function wsfOpenViewer(i) {
 // computeDiff() (090-version-history.js) is a generic line LCS;
 // computeWordDiffsForLines() (same file) adds word-level (intra-line)
 // highlights on paired remove/add lines, like the record diff viewer.
-function _wsfRenderDiffHtml(oldText, newText) {
+// out (optional): receives { adds, dels }.
+function _wsfRenderDiffHtml(oldText, newText, out) {
     var diff = computeDiff(oldText || '', newText || '');
     var wordDiffs = computeWordDiffsForLines(diff);
     var adds = 0, dels = 0;
@@ -565,6 +1390,7 @@ function _wsfRenderDiffHtml(oldText, newText) {
         if (d.type === 'add') adds++;
         else if (d.type === 'remove') dels++;
     });
+    if (out) { out.adds = adds; out.dels = dels; }
     if (adds === 0 && dels === 0) {
         return '<div class="wsf-empty">' + t('No differences') + '</div>';
     }
@@ -575,7 +1401,8 @@ function _wsfRenderDiffHtml(oldText, newText) {
         if (d.type === 'same') return;
         for (var j = Math.max(0, idx - CONTEXT); j <= Math.min(diff.length - 1, idx + CONTEXT); j++) visible[j] = true;
     });
-    var html = '<div class="wsf-diff-stats"><span class="wsf-diff-add">+' + adds + '</span><span class="wsf-diff-del">\u2212' + dels + '</span></div>';
+    // GitHub-style: omit the zero side (+12, not +12 \u22120).
+    var html = '<div class="wsf-diff-stats">' + (adds ? '<span class="wsf-diff-add">+' + adds + '</span>' : '') + (dels ? '<span class="wsf-diff-del">\u2212' + dels + '</span>' : '') + '</div>';
     html += '<div class="diff-container"><div class="diff-lines">';
     var hiddenRun = 0;
     function flushHidden() {
@@ -626,29 +1453,27 @@ async function wsfOpenDiff(i) {
 // snapshot existed (with durable blobs) and the modal was shown; false falls
 // through to the caller's default behavior (old chats / PRs pushed before
 // snapshots existed, or snapshot blobs lost).
+// Merged-PR snapshot texts for a section entry: { oldText, newText, snap }
+// or null (no snapshot, or a referenced blob is gone — pre-fix GC, quota
+// failure at push time; never render a half-empty diff that pretends the
+// file was created or deleted).
+async function _wsfMergedSnapTexts(f) {
+    if (typeof getAllWorkspaceMetas !== 'function' || typeof getWorkspaceBlobsBySha !== 'function') return null;
+    var snap = _wsfPickSnap(_wsfCollectMergedSnaps(await getAllWorkspaceMetas())[f.path], f.wsKey);
+    if (!snap) return null;
+    var tx = await _wsfPrSnapTexts(snap.file);
+    if (!tx && (snap.file.old_sha || snap.file.new_sha)) return null;
+    return { oldText: tx ? tx.oldText : '', newText: tx ? tx.newText : '', snap: snap };
+}
+
 async function _wsfOpenMergedDiff(f, i) {
     try {
-        if (typeof getAllWorkspaceMetas !== 'function' || typeof getWorkspaceBlobsBySha !== 'function') return false;
-        var snap = _wsfPickSnap(_wsfCollectMergedSnaps(await getAllWorkspaceMetas())[f.path], f.wsKey);
-        if (!snap) return false;
-        var shas = [];
-        if (snap.file.old_sha) shas.push(snap.file.old_sha);
-        if (snap.file.new_sha) shas.push(snap.file.new_sha);
-        var blobs = await getWorkspaceBlobsBySha(shas);
-        // A referenced blob may be gone (pre-fix GC, quota failure at push
-        // time) — fall through rather than render a half-empty diff that
-        // pretends the file was created or deleted.
-        if (snap.file.old_sha && blobs[snap.file.old_sha] == null) return false;
-        if (snap.file.new_sha && blobs[snap.file.new_sha] == null) return false;
-        var oldText = snap.file.old_sha ? blobs[snap.file.old_sha] : '';
-        var newText = snap.file.new_sha ? blobs[snap.file.new_sha] : '';
-        var prLink = '<a href="' + escapeHtml(snap.pr.url || '#') + '" target="_blank" rel="noopener">' + t('PR #{number}', { number: snap.pr.number }) + '</a>';
-        var note = '<div class="wsf-file-meta"><span class="sn-status-badge sn-status-merged">' + t('MERGED') + '</span> '
-            + (snap.pr.merged_at
-                ? t('Merged in {pr} \u00b7 {date} \u2014 original edited diff (pre-merge base \u2192 pushed content).', { pr: prLink, date: escapeHtml(String(snap.pr.merged_at).slice(0, 10)) })
-                : t('Merged in {pr} \u2014 original edited diff (pre-merge base \u2192 pushed content).', { pr: prLink }))
-            + '</div>';
-        _wsfOverlay(escapeHtml(f.path) + ' <span class="wsf-title-sub">' + t('merged \u00b7 PR #{number}', { number: snap.pr.number }) + '</span>', note + _wsfRenderDiffHtml(oldText, newText), { fileIndex: i, active: 'diff' });
+        var m = await _wsfMergedSnapTexts(f);
+        if (!m) return false;
+        var snap = m.snap, oldText = m.oldText, newText = m.newText;
+        var extra = (snap.pr.merged_at ? String(snap.pr.merged_at).slice(0, 10) + ' \u00b7 ' : '') + t('original edited diff (pre-merge base \u2192 pushed content)');
+        var note = _wsfPrChipLineHtml({ url: snap.pr.url, number: snap.pr.number, title: snap.pr.title, state: 'merged' }, extra);
+        _wsfOverlay(escapeHtml(f.path), note + _wsfRenderDiffHtml(oldText, newText), { fileIndex: i, active: 'diff' });
         return true;
     } catch (e) {
         console.error('wsf merged snapshot diff failed', e);
@@ -667,9 +1492,9 @@ async function _wsfOpenMergedView(f, i) {
         var blobs = await getWorkspaceBlobsBySha([snap.file.new_sha]);
         var content = blobs[snap.file.new_sha];
         if (content == null) return false;
-        var body = '<div class="wsf-file-meta"><span class="sn-status-badge sn-status-merged">' + t('MERGED') + '</span> ' + t('PR #{number} \u00b7 pushed content \u00b7 {size}', { number: snap.pr.number, size: _wsfFmtSize(content) }) + '</div>'
+        var body = _wsfPrChipLineHtml({ url: snap.pr.url, number: snap.pr.number, title: snap.pr.title, state: 'merged' }, t('pushed content \u00b7 {size}', { size: _wsfFmtSize(content) }))
             + '<pre class="wsf-code">' + escapeHtml(content) + '</pre>';
-        _wsfOverlay(escapeHtml(f.path) + ' <span class="wsf-title-sub">' + t('merged \u00b7 PR #{number}', { number: snap.pr.number }) + '</span>', body, { fileIndex: i, active: 'view' });
+        _wsfOverlay(escapeHtml(f.path), body, { fileIndex: i, active: 'view' });
         return true;
     } catch (e) { return false; }
 }
@@ -957,7 +1782,7 @@ function _wsfOnSubMessages(ev) {
                 // sync/merge stamps state:'merged'). Async — the render below
                 // uses the current cache; a refresh that changes the map
                 // re-renders once more by itself.
-                try { _wsfRefreshOwnedRows(); _wsfRefreshMergedSnaps(); } catch (e2) { /* not fatal */ }
+                try { _wsfInvalidateCounts(); _wsfRefreshOwnedRows(); _wsfRefreshMergedSnaps(); } catch (e2) { /* not fatal */ }
                 if (typeof renderVersionSidebar === 'function') renderVersionSidebar();
             } catch (e) { /* sidebar not ready */ }
         });

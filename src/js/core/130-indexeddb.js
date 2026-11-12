@@ -3594,6 +3594,8 @@ async function getWorkspaceOwnedFileSummaries() {
             if (owner && f.repo && f.path && (f.dirty || f.pushed_pr)) {
                 rows.push({ path: f.path, wsKey: f.repo, owner: owner,
                     isNew: !f.sha && !f.deleted, isDeleted: !!f.deleted,
+                    // WSF-STATUS: live state for the sidebar status badge
+                    dirty: !!f.dirty, prMerged: !!f.pushed_pr_merged, changedSincePush: !!f.changed_since_push,
                     pushedPr: f.pushed_pr ? { url: f.pushed_pr.url, number: f.pushed_pr.number } : null });
             }
             cursor.continue();

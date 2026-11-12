@@ -333,6 +333,9 @@ function _splitViewSyncVisibility() {
     if (pane) pane.hidden = hidden;
     var active = !!pane && !hidden;
     if (document.body) document.body.classList.toggle('split-view-active', active);
+    // Drag-to-resize divider (ui/242-panel-resize.js); re-added after every
+    // innerHTML rewrite and re-applies the persisted pane width.
+    if (active && typeof ensureSplitPaneResizeHandle === 'function') { try { ensureSplitPaneResizeHandle(pane); } catch (e) {} }
     // F: the right sidebar follows the GLOBAL split-mode key while the pane is
     // visible and the normal key otherwise (ui/120-ui-utils.js).
     if (typeof applyVersionSidebarMode === 'function') { try { applyVersionSidebarMode(active); } catch (e) {} }
@@ -657,7 +660,7 @@ function renderSplitViewPane(opts) {
     }
     var wrapper = document.querySelector('.main-wrapper');
     var main = document.getElementById('main-area');
-    if (!wrapper) return;
+    if (!wrapper && !main) return;
     if (!opts.force && pane && pane.dataset.chatId === chatId && pane.dataset.widgetId === state.widgetId) {
         _splitViewUpdateHeader();
         _splitViewSyncVisibility();
@@ -673,7 +676,11 @@ function renderSplitViewPane(opts) {
         pane.id = 'split-widget-pane';
         pane.className = 'split-widget-pane';
         pane.setAttribute('aria-label', 'Split widget view');
-        if (main && main.parentNode === wrapper) wrapper.insertBefore(pane, main.nextSibling);
+        // Mounted INSIDE #main-area (after the composer): in split mode the
+        // chat area becomes a grid (css/15b-split-view.css) whose first row is
+        // the full-width .main-header, so only the area BELOW the header is
+        // split between chat and pane.
+        if (main) main.appendChild(pane);
         else wrapper.appendChild(pane);
     }
     pane.dataset.chatId = chatId;

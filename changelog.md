@@ -1,5 +1,22 @@
 # Changelog
 
+## v1.1.42
+
+### New
+- Resizable split view pane and left sidebar.
+- Documents: Back/Forward moves between folders.
+- Simpler Workspace Files list.
+- You're notified about approvals and finished chats you didn't see before stepping away.
+- Pull Requests in the sidebar open a GitHub-style PR modal: title, state, branches, description, and a Files changed tab with inline diffs.
+- Workspace Files lists only uncommitted files; committed files appear under their PR.
+
+### Fixes
+- Back/Forward reopens the split view pane.
+- Sidebar record links open on the right instance.
+- Clicking a file in a sidebar PR file list opens its diff again.
+
+---
+
 ## v1.1.41
 
 ### New
@@ -12,6 +29,7 @@
 ### Fixes
 - Markdown code blocks and quotes render more reliably.
 - Sub-agent cards no longer wrap or overflow.
+- The keep-awake notice now hides as soon as you type or scroll, not only on click.
 
 ---
 

@@ -920,7 +920,12 @@ function _handleAgentBusMessage(msg) {
                     var _mergedVH = _inVH.map(function(v) {
                         if (v && v.id) {
                             _inSeen[v.id] = true;
-                            if (_prevById[v.id]) return _prevById[v.id];
+                            if (_prevById[v.id]) {
+                                var _pv = _prevById[v.id];
+                                // Repair page copies stripped of their instance origin.
+                                if (!_pv.instanceUrl && v.instanceUrl) _pv.instanceUrl = v.instanceUrl;
+                                return _pv;
+                            }
                         }
                         return v;
                     });

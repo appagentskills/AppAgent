@@ -555,6 +555,8 @@ function syncPauseButtonUI(chatId) {
     pauseBtn.innerHTML = isPaused
         ? '<span class="btn-icon">' + UI_ICONS.play + '</span>' + esc(t('Resume'))
         : '<span class="btn-icon">' + UI_ICONS.pause + '</span>' + esc(t('Pause'));
+    // Narrow composer shows the button icon-only (css/15d-narrow-chat.css).
+    pauseBtn.title = isPaused ? t('Resume') : t('Pause');
 }
 
 function togglePause() {

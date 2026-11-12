@@ -805,6 +805,29 @@ describe('reload full test suite gate (real 270-iframe-panel.js)', function() {
         await settle(p);
         assert.strictEqual(count(h, 'extension_build'), 1, 'explicit Force build still builds');
     }, T);
+    test('not_run / sandbox-transport files are listed apart from failing test files', async function() {
+        var fx = await reloadKit(), h = fx.setup({ run: function(args) {
+            var r = failing(args.files, 'test/alpha.test.js', 'adds numbers'), b = r.files.find(function(x) { return x.file === 'test/beta.test.js'; });
+            r.summary.passed -= b.passed; r.summary.skipped -= b.skipped; r.summary.total -= b.passed + b.skipped;
+            b.status = 'not_run'; b.passed = 0; b.failed = 0; b.skipped = 0; b.failures = [];
+            b.error = 'Not run: A listener indicated an asynchronous response by returning true, but the message channel closed (shard 2/4)';
+            return r;
+        } });
+        addTests(h, ['test/alpha.test.js', 'test/beta.test.js']);
+        var p = h.api.reload();
+        await waitFor(function() { return forceShown(h) && !h.find('Force build').disabled; }, 'force offered');
+        assert.strictEqual(count(h, 'extension_build'), 0, 'a no-verdict file still blocks the build');
+        var status = h.byClass('reload-preflight-status')[0].textContent;
+        assert.ok(status.indexOf('Failing test files: test/alpha.test.js') >= 0, status);
+        assert.ok(status.indexOf('Failing test files: test/alpha.test.js,') < 0 && status.indexOf('Failing test files: test/beta') < 0, 'beta is not a failing file: ' + status);
+        assert.ok(status.indexOf('Test files with no verdict (not run or sandbox transport error): test/beta.test.js') >= 0, status);
+        var text = rowText(h.rows[5]);
+        assert.ok(text.indexOf('Test files with no verdict (not run or sandbox transport error): test/beta.test.js') >= 0, text);
+        assert.ok(text.indexOf('Failing test files: test/alpha.test.js\n') >= 0, 'row lists only alpha as failing: ' + text);
+        h.find('Cancel').click();
+        await settle(p);
+        assert.strictEqual(count(h, 'extension_build'), 0);
+    }, T);
     test('Cancel after a full-suite failure never builds', async function() {
         var fx = await reloadKit(), h = fx.setup({ run: function(args) { return failing(args.files, 'test/alpha.test.js', 'x'); } });
         addTests(h, ['test/alpha.test.js']);

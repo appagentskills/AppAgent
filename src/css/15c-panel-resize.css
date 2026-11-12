@@ -1,0 +1,37 @@
+/* Drag-to-resize handles (ui/242-panel-resize.js): the expanded LEFT sidebar
+   edge and the split widget pane divider. Desktop side-by-side layouts only —
+   hidden where the sidebar is an overlay (<= 768px, side panel) or the split
+   view is stacked (<= 900px, side panel). */
+.panel-resize-handle { display: none; position: absolute; top: 0; bottom: 0; width: 7px; z-index: 6; cursor: col-resize; touch-action: none; background: transparent; outline: none; }
+.panel-resize-handle::after { content: ''; position: absolute; top: 0; bottom: 0; inset-inline-start: 3px; width: 1px; background: transparent; transition: background-color 0.15s ease, width 0.15s ease, inset-inline-start 0.15s ease; }
+.panel-resize-handle:hover::after { inset-inline-start: 2px; width: 2px; background: var(--primary); opacity: .6; }
+.panel-resize-handle.is-dragging::after,
+.panel-resize-handle:focus-visible::after { inset-inline-start: 2px; width: 3px; background: var(--primary); opacity: 1; }
+
+/* While dragging: iframes (widgets, browser panel) must not swallow pointer
+   events, no text selection, and no width transitions (the panel must track
+   the pointer frame by frame). */
+body.panel-resizing { cursor: col-resize; user-select: none; -webkit-user-select: none; }
+body.panel-resizing iframe { pointer-events: none; }
+body.panel-resizing .sidebar, body.panel-resizing .main { transition: none !important; }
+/* The RIGHT chat panel is hidden while the LEFT sidebar is dragged; restored
+   (or closed for real when the chat would get too narrow) on release. */
+.version-sidebar.resize-suspended { display: none !important; }
+
+/* Sidebar: handle straddles the inline-end edge; the dragged width
+   (--sidebar-resize-width set on #sidebar itself, appStorage 'sidebarWidth')
+   replaces the 260px default. Deliberately NOT --sidebar-width: that :root
+   token (60px, css/00-tokens.css) shadowed the fallback. The search-expanded
+   width (.searching) is left untouched. */
+@media (min-width: 769px) {
+    body:not(.sidepanel-mode) .sidebar.expanded { position: relative; }
+    body:not(.sidepanel-mode) .sidebar.expanded:not(.searching) { width: var(--sidebar-resize-width, 260px); min-width: var(--sidebar-resize-width, 260px); }
+    body:not(.sidepanel-mode) .sidebar.expanded > .sidebar-resize-handle { display: block; inset-inline-end: -4px; }
+}
+
+/* Split pane: handle on the pane's inline-start edge (the chat/pane divider);
+   inside the pane because it clips overflow. */
+@media (min-width: 901px) {
+    body.split-view-active:not(.sidepanel-mode) .split-widget-pane > .split-pane-resize-handle { display: block; inset-inline-start: 0; }
+}
+@media (prefers-reduced-motion: reduce) { .panel-resize-handle::after { transition: none; } }

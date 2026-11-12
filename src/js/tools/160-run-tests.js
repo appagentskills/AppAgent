@@ -244,6 +244,22 @@ function rtFailedRunResult(error, code, isolation, denied) {
 
 function rtNotRun(file, why) { return { file: file, status: 'not_run', passed: 0, failed: 0, skipped: 0, no_assertions: 0, failures: [], error: why }; }
 
+// A shard whose js_eval never produced a verdict because the CHANNEL died: the
+// offscreen document / sandbox frame was closed under it ("message channel
+// closed", "message port closed", "Receiving end does not exist", "Could not
+// establish connection") or no reply came back at all. Only these are
+// SANDBOX_TRANSPORT. A success:true result without an envelope, the js_eval
+// 5-minute inactivity timeout, a cancel/deadline and OFFSCREEN_* startup codes
+// keep their own labels and are never retried.
+var RT_TRANSPORT_RE = /message channel closed|message port closed|Receiving end does not exist|Could not establish connection|returned no response|no response was received/i;
+function rtIsTransportFailure(evalRes) {
+    if (!evalRes) return true;
+    if (evalRes.success !== false) return false;
+    var msg = String(evalRes.error || '');
+    if (/timed out after|inactivity|cancelled|canceled|Per-test timeout|\bOFFSCREEN_[A-Z_]+\b/i.test(msg)) return false;
+    return RT_TRANSPORT_RE.test(msg);
+}
+
 // Merge per-shard js_eval results. shardRuns: [{indices, evalRes, duration_ms}].
 // Host denials/isolation are authoritative; sandbox data can only ADD failures.
 // A timed-out shard keeps its completed prefix; the timed-out file is aborted
@@ -259,8 +275,10 @@ function rtMergeShardResults(shardRuns, cfg, isolation, hostDenials) {
         var sf = s.indices.map(function(i) { return all[i]; });
         var evalRes = s.evalRes, env = evalRes && evalRes.success === true && evalRes.result;
         var info = { index: k, file_count: sf.length, duration_ms: s.duration_ms || 0, status: 'ok' };
+        // One automatic re-run after a SANDBOX_TRANSPORT loss (executeRunTests).
+        if (s.transport_retries) { info.transport_retries = s.transport_retries; if (s.first_error) info.first_error = String(s.first_error).slice(0, 500); }
         shards.push(info);
-        var reason = null;
+        var reason = null, transport = false;
         if (env && env.host_test_boundary === true && env.value && Array.isArray(env.value.files)) {
             // An envelope only repeats ITS OWN shard's registry denials: dedupe against
             // that shard's host log (all host entries are already in `denied`).
@@ -289,12 +307,20 @@ function rtMergeShardResults(shardRuns, cfg, isolation, hostDenials) {
                 if (v.aborted) { info.status = 'aborted'; info.error = 'Sandbox reported an aborted run ' + label; errors.push(info.error); }
                 return;
             } else reason = 'Invalid/incomplete sandbox result';
-        } else reason = evalRes && evalRes.error || 'no attested result';
+        } else { reason = evalRes && evalRes.error || 'no attested result'; transport = rtIsTransportFailure(evalRes); }
         if (!firstFailed && evalRes && evalRes.success === false) firstFailed = evalRes;
         if (firstErr === null) firstErr = String(reason);
         info.status = 'error'; info.error = String(reason).slice(0, 2000);
-        sf.forEach(function(f, i) { slots[s.indices[i]] = rtNotRun(f, 'Not run: ' + info.error + ' ' + label); });
-        errors.push('Invalid/incomplete sandbox result ' + label + ': ' + info.error);
+        // No envelope at all = the shard's transport died (sandbox frame / offscreen
+        // document / message channel), not a test verdict: say so distinctly.
+        if (transport) info.error_code = 'SANDBOX_TRANSPORT';
+        sf.forEach(function(f, i) {
+            var row = rtNotRun(f, 'Not run: ' + info.error + ' ' + label);
+            // Per-file rows carry the shard's transport code (Reload dialog: no verdict).
+            if (transport) row.error_code = 'SANDBOX_TRANSPORT';
+            slots[s.indices[i]] = row;
+        });
+        errors.push((transport ? 'Sandbox transport failure (no test verdict) ' : 'Invalid/incomplete sandbox result ') + label + ': ' + info.error);
     });
     for (var h = 0; h < slots.length; h++) if (!slots[h]) slots[h] = rtNotRun(all[h], 'Not run: not assigned to any shard');
     var files = anyValid ? slots : [];
@@ -513,7 +539,7 @@ function rtWorkerRunCounts() {
     return { page: Object.keys(_rtWorkerRuns).length, host: host, host_ports: _rtWorkerHostRuns.size };
 }
 
-var RunTestsHelpers = { rtCombineDenials: rtCombineDenials, rtFailedRunResult: rtFailedRunResult, rtRunViaWorker: rtRunViaWorker, rtHandleWorkerMessage: rtHandleWorkerMessage, rtServeWorkerRequest: rtServeWorkerRequest, rtCancelWorkerRequest: rtCancelWorkerRequest, rtWorkerPortLost: rtWorkerPortLost, rtWorkerHostPortClosed: rtWorkerHostPortClosed, rtWorkerRunCounts: rtWorkerRunCounts, rtWorkerProgressEvent: rtWorkerProgressEvent, rjfValidateArgs: rjfValidateArgs, rtValidateArgs: rtValidateArgs, rtSelectTestFiles: rtSelectTestFiles, rtBuildSandboxCode: rtBuildSandboxCode, rtProgressEvent: rtProgressEvent, rtParseEvalResult: rtParseEvalResult, rtDevModeActive: rtDevModeActive, RUN_TESTS_FILE_RE: RUN_TESTS_FILE_RE, rtSandboxErrorCode: rtSandboxErrorCode, rtGuardResult: rtGuardResult, rtPlanShards: rtPlanShards, rtShardProgressEvent: rtShardProgressEvent, rtMergeShardResults: rtMergeShardResults, rtCountTests: rtCountTests };
+var RunTestsHelpers = { rtCombineDenials: rtCombineDenials, rtFailedRunResult: rtFailedRunResult, rtRunViaWorker: rtRunViaWorker, rtHandleWorkerMessage: rtHandleWorkerMessage, rtServeWorkerRequest: rtServeWorkerRequest, rtCancelWorkerRequest: rtCancelWorkerRequest, rtWorkerPortLost: rtWorkerPortLost, rtWorkerHostPortClosed: rtWorkerHostPortClosed, rtWorkerRunCounts: rtWorkerRunCounts, rtWorkerProgressEvent: rtWorkerProgressEvent, rjfValidateArgs: rjfValidateArgs, rtValidateArgs: rtValidateArgs, rtSelectTestFiles: rtSelectTestFiles, rtBuildSandboxCode: rtBuildSandboxCode, rtProgressEvent: rtProgressEvent, rtParseEvalResult: rtParseEvalResult, rtDevModeActive: rtDevModeActive, RUN_TESTS_FILE_RE: RUN_TESTS_FILE_RE, rtSandboxErrorCode: rtSandboxErrorCode, rtGuardResult: rtGuardResult, rtPlanShards: rtPlanShards, rtShardProgressEvent: rtShardProgressEvent, rtMergeShardResults: rtMergeShardResults, rtCountTests: rtCountTests, rtIsTransportFailure: rtIsTransportFailure };
 
 // ─── tool entry points (dispatched from tools/020-tool-execution.js) ─────────
 
@@ -658,11 +684,27 @@ async function executeRunTests(args, messageIndex, options) {
             return { code: rtBuildSandboxCode(shardCfg), options: evalOptions, run: run };
         });
         active();
-        await Promise.all(jobs.map(function(j) {
+        function runJob(j) {
             var t0 = Date.now();
             return budget(executeTool('js_eval', { code: j.code }, messageIndex, j.options))
                 .then(function(r) { j.run.evalRes = r; }, function(e) { j.run.evalRes = { success: false, error: String(e && e.message || e) }; })
-                .then(function() { j.run.duration_ms = Date.now() - t0; });
+                .then(function() { j.run.duration_ms += Date.now() - t0; });
+        }
+        await Promise.all(jobs.map(function(j) {
+            return runJob(j).then(function() {
+                // A forced offscreen close (wedged-document recreate, zombie heal,
+                // js_eval watchdog) kills sibling shards with no verdict. Re-run
+                // such a shard ONCE in a fresh sandbox + registry context. Never
+                // real failures, aborts, per-test or inactivity timeouts, cancel.
+                if (!rtIsTransportFailure(j.run.evalRes) || controller.signal.aborted || Date.now() >= deadline) return;
+                j.run.transport_retries = 1;
+                j.run.first_error = j.run.evalRes && j.run.evalRes.error || 'no reply';
+                var ctx2 = TestRunPolicy.registry.open({ workspace: wk, deadline: deadline, allow_tools: a.allow_tools });
+                contexts.push(ctx2);
+                j.run.ctx = ctx2;
+                j.options = Object.assign({}, j.options, { _testRunContext: ctx2, toolCallId: j.options.toolCallId + '_r1' });
+                return runJob(j);
+            });
         }));
     } catch (error) {
         evalRes = { success: false, error: String(error && error.message || error) };

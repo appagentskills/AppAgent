@@ -148,6 +148,12 @@
 .sdoc-src-crumb[aria-current="page"], .sdoc-src-crumb[aria-current="location"] { color: var(--text-primary); font-weight: var(--font-semibold); cursor: default; }
 .sdoc-src-crumb-sep { color: var(--text-muted); user-select: none; }
 [dir="rtl"] .sdoc-src-crumb-sep { display: inline-block; transform: scaleX(-1); }
+/* Sticky breadcrumb: .documents-panel is the scroller (21c-smart-documents.css:119, overflow-y:auto) and no
+   ancestor in between clips (.page-list is overflow:visible, 19c:24), so the crumbs pin just below the sticky
+   shared header (--shared-page-header-h, 19c:44) + page toolbar (--documents-toolbar-h, measured by
+   _sdocTrackToolbarHeight in tools/110; 52px = .page-toolbar min-height fallback). Opaque panel bg so
+   cards don't show through; z-index 3 stays below the toolbar (10) and above the cards. */
+.sdoc-src-crumbs { position: sticky; top: calc(var(--shared-page-header-h, 0px) + var(--documents-toolbar-h, 52px)); z-index: 3; background: var(--bg-light); padding-block: var(--space-2); margin-block-start: calc(-1 * var(--space-2)); }
 /* Gallery grid: breadcrumb and notes span the whole row instead of taking a card cell (same pattern as 19c-page-layout.css:24) */
 .page-list.layout-gallery > .sdoc-src-crumbs, .page-list.layout-gallery > .sdoc-src-notes, .page-list.layout-gallery > .sdoc-src-note { grid-column: 1 / -1; }
 

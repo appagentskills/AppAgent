@@ -590,6 +590,8 @@ function updateContextIndicator() {
     } else {
         indicator.title = t('{percent}% context used ({tokens} tokens)', { percent: percentage, tokens: tokenDisplay });
     }
+    // Narrow composer shows the pill as ring + % only: keep the action in the tooltip.
+    if (showContinue) indicator.title = indicator.title + ' · ' + continueText;
 }
 
 // Re-fit a composer when its WIDTH changes (panel resize, sidebar toggle):
@@ -633,6 +635,15 @@ function autoResizeTextarea(textarea) {
     _observeComposerWidth(textarea);
     var cs = (typeof getComputedStyle === 'function') ? getComputedStyle(textarea) : null;
     var cap = cs ? parseFloat(cs.maxHeight) : NaN;
+    // Empty composer = one row (rows="1"), whatever the placeholder would
+    // wrap to in a narrow column (it used to measure a per-character wrapped
+    // placeholder and grow to the max-height cap).
+    if (!textarea.value) {
+        textarea.style.height = '';
+        if (typeof syncSendButton === 'function') syncSendButton();
+        if (typeof composerSyncDraftSize === 'function') composerSyncDraftSize(textarea);
+        return;
+    }
     var prevScroll = textarea.scrollTop;
     textarea.style.height = 'auto';
     var full = textarea.scrollHeight;

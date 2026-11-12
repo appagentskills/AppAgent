@@ -158,19 +158,26 @@ function _reloadFullSuiteState(states) {
     if (states.some(function(s) { return s === 'error'; })) return 'error';
     return states.every(function(s) { return s === 'pass'; }) ? 'pass' : 'skipped';
 }
-// Totals, the failing files and each failing test (file › test — first message line).
+// A file with no test verdict: never executed (its shard died, was aborted around it,
+// or the run stopped) or its sandbox transport failed. Still blocks Reload, but is
+// listed apart from real failing test files so a flaky transport is not read as a red test.
+function _reloadNoVerdict(entry) {
+    return !!(entry && (entry.status === 'not_run' || entry.error_code === 'SANDBOX_TRANSPORT'));
+}
+// Totals, the failing files, the no-verdict files and each failing test (file › test — first message line).
 function _reloadFullSuiteDetail(files, states, counts, entries, details, from) {
-    var c = [0, 0, 0], bad = [], lines = [];
+    var c = [0, 0, 0], bad = [], noVerdict = [], lines = [];
     for (var i = from; i < files.length; i++) {
         if (counts[i]) { c[0] += counts[i][0]; c[1] += counts[i][1]; c[2] += counts[i][2]; }
         if (states[i] !== 'fail' && states[i] !== 'error') continue;
-        bad.push(files[i]);
+        if (_reloadNoVerdict(entries[i])) noVerdict.push(files[i]); else bad.push(files[i]);
         var fails = entries[i] && Array.isArray(entries[i].failures) ? entries[i].failures : [];
         if (fails.length) fails.forEach(function(x) { lines.push(files[i] + ' › ' + String(x && x.name || '?') + ' — ' + String(x && (x.message || x.error) || '').split('\n')[0].slice(0, 200)); });
         else lines.push(files[i] + ' — ' + String(details[i] || '').split('\n').filter(function(l) { return l.trim() && !/^\d+ passed; /.test(l); })[0] || files[i]);
     }
     var head = c[0] + ' passed; ' + c[1] + ' failed; ' + c[2] + ' skipped (unchecked)';
-    return [head].concat(bad.length ? [t('Failing test files: {files}', { files: bad.join(', ') })] : [], lines).join('\n').slice(0, 12000);
+    return [head].concat(bad.length ? [t('Failing test files: {files}', { files: bad.join(', ') })] : [],
+        noVerdict.length ? [t('Test files with no verdict (not run or sandbox transport error): {files}', { files: noVerdict.join(', ') })] : [], lines).join('\n').slice(0, 12000);
 }
 function _reloadSuiteResult(result, file) {
     var f = result && Array.isArray(result.files) && result.files.length === 1 && result.files[0];
@@ -516,8 +523,13 @@ async function _runReloadPreflight() {
     if (ui.skipped() && workspace) { ui.close(); return { proceed: true, workspace: workspace, skipped: true }; }
     files.forEach(function(_, i) { if (states[i] === 'pending') set(i, 'skipped', 'Not run'); });
     // Name the failing test files so a blocked Reload is never silent about why.
-    var badFiles = files.filter(function(_, i) { return states[i] === 'fail' || states[i] === 'error'; });
-    var badText = badFiles.length ? ' ' + t('Failing test files: {files}', { files: badFiles.slice(0, 10).join(', ') + (badFiles.length > 10 ? ', …' : '') }) : '';
+    // Files without a verdict (not run / sandbox transport error) get their own label.
+    function _listText(list) { return list.slice(0, 10).join(', ') + (list.length > 10 ? ', …' : ''); }
+    var redFiles = files.filter(function(_, i) { return states[i] === 'fail' || states[i] === 'error'; });
+    var badFiles = redFiles.filter(function(f) { return !_reloadNoVerdict(entries[files.indexOf(f)]); });
+    var noVerdictFiles = redFiles.filter(function(f) { return _reloadNoVerdict(entries[files.indexOf(f)]); });
+    var badText = (badFiles.length ? ' ' + t('Failing test files: {files}', { files: _listText(badFiles) }) : '') +
+        (noVerdictFiles.length ? ' ' + t('Test files with no verdict (not run or sandbox transport error): {files}', { files: _listText(noVerdictFiles) }) : '');
     ui.failure((typeof failed === 'string' ? failed : t('Required checks did not pass.')) + badText + ' ' +
         (settled ? t('Cancel or explicitly Force build (tests only; artifact/security checks still apply).') : t('Host cleanup did not settle; Force is unavailable.')), settled && !!workspace);
     try { return { proceed: (await ui.decision) === 'force', workspace: workspace }; }

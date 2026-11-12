@@ -11,7 +11,11 @@
 .version-sidebar.visible { display: flex; }
 .version-sidebar-close { position: absolute; top: 8px; inset-inline-end: 8px; width: 28px; height: 28px; background: var(--bg-white); border: 1px solid var(--secondary-border); border-radius: var(--radius-md); cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: var(--text-body-lg); color: var(--text-muted); transition: all var(--transition-fast); z-index: 10; }
 .version-sidebar-close:hover { background: var(--secondary-light); color: var(--text-primary); border-color: var(--secondary-border-dark); }
-.version-sidebar-open { position: absolute; top: 8px; inset-inline-end: 8px; width: 32px; height: 32px; background: var(--bg-white); border: 1px solid var(--secondary-border); border-radius: var(--radius-md); cursor: pointer; display: none; align-items: center; justify-content: center; font-size: var(--text-body-lg); color: var(--text-muted); transition: all var(--transition-fast); z-index: 10; box-shadow: var(--shadow-md); }
+/* Floating opener: absolute in .chat-content-wrapper (position: relative,
+   not the scroller), so it stays put while .messages scrolls under it and
+   reserves no layout space. Small 32px hit area; opaque bg + border + shadow
+   keep it readable over messages. */
+.version-sidebar-open { position: absolute; top: 8px; inset-inline-end: 8px; width: 32px; height: 32px; margin: 0; padding: 0; flex: none; box-sizing: border-box; background: var(--bg-white); border: 1px solid var(--secondary-border); border-radius: var(--radius-md); cursor: pointer; display: none; align-items: center; justify-content: center; font-size: var(--text-body-lg); color: var(--text-muted); transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast); z-index: 20; box-shadow: var(--shadow-md); }
 .version-sidebar-open:hover { background: var(--secondary-light); color: var(--text-primary); border-color: var(--secondary-border-dark); }
 .version-sidebar-open.visible { display: flex; }
 .version-history-list { flex: 1; overflow-y: auto; padding: 0; display: flex; flex-direction: column; padding-top: var(--space-12); }
@@ -58,6 +62,12 @@
 .pr-sidebar-state.closed { color: var(--text-muted); }
 .pr-sidebar-state.merging { color: var(--text-muted); }
 .pr-sidebar-item:hover .pr-sidebar-open { opacity: 1; }
+/* Chat sidebar PR rows: the whole row opens the PR modal (wsfOpenPrModal). */
+.pr-sidebar-item-clickable:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
+a.pr-sidebar-open { color: var(--text-muted); text-decoration: none; padding: 2px; border-radius: var(--radius-sm); }
+a.pr-sidebar-open:hover { color: var(--primary); }
+a.pr-sidebar-open:focus-visible { opacity: 1; outline: 2px solid var(--primary); outline-offset: 1px; }
+
 
 /* File List in Sidebar */
 .version-files-list { padding: var(--space-4) var(--space-5); }

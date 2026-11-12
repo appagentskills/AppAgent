@@ -148,6 +148,67 @@ describe('trackRecordMutation stamps a normalized instanceUrl', function() {
     }, { tags: ['unit'], timeout: 3000 });
 });
 
+describe('instanceUrl survives the page recordMutated path and the snapshot merge', function() {
+    test('emit → 036 handler entry keeps the stored instanceUrl (active-instance write)', async function() {
+        var h = await loadModules(['src/js/core/150-record-helpers.js'], { globals: { Platform: { instanceUrl: ACTIVE } } });
+        var src = await loadFile('src/js/tools/020-tool-execution.js');
+        var fx = EX.findFunction(src, 'trackRecordMutation', { includeAsync: false });
+        var handlers = {};
+        var bus = { on: function(n, f) { handlers[n] = f; }, emit: function(n, e) { if (handlers[n]) handlers[n](e); } };
+        var pageEntries = [];
+        var pageSrc = await loadFile('src/js/app/036-agent-event-handlers-page.js');
+        var i0 = pageSrc.indexOf("AgentEvents.on('recordMutated'");
+        var i1 = pageSrc.indexOf('\n});', i0) + 4;
+        assert.ok(i0 >= 0 && i1 > i0, 'recordMutated handler found');
+        new Function('AgentEvents', 'addVersionHistoryEntryForChat', pageSrc.slice(i0, i1))(bus, function(cid, e) { pageEntries.push(e); });
+        var chats = { c1: { versionHistory: [] } };
+        var fn = new Function('chats', 'AgentEvents', 'saveChatsToStorage', 'recordInstanceKey', 'recordStoredInstanceUrl', src.slice(fx.start, fx.end + 1) + '\nreturn trackRecordMutation;')(
+            chats, bus, function() {}, h.recordInstanceKey, h.recordStoredInstanceUrl);
+        fn({ chatId: 'c1', table: 'incident', sysId: SID, action: 'PATCH' });
+        fn({ chatId: 'c1', table: 'incident', sysId: SID, action: 'PATCH', instanceUrl: 'OTHER.service-now.com/' });
+        assert.strictEqual(pageEntries.length, 2);
+        assert.strictEqual(pageEntries[0].instanceUrl, ACTIVE);
+        assert.strictEqual(pageEntries[1].instanceUrl, OTHER);
+        assert.strictEqual(pageEntries[0].id, chats.c1.versionHistory[0].id);
+    }, { tags: ['unit'], timeout: 3000 });
+
+    test('045 snapshot merge copies instanceUrl onto a stripped page copy', async function() {
+        var src = await loadFile('src/js/app/045-agent-port-bridge-page.js');
+        var i0 = src.indexOf('if (_prevChat && Array.isArray(_prevChat.versionHistory)');
+        var i1 = src.indexOf('// WIDGET-MERGE', i0);
+        assert.ok(i0 >= 0 && i1 > i0, 'merge block found');
+        var merge = new Function('_prevChat', '_inChat', src.slice(i0, i1));
+        var prev = { versionHistory: [{ id: 'v1', timestamp: 1, invalidated: true }, { id: 'v2', timestamp: 2, instanceUrl: ACTIVE }] };
+        var inc = { versionHistory: [{ id: 'v1', timestamp: 1, instanceUrl: OTHER }, { id: 'v2', timestamp: 2, instanceUrl: OTHER }] };
+        merge(prev, inc);
+        assert.strictEqual(inc.versionHistory[0].instanceUrl, OTHER, 'repaired from snapshot');
+        assert.strictEqual(inc.versionHistory[0].invalidated, true, 'page flags kept');
+        assert.strictEqual(inc.versionHistory[1].instanceUrl, ACTIVE, 'page value wins when present');
+    }, { tags: ['unit'], timeout: 3000 });
+
+    test('navigateIframe target: only absolute URLs on another KNOWN instance', async function() {
+        var src = await loadFile('src/js/ui/300-iframe-management.js');
+        var fx = EX.findFunction(src, 'navigateTargetInstanceOrigin', { includeAsync: false });
+        var fn = new Function('Platform', src.slice(fx.start, fx.end + 1) + '\nreturn navigateTargetInstanceOrigin;')(
+            { instances: [{ url: ACTIVE }, { url: OTHER }] });
+        assert.strictEqual(fn(OTHER + '/incident.do?sys_id=1', ACTIVE + '/now/nav/ui'), OTHER);
+        assert.strictEqual(fn(ACTIVE + '/incident.do', ACTIVE + '/x'), null, 'same instance');
+        assert.strictEqual(fn('/incident.do', ACTIVE + '/x'), null, 'relative');
+        assert.strictEqual(fn('https://example.com/a', ACTIVE + '/x'), null, 'unknown host');
+    }, { tags: ['unit'], timeout: 3000 });
+
+    test('getLastBrowserUrl resolves a relative navigate against its call instance', async function() {
+        var src = await loadFile('src/js/ui/120-ui-utils.js');
+        var fx = EX.findFunction(src, 'getLastBrowserUrl', { includeAsync: false });
+        var chats = { c1: { messages: [{ role: 'assistant', tool_calls: [{ function: { name: 'iframe_tool', arguments: JSON.stringify({ action: 'navigate', url: '/sys_ui_page.do', instance: 'other' }) } }] }] } };
+        var plat = { instanceUrl: ACTIVE, resolveInstanceUrl: function(n) { return n === 'other' ? OTHER : null; } };
+        var fn = new Function('chats', 'currentChatId', 'Platform', src.slice(fx.start, fx.end + 1) + '\nreturn getLastBrowserUrl;')(chats, 'c1', plat);
+        assert.strictEqual(fn(), OTHER + '/sys_ui_page.do');
+        chats.c1.messages[0].tool_calls[0].function.arguments = JSON.stringify({ action: 'navigate', url: '/x.do' });
+        assert.strictEqual(fn(), '/x.do', 'no instance → unchanged');
+    }, { tags: ['unit'], timeout: 3000 });
+});
+
 describe('entries stored while instance A was active keep targeting A after switching to B', function() {
     var B = 'https://bravo.service-now.com';
     test('delete + revert go to A (absolute URL, A token); new entries keep A', async function() {

@@ -569,7 +569,7 @@ describe('ui workspace files › renderWorkspaceFilesSection', function() {
         assert.deepStrictEqual(s.m.__scope._wsfSectionFiles, []);
     }, { tags: ['unit'] });
 
-    test('rows: name/dir/workspace chip, NEW/MODIFIED/DELETED/DISCARDED/MERGED badges, change count, worker chips, escaping', async function() {
+    test('rows: name/dir, M/A/D letters, merged/discarded rows excluded (only uncommitted files), tooltip carries kind/worker, escaping', async function() {
         var hostilePath = 'x/' + HOSTILE.replace(/\//g, '_') + '.js';
         var metas = [{ repo: 'example-org/AppAgent::main', github_repo: 'example-org/AppAgent', prs: [{ number: 7, state: 'merged', merged_at: '2026-01-01', files: [{ path: 'src/merged.js' }] }] }];
         var s = await setup({ metas: metas, subs: [{ chat: chatOf([call('edit', { path: 'src/worker.js' })]), name: HOSTILE }] });
@@ -580,24 +580,52 @@ describe('ui workspace files › renderWorkspaceFilesSection', function() {
         await U.flush(); await U.flush();
         assert.ok(s.g.renderVersionSidebar.calls.length >= 1, 'merged-snapshot load triggers one re-render');
         var host = render(s, chat);
-        assert.strictEqual(host.querySelector('.version-section-title').textContent, 'Workspace Files (7)');
+        assert.strictEqual(host.querySelector('.version-section-title').textContent, 'Workspace Files (5)', 'header counts active files only');
         var cards = Array.prototype.slice.call(host.querySelectorAll('.wsf-card'));
-        var badge = function(c) { return c.querySelector('.sn-status-badge').textContent; };
-        assert.deepStrictEqual(cards.map(function(c) { return c.querySelector('.sn-artifact-name').textContent; }),
-            ['a.js', 'new.js', 'old.js', 'd.js', 'merged.js', HOSTILE.replace(/\//g, '_') + '.js', 'worker.js']);
-        assert.deepStrictEqual(cards.map(badge), ['MODIFIED', 'NEW', 'DELETED', 'DISCARDED', 'MERGED', 'MODIFIED', 'MODIFIED']);
-        assert.strictEqual(cards[4].querySelector('.sn-status-merged').getAttribute('title'), 'Merged in PR #7');
-        assert.strictEqual(cards[0].querySelector('.sn-changes-badge').textContent, '2 changes');
-        assert.strictEqual(cards[1].querySelector('.sn-changes-badge'), null);
+        assert.deepStrictEqual(cards.map(function(c) { return c.querySelector('.wsf-name').textContent; }),
+            ['a.js', 'new.js', 'old.js', HOSTILE.replace(/\//g, '_') + '.js', 'worker.js']);
+        assert.deepStrictEqual(cards.map(function(c) { return c.getAttribute('data-status'); }), ['modified', 'new', 'deleted', 'modified', 'modified']);
+        assert.deepStrictEqual(cards.slice(0, 3).map(function(c) { return c.querySelector('.wsf-letter').textContent; }), ['M', 'A', 'D']);
+        assert.strictEqual(host.querySelectorAll('.wsf-done-group, .wsf-done-toggle').length, 0, 'no Merged/Done group');
+        assert.strictEqual(cards[0].getAttribute('title').split('\n')[1], 'MODIFIED', 'tooltip carries the change kind');
+        assert.strictEqual(host.querySelectorAll('a, .sn-status-badge, .sn-changes-badge, .wsf-ws, .wsf-pr').length, 0, 'no PR link/chip, pills, change-count or worker chips');
         assert.strictEqual(cards[0].querySelector('.wsf-dir').textContent, 'src');
-        assert.strictEqual(cards[2].querySelector('.wsf-dir'), null, 'root file has no dir chip');
-        assert.strictEqual(cards[0].querySelector('.wsf-ws').textContent, 'AppAgent::main', 'first explicit wsKey backfilled');
-        assert.strictEqual(cards[5].getAttribute('title'), hostilePath, 'copy is attributed to dest; full path as tooltip');
-        var chip = cards[6].querySelector('.wsf-ws');
-        assert.strictEqual(chip.textContent, HOSTILE); assert.strictEqual(chip.getAttribute('title'), 'Edited by worker ' + HOSTILE);
+        assert.strictEqual(cards[2].querySelector('.wsf-dir'), null, 'root file has no dir');
+        assert.strictEqual(host.querySelector('.wsf-group-label'), null, 'single workspace: no group label');
+        assert.strictEqual(cards[3].getAttribute('title').split('\n')[0], hostilePath, 'copy is attributed to dest; full path in tooltip');
+        assert.ok(cards[4].getAttribute('title').indexOf('Edited by worker ' + HOSTILE) > 0, 'worker kept in tooltip');
         noInjection(host);
-        assert.deepStrictEqual(cards.map(function(c) { return c.getAttribute('onclick'); }).slice(0, 2), ['wsfOpenDiff(0)', 'wsfOpenDiff(1)'], 'index-based routing');
-        assert.notStrictEqual(U.css(cards[1].querySelector('.sn-status-badge'), 'background-color'), U.css(cards[2].querySelector('.sn-status-badge'), 'background-color'), 'NEW and DELETED badges styled differently');
+        assert.deepStrictEqual(cards.map(function(c) { return c.getAttribute('onclick'); }).slice(0, 2), ['wsfOpenWsFile(0)', 'wsfOpenWsFile(1)'], 'index-based routing');
+        assert.deepStrictEqual(s.m.__scope._wsfSectionFiles.map(function(f) { return f.path; }).indexOf('src/merged.js'), -1, 'registry = displayed rows only');
+        assert.strictEqual(s.m.__scope._wsfSectionFiles.length, 5);
+        assert.notStrictEqual(U.css(cards[1].querySelector('.wsf-letter'), 'color'), U.css(cards[2].querySelector('.wsf-letter'), 'color'), 'A and D letters colored differently');
+    }, { tags: ['unit'] });
+
+    test('rows show +N/−M line counts (cached async, one re-render), NEW / DELETED tags, no counts for lazy stubs', async function() {
+        var files = {
+            'src/a.js': { dirty: true, original_content: 'one\ntwo\nthree', content: 'one\n2\nthree\nfour' },
+            'src/new.js': { dirty: true, original_content: null, content: 'x\ny\nz' },
+            'old.js': { dirty: true, deleted: true, original_content: 'p\nq', content: null },
+            'src/stub.js': { dirty: true, stub: true, content: null, original_content: null }
+        };
+        var s = await setup({ files: files });
+        var chat = chatOf([call('edit', { path: 'src/a.js', workspace: WS }), call('write', { path: 'src/new.js', workspace: WS }, { success: true, message: 'Created src/new.js' }),
+            call('delete', { path: 'old.js', workspace: WS }), call('edit', { path: 'src/stub.js', workspace: WS })]);
+        var host = render(s, chat);
+        assert.strictEqual(host.querySelectorAll('.wsf-counts').length, 0, 'first render: counts not loaded yet');
+        for (var k = 0; k < 6; k++) await U.flush();
+        var renders = s.g.renderVersionSidebar.calls.length;
+        assert.ok(renders >= 1, 'count load re-renders');
+        host = render(s, chat);
+        var cards = Array.prototype.slice.call(host.querySelectorAll('.wsf-card'));
+        function cnt(c) { var e = c.querySelector('.wsf-counts'); return e ? e.textContent : null; }
+        assert.deepStrictEqual(cards.map(cnt), ['+2\u22121', '+3', '\u22122', null]);
+        assert.deepStrictEqual(cards.map(function(c) { return c.querySelector('.wsf-letter').textContent; }), ['M', 'A', 'D', 'M'], 'change letters');
+        assert.strictEqual(cards[1].querySelector('.wsf-letter').getAttribute('aria-label'), 'NEW');
+        assert.strictEqual(cards[2].querySelector('.wsf-letter').getAttribute('aria-label'), 'DELETED');
+        assert.notStrictEqual(U.css(cards[0].querySelector('.wsf-diff-add'), 'color'), U.css(cards[0].querySelector('.wsf-diff-del'), 'color'), '+ and \u2212 colored differently');
+        for (var j = 0; j < 6; j++) await U.flush();
+        assert.strictEqual(s.g.renderVersionSidebar.calls.length, renders, 'cached counts: re-render does not loop');
     }, { tags: ['unit'] });
 
     test('row click opens the diff modal (escaped title, counter, stats); Esc closes; ArrowRight switches file; missing file → snackbar', async function() {
@@ -743,9 +771,9 @@ describe('ui workspace files › renderWorkspaceFilesSection', function() {
             collapseOtherTools: U.recorder(function(t) { document.querySelectorAll('details.tool-call[open]').forEach(function(el) { if (el !== t) el.open = false; }); }) };
         var s = await setup({ metas: [{ repo: 'o/r::main' }], files: { 'z.txt': { dirty: true, original_content: '', content: 'v2' } }, globals: st });
         render(s, chat);
-        var card = s.host.querySelector('.wsf-card[title="z.txt"]');
+        var card = Array.prototype.slice.call(s.host.querySelectorAll('.wsf-card')).filter(function(c) { return c.getAttribute('title').split('\n')[0] === 'z.txt'; })[0];
         assert.ok(card, 'z.txt row rendered');
-        assert.strictEqual(await s.m.wsfOpenVersions(+/wsfOpenDiff\((\d+)\)/.exec(card.getAttribute('onclick'))[1]), true);
+        assert.strictEqual(await s.m.wsfOpenVersions(+/wsfOpenWsFile\((\d+)\)/.exec(card.getAttribute('onclick'))[1]), true);
         var chips = document.querySelectorAll('.wsf-overlay .wsf-ver-chat.this-chat[title="Show in chat"]');
         assert.deepStrictEqual(Array.prototype.map.call(chips, function(c) { return c.getAttribute('onclick'); }), ['wsfGoToVersionMsg(1)', 'wsfGoToVersionMsg(2)']);
         return { s: s, st: st };

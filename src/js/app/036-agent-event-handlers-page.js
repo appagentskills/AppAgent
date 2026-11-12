@@ -769,6 +769,8 @@ AgentEvents.on('runCrashed', function(e) {
                 message: _agentEventsChatTitle(_crChat),
                 chatId: e.chatId
             });
+            // IDLE-REPLAY marker (ui/220): this bell was already OS-notified.
+            if (typeof noteOsNotified === 'function') { try { noteOsNotified('finish:' + e.chatId); } catch (err) {} }
         }
     }
     // A crashed hook run never emits silentHookState{active:false} — clear the
@@ -801,6 +803,7 @@ AgentEvents.on('notifyFinish', function(e) {
             message: _agentEventsChatTitle(nc),
             chatId: chatId
         });
+        if (typeof noteOsNotified === 'function') { try { noteOsNotified('finish:' + chatId); } catch (err) {} }
     }
     // In-app counterpart: when the user is ON the extension page but viewing
     // a DIFFERENT chat, no browser notification fires — light up the small
@@ -1206,6 +1209,7 @@ AgentEvents.on('recordMutated', function(e) {
         displayName: e.displayName,
         action: e.action,
         statusMessage: e.statusMessage || null,
+        instanceUrl: e.instanceUrl || undefined,
         messageIndex: typeof e.messageIndex === 'number' ? e.messageIndex : -1,
         beforeVersion: e.beforeVersion || null,
         afterVersion: e.afterVersion || null

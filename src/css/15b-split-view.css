@@ -1,9 +1,27 @@
-/* Split widget view — <aside id="split-widget-pane"> beside #main-area inside
-   .main-wrapper (core/082-split-view.js). Side by side on wide screens,
-   stacked vertically (chat on top, widget below) when narrow / side panel. */
-.split-widget-pane { flex: 1 1 50%; min-width: 320px; display: flex; flex-direction: column; border-inline-start: 1px solid var(--secondary-border); background: var(--bg-white); overflow: hidden; }
+/* Split widget view — <aside id="split-widget-pane"> mounted inside #main-area
+   (core/082-split-view.js). While split, #main-area is a grid: row 1 is the
+   full-width .main-header (always visible), and only the area BELOW it is
+   split — chat + composer beside the pane on wide screens, stacked (chat on
+   top, widget below) when narrow / side panel. !important beats the inline
+   display:flex set by the view switcher; split-view-active is removed whenever
+   #main-area is hidden, so display:none still applies then. */
+body.split-view-active #main-area { display: grid !important; grid-template-columns: minmax(0, 1fr) minmax(320px, 1fr); grid-template-rows: auto minmax(0, 1fr) auto; }
+body.split-view-active #main-area > * { grid-column: 1; min-width: 0; min-height: 0; }
+body.split-view-active #main-area > .main-header { grid-column: 1 / -1; grid-row: 1; }
+body.split-view-active #main-area > .chat-content-wrapper { grid-row: 2; }
+body.split-view-active #main-area > .input-area { grid-row: 3; }
+body.split-view-active #main-area > .split-widget-pane { grid-column: 2; grid-row: 2 / -1; }
+/* User-dragged pane width (ui/242-panel-resize.js, appStorage 'splitPaneWidth'):
+   side-by-side layout only; clamp() keeps the widget pane between 25% and 75%
+   of #main-area even if the stored width no longer fits after a window resize
+   (default 50%). */
+@media (min-width: 901px) {
+    body.split-view-active:not(.sidepanel-mode) #main-area { grid-template-columns: minmax(0, 1fr) 50%; }
+    body.split-view-active:not(.sidepanel-mode) #main-area.split-pane-sized { grid-template-columns: minmax(0, 1fr) clamp(25%, var(--split-pane-width, 50%), 75%); }
+    body.split-view-active:not(.sidepanel-mode) .split-widget-pane { min-width: 0; }
+}
+.split-widget-pane { position: relative; min-width: 320px; display: flex; flex-direction: column; border-inline-start: 1px solid var(--secondary-border); background: var(--bg-white); overflow: hidden; }
 .split-widget-pane[hidden] { display: none; }
-body.split-view-active .main-wrapper > .main { flex: 1 1 50%; }
 /* Header = the shared fullscreen header (.widget-fullscreen-header, buildWidgetViewHeaderHtml); compact it for the pane. */
 .split-widget-header.widget-fullscreen-header { gap: var(--space-4); padding: var(--space-4) var(--space-6); flex-shrink: 0; flex-wrap: wrap; }
 .split-widget-header .widget-title { flex: 1; min-width: 80px; font-size: var(--text-body); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -41,9 +59,10 @@ body.split-view-active .main-wrapper > .main { flex: 1 1 50%; }
 .split-widget-update-pill { align-self: center; display: inline-flex; align-items: center; gap: var(--space-3); margin: var(--space-2) auto 0; padding: var(--space-1) var(--space-2) var(--space-1) var(--space-4); border-radius: 999px; background: var(--primary-lighter); color: var(--primary); font-size: var(--text-caption); flex-shrink: 0; }
 
 @media (max-width: 900px) {
-    body.split-view-active .main-wrapper { flex-direction: column; }
-    body.split-view-active .main-wrapper > .main { flex: 1 1 50%; min-height: 0; }
-    .split-widget-pane { min-width: 0; flex: 1 1 50%; min-height: 0; border-inline-start: none; border-top: 1px solid var(--secondary-border); }
+    body.split-view-active #main-area { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr) auto minmax(0, 1fr); }
+    body.split-view-active #main-area > .split-widget-pane { grid-column: 1; grid-row: 4; }
+    .split-widget-pane { min-width: 0; min-height: 0; border-inline-start: none; border-top: 1px solid var(--secondary-border); }
 }
-body.sidepanel-mode.split-view-active .main-wrapper { flex-direction: column; }
+body.sidepanel-mode.split-view-active #main-area { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr) auto minmax(0, 1fr); }
+body.sidepanel-mode.split-view-active #main-area > .split-widget-pane { grid-column: 1; grid-row: 4; }
 body.sidepanel-mode .split-widget-pane { min-width: 0; min-height: 0; border-inline-start: none; border-top: 1px solid var(--secondary-border); }

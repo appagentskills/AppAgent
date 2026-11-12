@@ -1439,12 +1439,17 @@ function openDocumentsView() {
         sdocGhReset();
         // Restore the persisted rail selection once; the refresh fallback
         // (sdocRefreshSources) resets it to 'all' if that source is gone.
+        // A reload keeps history.state: land back in the folder that entry recorded
+        // (validated once the sources load), else the persisted rail selection.
         if (!sdocSrcState.restored) {
             sdocSrcState.restored = true;
-            try {
-                var savedSrc = (typeof appStorage !== 'undefined' && appStorage) ? appStorage.getItem('documentsPageSource') : null;
-                if (savedSrc) sdocSrcState.sel = String(savedSrc);
-            } catch (e) {}
+            var bootSt = _sdocBootHistoryState;
+            if (!sdocApplyHistoryFolder(bootSt && bootSt.view === 'documents' ? bootSt : null)) {
+                try {
+                    var savedSrc = (typeof appStorage !== 'undefined' && appStorage) ? appStorage.getItem('documentsPageSource') : null;
+                    if (savedSrc) sdocSrcState.sel = String(savedSrc);
+                } catch (e) {}
+            }
         }
         renderDocumentsPage();
         if (typeof afScheduleRefresh === 'function') afScheduleRefresh(0);
@@ -1454,6 +1459,7 @@ function openDocumentsView() {
     updateAllButtonStates();
     renderChatList();
     pushHistoryState('documents', null);
+    sdocSyncFolderHistory(true); // stamp the page entry with the folder it opened on
 }
 
 // Search + Rows/Gallery layout mirror the dashboard's Widget Library
@@ -1784,6 +1790,21 @@ function sdocPageMatches(doc, q) {
         String(doc.currentContent || '').toLowerCase().indexOf(q) !== -1;
 }
 
+// Publish the sticky page toolbar's live height as --documents-toolbar-h on the panel so the sticky
+// folder breadcrumb (.sdoc-src-crumbs, css/29) pins right under it even when the toolbar wraps.
+var _sdocToolbarRO = null;
+function _sdocTrackToolbarHeight() {
+    if (_sdocToolbarRO || typeof ResizeObserver !== 'function') return;
+    var panel = document.getElementById('documents-panel');
+    var bar = panel && panel.querySelector('.documents-header');
+    if (!bar) return;
+    _sdocToolbarRO = new ResizeObserver(function() {
+        var h = bar.offsetHeight;
+        if (h > 0) panel.style.setProperty('--documents-toolbar-h', h + 'px');
+    });
+    _sdocToolbarRO.observe(bar);
+}
+
 function renderDocumentsPage() {
     var list = document.getElementById('documents-list');
     if (!list) return;
@@ -1826,6 +1847,7 @@ function renderDocumentsPage() {
         '</div>');
     }
     list.classList.add('sdoc-rail-layout');
+    _sdocTrackToolbarHeight();
     sdocBindAgentFilesDrop(document.getElementById('documents-sources'));
     sdocBindAgentFilesDrop(document.getElementById('sdoc-pane'));
     _sdocBindAddOutside();
@@ -2027,7 +2049,7 @@ function sdocRefreshSources() {
         sdocSrcState.wsRows = list.wsRows || {};
         delete list.wsRows;
         sdocSrcState.sources = list;
-        if (sdocSrcState.sel !== 'all' && sdocSrcState.sel !== 'sdocs' && !sdocSrcById(sdocSrcState.sel)) { sdocSrcState.sel = 'all'; sdocSrcState.path = ''; }
+        if (_sdocValidateNav()) sdocSyncFolderHistory(true);
     }).catch(function() { if (gen === sdocSrcState.gen) sdocSrcState.sources = []; }).then(function() {
         if (sdocSrcState.loading === p) sdocSrcState.loading = null;
         if (gen !== sdocSrcState.gen) return;
@@ -2046,7 +2068,58 @@ function sdocSelectSource(id) {
     sdocSrcState.sel = pr ? pr.wsId : (id || 'all');
     sdocSrcState.path = pr ? '#pr/' + pr.n : '';
     try { if (typeof appStorage !== 'undefined' && appStorage) appStorage.setItem('documentsPageSource', sdocSrcState.sel); } catch (e) {}
+    sdocSyncFolderHistory();
     sdocRenderSourcesStrip(); renderDocumentsPageItems();
+}
+
+// ─── Folder navigation <-> browser history ───
+// Every in-page folder change (rail source, breadcrumb, folder row) pushes a
+// {view:'documents', docSel, docPath} entry on top of the page entry that
+// openDocumentsView pushed, so Back/Forward walk folders before leaving the
+// page; Back from the first Documents entry leaves the page as before.
+// handlePopState (ui/025-history-nav.js) restores via sdocApplyHistoryFolder;
+// isHandlingPopState blocks pushes meanwhile, so a pop never adds an entry.
+// Entries keep view/chatId/skillId, so pushHistoryState's same-entry check and
+// the split-view chat restore (#1299) see ordinary 'documents' entries.
+function _sdocHistoryState() { try { return history.state; } catch (e) { return null; } }
+var _sdocBootHistoryState = _sdocHistoryState(); // captured at parse, before init rewrites the entry
+function sdocFolderHistoryState(sel, path) {
+    return { view: 'documents', chatId: null, skillId: null, docSel: String(sel || 'all'), docPath: String(path || '') };
+}
+// replace=true rewrites the current entry (page stamp / dead-folder fallback; allowed
+// during a pop). Otherwise pushes, unless the current entry already shows this folder.
+function sdocSyncFolderHistory(replace) {
+    if (typeof currentView === 'undefined' || currentView !== 'documents') return;
+    if (!replace && typeof isHandlingPopState !== 'undefined' && isHandlingPopState) return;
+    if (typeof history === 'undefined' || !history) return;
+    var st = sdocFolderHistoryState(sdocSrcState.sel, sdocSrcState.path);
+    var cur = _sdocHistoryState();
+    if (cur && cur.view === 'documents' && cur.docSel === st.docSel && (cur.docPath || '') === st.docPath) return;
+    try {
+        if (replace || !cur || (cur.view === 'documents' && cur.docSel === undefined)) history.replaceState(st, '');
+        else history.pushState(st, '');
+    } catch (e) {}
+}
+// Fix a selection that points at a source/workspace folder that is gone; true when changed.
+function _sdocValidateNav() {
+    var sel = sdocSrcState.sel, path = sdocSrcState.path;
+    if (sel === 'all' || sel === 'sdocs' || sdocSrcState.sources === null) return false; // unloaded: sdocRefreshSources re-checks
+    var src = sdocSrcById(sel);
+    if (!src) { sdocSrcState.sel = 'all'; sdocSrcState.path = ''; return true; }
+    if (src.type === 'ws' && path && !sdocPrPathNumber(path)) {
+        var pre = path + '/', rows = sdocSrcState.wsRows[src.wk] || [];
+        if (!rows.some(function(r) { return !r.deleted && String(r.path || '').indexOf(pre) === 0; })) { sdocSrcState.path = ''; return true; }
+    }
+    return false;
+}
+// Restore the folder a history entry recorded (no push). False for entries without one.
+function sdocApplyHistoryFolder(state) {
+    if (!state || typeof state !== 'object' || typeof state.docSel !== 'string') return false;
+    sdocSrcState.sel = state.docSel || 'all';
+    sdocSrcState.path = typeof state.docPath === 'string' ? state.docPath : '';
+    try { if (typeof appStorage !== 'undefined' && appStorage) appStorage.setItem('documentsPageSource', sdocSrcState.sel); } catch (e) {}
+    if (_sdocValidateNav()) sdocSyncFolderHistory(true);
+    return true;
 }
 function sdocSrcTopCount(src) {
     if (src.type === 'ws') return src.count;
@@ -3041,7 +3114,11 @@ function sdocSrcListing(src, path, recursive) {
     cache[key] = { loading: true };
     Promise.resolve().then(function() { return lfListDir(src.folderId, recursive ? '' : path, { recursive: !!recursive, limit: recursive ? SDOC_SRC_SEARCH_MAX : SDOC_SRC_LIST_MAX }); })
         .then(function(res) { cache[key] = { entries: (res && res.entries) || [], truncated: !!(res && res.truncated) }; },
-              function(e) { cache[key] = { entries: [], error: String((e && e.message) || e), needsGrant: !!(e && e.code === 'PERMISSION_REQUIRED') }; })
+              function(e) {
+                  cache[key] = { entries: [], error: String((e && e.message) || e), needsGrant: !!(e && e.code === 'PERMISSION_REQUIRED') };
+                  // The open folder vanished (e.g. restored from history): fall back to the source root.
+                  if (e && e.code === 'NOT_FOUND' && !recursive && path && sdocSrcState.sel === src.id && sdocSrcState.path === path) { sdocSrcState.path = ''; sdocSyncFolderHistory(true); }
+              })
         .then(function() {
             if (cache !== sdocSrcState.listings) return; // reset while loading: the stale result stays in the dropped cache
             // A fresh Agent Files listing (after upload / delete / reopen) re-scans the unseen set.
@@ -3676,7 +3753,7 @@ function sdocBreadcrumbHtml(src) {
     for (var i = 0; i < parts.length; i++) html += '<span class="sdoc-src-crumb-sep" aria-hidden="true">/</span><button type="button" class="sdoc-src-crumb" onclick="sdocSrcNavigate(\'' + sdocJsArg(parts.slice(0, i + 1).join('/')) + '\')"' + (i === parts.length - 1 ? ' aria-current="location"' : '') + '>' + _sdsEsc(parts[i]) + '</button>';
     return html + '</div>';
 }
-function sdocSrcNavigate(path) { sdocSrcState.path = path || ''; sdocRenderSourcesStrip(); renderDocumentsPageItems(); }
+function sdocSrcNavigate(path) { sdocSrcState.path = path || ''; sdocSyncFolderHistory(); sdocRenderSourcesStrip(); renderDocumentsPageItems(); }
 
 // Renders the file part of the unified list after the doc rows; returns true when it drew something.
 function sdocRenderFileSection(items, sel, q, docs, preHtml) {
@@ -3728,7 +3805,7 @@ function sdocOpenFileRow(idx) {
     var row = sdocSrcState.rendered[idx];
     if (!row) return;
     var e = row.entry, src = row.src;
-    if (e.kind === 'directory') { sdocSrcState.sel = src.id; sdocSrcState.path = e.path; sdocRenderSourcesStrip(); renderDocumentsPageItems(); return; }
+    if (e.kind === 'directory') { sdocSrcState.sel = src.id; sdocSrcState.path = e.path; sdocSyncFolderHistory(); sdocRenderSourcesStrip(); renderDocumentsPageItems(); return; }
     if (e.pr) return sdocPrOpenFile(src, e);
     return sdocPreviewFile(src, e.path);
 }

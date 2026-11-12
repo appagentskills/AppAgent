@@ -169,6 +169,12 @@ function handlePopState(event) {
             loadVersionHistory();
             renderChatList();
             renderMessages();
+            // The split widget pane follows the displayed chat — mirrors selectChat
+            // (ui/170-chat-management.js). popstate bypassed it, so Back/Forward to a
+            // chat with a widget in split view left the pane closed (or kept the
+            // previous chat's pane). Reads the persisted per-chat record, so a pane
+            // the user closed (x -> {closed:true}) stays closed.
+            if (typeof renderSplitViewPane === 'function') { try { renderSplitViewPane(); } catch (e) {} }
             updateInputPosition();
             updateChatTitleHeader();
             updateAllButtonStates();
@@ -297,6 +303,9 @@ function handlePopState(event) {
             // it gets the same typeof guard this file uses for cross-tier calls.
             currentView = 'documents';
             appStorage.setItem('currentView', 'documents');
+            // Folder entries ({docSel, docPath}, pushed by sdocSyncFolderHistory) restore
+            // the folder before the render; isHandlingPopState keeps this from pushing.
+            if (typeof sdocApplyHistoryFolder === 'function') sdocApplyHistoryFolder(state);
             hideAllPanels();
             var documentsPanel = document.getElementById('documents-panel');
             if (documentsPanel) {

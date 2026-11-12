@@ -61,6 +61,24 @@ function getFinishedChatBell(chatId) {
     return { hasError: !!_unseenFinishedChats[chatId].hasError };
 }
 
+// IDLE-REPLAY (ui/220 replayMissedOsNotifications): the chats currently
+// carrying a bell — the row bell (getFinishedChatBell) or an errored finish
+// still in the error state. Read-only. [{ chatId, at, hasError }]
+function listUnseenFinishedChats() {
+    var out = [];
+    Object.keys(_unseenFinishedChats).forEach(function(cid) {
+        var e = _unseenFinishedChats[cid];
+        if (!e) return;
+        var lit = !!getFinishedChatBell(cid);
+        if (!lit && e.hasError && typeof chats !== 'undefined' && chats[cid] &&
+            typeof _jobsChatState === 'function' && _jobsChatState(cid) === 'error' &&
+            !(typeof currentChatId !== 'undefined' && cid === currentChatId &&
+              (typeof currentView === 'undefined' || currentView === 'chat'))) lit = true;
+        if (lit) out.push({ chatId: cid, at: e.at || 0, hasError: !!e.hasError });
+    });
+    return out;
+}
+
 // Called from the notifyFinish handler (036-agent-event-handlers-page.js)
 // when a run finishes on a chat the user is not currently viewing.
 function noteChatFinishedUnseen(chatId, hasError) {

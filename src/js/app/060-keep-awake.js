@@ -273,11 +273,18 @@
         // pointerdown is capture-phase so it lands before the global activity
         // 'click' handler, closing the panel immediately rather than after a grace period.
         document.addEventListener('pointerdown', onOutsidePointerDown, true);
+        // Keyboard typing and wheel scrolling are user activity too: hide the
+        // notice immediately (no 10 s grace period), same as an outside click.
+        // Keys pressed inside the panel (Tab/Enter on its buttons) are ignored.
+        document.addEventListener('keydown', onOutsidePointerDown, true);
+        document.addEventListener('wheel', onOutsidePointerDown, { capture: true, passive: true });
     }
 
     function hideNotice() {
         if (!noticeEl) return;
         document.removeEventListener('pointerdown', onOutsidePointerDown, true);
+        document.removeEventListener('keydown', onOutsidePointerDown, true);
+        document.removeEventListener('wheel', onOutsidePointerDown, { capture: true, passive: true });
         noticeEl.classList.remove('show');
         var el = noticeEl;
         noticeEl = null;
@@ -287,8 +294,11 @@
     // Dismiss the notice when the user interacts anywhere outside it. The OS lock
     // is governed separately by computeDesired()/the activity handler — this only
     // hides the message, mirroring the × button.
+    // Handles pointerdown, keydown and wheel (any real user input). Synthetic
+    // events (isTrusted === false) are ignored so scripted input can't dismiss it.
     function onOutsidePointerDown(evt) {
         if (!noticeEl) return;
+        if (evt && evt.isTrusted === false) return;
         if (noticeEl.contains && noticeEl.contains(evt.target)) return;
         noticeDismissed = true;
         hideNotice();

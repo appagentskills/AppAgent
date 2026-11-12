@@ -2,15 +2,37 @@
    Workspace Files sidebar section + modals
    ============================================= */
 
-.version-wsfiles-section { margin-bottom: var(--space-6); }
-/* Match the Workers section header (.sidebar-workers-header): caption size, no icon. */
-.version-wsfiles-section .version-section-title { font-size: var(--text-caption, 11px); letter-spacing: 0.04em; padding: var(--space-3) var(--space-5); }
-
-.wsf-card .sn-artifact-meta { gap: var(--space-2); }
-.wsf-dir { color: var(--text-muted); font-size: var(--text-xs); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 110px; }
+/* WSF-DESIGN: minimal Source-Control-style list — matches the Pull Requests
+   section (.version-prs-section in 11-version.css): same padding, divider,
+   caption title and plain hover rows. No pills / cards / borders per row. */
+.version-wsfiles-section { padding: var(--space-5) var(--space-6); border-bottom: 1px solid var(--secondary-border); }
+.version-wsfiles-section .version-section-title { font-size: var(--text-caption); font-weight: var(--font-semibold); color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: var(--space-4); }
+.wsf-list { display: flex; flex-direction: column; }
+.wsf-card { display: flex; align-items: center; gap: var(--space-3); min-height: 30px; padding: 0 var(--space-4); border-radius: var(--radius-sm); cursor: pointer; color: var(--text-primary); min-width: 0; transition: background-color var(--transition-fast); }
+.wsf-card:hover { background: var(--bg-hover); }
+.wsf-card:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
+.wsf-name { font-size: var(--text-body); font-weight: normal; color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 0 1 auto; min-width: 0; }
+.wsf-dir { flex: 1 1 0; min-width: 0; font-size: var(--text-body-sm); color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* WSF-COUNTS: right-aligned meta group — +N / −M counts, change letter. Never shrinks; name/dir ellipsize instead. */
+.wsf-meta { margin-inline-start: auto; flex-shrink: 0; display: inline-flex; align-items: center; gap: var(--space-2); white-space: nowrap; }
+/* GitHub-style compact diffstat: small, quiet, not bold; a zero side is omitted in markup. */
+.wsf-counts { display: inline-flex; gap: var(--space-1); font-family: var(--font-mono, monospace); font-size: var(--text-caption); font-weight: normal; line-height: 1; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.wsf-counts .wsf-diff-add, .wsf-counts .wsf-diff-del { font-weight: normal; }
+.wsf-tag { font-size: var(--text-body-sm); font-weight: var(--font-semibold); line-height: 1.4; padding: 0 var(--space-2); border-radius: var(--radius-sm); border: 1px solid currentColor; }
+.wsf-tag-new { color: var(--success); }
+.wsf-tag-deleted { color: var(--danger); }
+.wsf-letter { flex-shrink: 0; width: 12px; text-align: center; font-family: var(--font-mono, monospace); font-size: var(--text-caption); font-weight: var(--font-medium); line-height: 1; color: var(--text-muted); opacity: 0.85; }
+/* WSF-KIND: letter color = change kind (Workspace Files rows + PR file lists). */
+.wsf-letter.wsf-k-modified { color: var(--warning); }
+.wsf-letter.wsf-k-new { color: var(--success); }
+.wsf-letter.wsf-k-deleted { color: var(--danger); }
+.wsf-st-deleted .wsf-name { text-decoration: line-through; color: var(--text-secondary); }
+/* Quiet workspace label — only rendered when >1 workspace has active files. */
+.wsf-group-label { font-size: var(--text-body-sm); color: var(--text-muted); padding: var(--space-2) var(--space-4) var(--space-1); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wsf-group-label:first-of-type { padding-top: 0; }
+.wsf-empty-line { font-size: var(--text-body-sm); color: var(--text-muted); padding: 0 var(--space-4); }
+/* Worker chip — still used by the Pull Requests / Artifacts sections (120-ui-utils.js). */
 .wsf-ws { display: inline-block; font-size: var(--text-xs); font-weight: var(--font-medium); padding: 0 var(--space-2); border-radius: var(--radius-sm); background: var(--secondary-light); color: var(--text-secondary); }
-
-.sn-status-deleted { background: var(--danger-light); color: var(--danger); }
 
 /* --- Overlay / modal --- */
 /* z-index MUST stay below --z-modal (10006) and --z-snackbar (10010): the
@@ -40,9 +62,72 @@
 /* 16-diff.css hides .diff-separator except under .diff-focused — our compact
    diff always collapses context, so force the markers visible here. */
 .wsf-modal-body .diff-separator { display: flex; }
-.wsf-diff-stats { display: flex; gap: var(--space-3); margin-bottom: var(--space-3); font-size: var(--text-body-sm); font-weight: var(--font-semibold); }
+.wsf-diff-stats { display: flex; gap: var(--space-3); margin-bottom: var(--space-3); font-family: var(--font-mono, monospace); font-size: 12px; font-weight: normal; }
 .wsf-diff-add { color: var(--success); }
 .wsf-diff-del { color: var(--danger); }
+/* --- PR modal (GitHub-style) + PR chip in diff/view modals --- */
+.wsf-pr-overlay .wsf-modal-title { white-space: normal; overflow: visible; align-items: flex-start; }
+.wsf-pr-head { display: flex; flex-direction: column; gap: var(--space-3); min-width: 0; }
+.wsf-pr-title-row { font-size: 20px; line-height: 1.3; font-weight: var(--font-regular, 400); color: var(--text-primary); word-break: break-word; }
+.wsf-pr-title { font-weight: var(--font-semibold); }
+.wsf-pr-num { color: var(--text-muted); font-weight: 300; }
+.wsf-pr-sub { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-3); font-size: var(--text-body-sm); font-weight: normal; color: var(--text-secondary); }
+.wsf-pr-branches code { font-family: var(--font-mono, monospace); font-size: 12px; padding: 1px 6px; border-radius: 6px; background: rgba(9, 105, 218, 0.1); color: #0969da; }
+.wsf-pr-gh { display: inline-flex; align-items: center; text-decoration: none; }
+.wsf-pr-state { display: inline-flex; align-items: center; gap: 4px; padding: 2px 10px; border-radius: 2em; font-size: 12px; font-weight: var(--font-semibold); line-height: 18px; color: #fff; white-space: nowrap; }
+.wsf-pr-state .ui-icon, .wsf-pr-state svg { width: 14px; height: 14px; }
+.wsf-pr-state-open { background: #1f883d; }
+.wsf-pr-state-merged { background: #8250df; }
+.wsf-pr-state-closed { background: #cf222e; }
+.wsf-pr-tabs { display: flex; gap: var(--space-2); border-bottom: 1px solid var(--secondary-border); margin-bottom: var(--space-5); }
+.wsf-pr-tab { border: none; background: transparent; color: var(--text-secondary); font-size: var(--text-body); padding: var(--space-3) var(--space-4); margin-bottom: -1px; border-bottom: 2px solid transparent; cursor: pointer; display: inline-flex; align-items: center; gap: var(--space-2); border-radius: var(--radius-md) var(--radius-md) 0 0; }
+.wsf-pr-tab:hover { color: var(--text-primary); background: var(--secondary-lighter); }
+.wsf-pr-tab.active { color: var(--text-primary); font-weight: var(--font-semibold); border-bottom-color: #fd8c73; }
+.wsf-pr-count { display: inline-block; min-width: 18px; padding: 0 6px; border-radius: 2em; background: var(--secondary-light); color: var(--text-primary); font-size: 12px; font-weight: var(--font-medium); line-height: 18px; text-align: center; }
+.wsf-pr-pane[hidden] { display: none; }
+/* Files changed tab: GitHub-style file headers with inline (accordion) diffs */
+.wsf-pr-files-bar { display: flex; justify-content: flex-end; margin-bottom: var(--space-3); }
+.wsf-pr-toggle-all { border: 1px solid var(--secondary-border); background: var(--bg-white); color: var(--text-primary); font: inherit; font-size: var(--text-body-sm); padding: 3px 10px; border-radius: var(--radius-md); cursor: pointer; }
+.wsf-pr-toggle-all:hover { background: var(--secondary-lighter); }
+.wsf-pr-toggle-all:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
+.wsf-pr-file-list { display: flex; flex-direction: column; gap: var(--space-4); }
+.wsf-pr-file { border: 1px solid var(--secondary-border); border-radius: var(--radius-md); overflow: hidden; min-width: 0; }
+.wsf-pr-file-head { display: flex; align-items: center; gap: var(--space-3); padding: var(--space-3) var(--space-4); background: var(--secondary-lighter); cursor: pointer; min-width: 0; }
+.wsf-pr-file.open .wsf-pr-file-head { border-bottom: 1px solid var(--secondary-border); }
+.wsf-pr-file-head:hover { background: var(--bg-hover); }
+.wsf-pr-file-head:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
+.wsf-pr-file-chev { display: inline-flex; flex-shrink: 0; color: var(--text-muted); transition: transform var(--transition-fast); }
+.wsf-pr-file-chev svg { width: 14px; height: 14px; }
+.wsf-pr-file.open .wsf-pr-file-chev { transform: rotate(90deg); }
+[dir="rtl"] .wsf-pr-file-chev { transform: scaleX(-1); }
+[dir="rtl"] .wsf-pr-file.open .wsf-pr-file-chev { transform: rotate(90deg); }
+.wsf-pr-file-path { flex: 1; min-width: 0; font-family: var(--font-mono, monospace); font-size: 12px; color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: ltr; text-align: start; }
+.wsf-pr-file-head .wsf-meta { margin-inline-start: auto; }
+.wsf-pr-file-body[hidden] { display: none; }
+.wsf-pr-file-body { padding: 0; }
+.wsf-pr-file-body > .wsf-empty, .wsf-pr-file-body > .wsf-file-meta { padding: var(--space-4); }
+.wsf-pr-file-body .wsf-diff-stats { display: none; }
+.wsf-pr-file-body .diff-container { border: none; border-radius: 0; margin: 0; }
+.wsf-pr-desc { border: 1px solid var(--secondary-border); border-radius: var(--radius-md); padding: var(--space-5) var(--space-6); font-size: var(--text-body); line-height: 1.6; color: var(--text-primary); word-wrap: break-word; }
+.wsf-pr-desc > :first-child { margin-top: 0; }
+.wsf-pr-desc > :last-child { margin-bottom: 0; }
+.wsf-pr-desc h1, .wsf-pr-desc h2 { padding-bottom: 0.3em; border-bottom: 1px solid var(--secondary-border); }
+.wsf-pr-desc code { font-family: var(--font-mono, monospace); font-size: 85%; padding: 0.2em 0.4em; border-radius: 6px; background: var(--secondary-lighter); }
+.wsf-pr-desc pre { background: var(--secondary-lighter); border-radius: var(--radius-md); padding: var(--space-4); overflow: auto; }
+.wsf-pr-desc pre code { padding: 0; background: transparent; }
+.wsf-pr-desc table { border-collapse: collapse; }
+.wsf-pr-desc th, .wsf-pr-desc td { border: 1px solid var(--secondary-border); padding: 4px 10px; }
+.wsf-pr-desc blockquote { margin: 0; padding: 0 1em; color: var(--text-secondary); border-inline-start: 0.25em solid var(--secondary-border); }
+.wsf-pr-chip-line { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-3); }
+.wsf-pr-chip { display: inline-flex; align-items: center; gap: var(--space-2); max-width: 100%; min-width: 0; border: 1px solid var(--secondary-border); background: var(--bg-white); color: var(--text-primary); font: inherit; font-size: var(--text-body-sm); padding: 4px 10px; border-radius: var(--radius-md); cursor: pointer; text-decoration: none; text-align: start; }
+.wsf-pr-chip:hover { background: var(--secondary-lighter); text-decoration: none; }
+.wsf-pr-chip:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
+.wsf-pr-chip-icon { display: inline-flex; color: var(--text-muted); }
+.wsf-pr-chip-icon svg { width: 14px; height: 14px; }
+.wsf-pr-chip-title { font-weight: var(--font-semibold); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.wsf-pr-chip-num { color: var(--text-muted); white-space: nowrap; }
+.wsf-pr-chip .wsf-pr-state { padding: 0 8px; font-size: 11px; }
+.wsf-pr-chip-extra { color: var(--text-muted); font-size: var(--text-body-sm); }
 .wsf-edit-hunk-title { font-size: var(--text-body-sm); font-weight: var(--font-semibold); color: var(--text-secondary); margin: var(--space-5) 0 var(--space-2); }
 
 /* --- Versions list --- */

@@ -83,7 +83,7 @@ describe('sidebar persisted workspace ownership', function() {
         var nested = { id: 'root', messages: [{ role: 'assistant', tool_calls: [{ function: { name: 'js_eval', arguments: '{"code":"not parsed or evaluated"}' } }] }] };
         var html = s.api.render(nested);
         assert.strictEqual(s.api.section().length, 2);
-        assert.ok(html.includes('Translator'));
+        assert.ok(s.api.section().some(function(f) { return (f.workers || []).indexOf('Translator') !== -1; }), 'worker attributed (shown in the row tooltip)');
         assert.ok(!html.includes('secret.md'));
         assert.strictEqual(s.api.files({ id: 'worker', _messagesEvicted: true }).length, 1);
         assert.strictEqual(s.api.files({ id: 'other' }).length, 0);
@@ -96,6 +96,9 @@ describe('sidebar persisted workspace ownership', function() {
         assert.strictEqual(files[0].changes.length, 1);
         assert.strictEqual(files[1].changes.length, 0);
         s.api.render(direct('root', 'o/r::main', 'locales/fr.json'));
+        // WSF-COUNTS: the render's async +/- count pass also resolves rows — let it drain, then probe the resolver alone.
+        for (var k = 0; k < 20; k++) await Promise.resolve();
+        s.resolved.length = 0;
         for (var i = 0; i < 3; i++) await s.api.resolve(s.api.section()[i]);
         assert.deepStrictEqual(s.resolved, [['o/r::main','locales/fr.json'],['o/r::next','locales/fr.json'],['o/other::main','locales/fr.json']], 'view/diff resolver uses exact selected workspace');
     });
@@ -125,10 +128,14 @@ describe('sidebar persisted workspace ownership', function() {
         assert.strictEqual(files.length, 2);
         assert.deepStrictEqual(files.map(function(f) { return [f.wsKey, f.pushedPr.number, f.changes.length]; }), [['o/r::main',1,0],['o/r::next',2,0]]);
     });
-    test('pushed owner survives reload and missing worker body with PR chip', async function() {
-        var opts = { rows: { 'o/r::main': [row(null, 'fr.md', { pushed_by_chat_id: 'worker', pushed_pr: { url: 'https://github.com/o/r/pull/7', number: 7 } })] }, registry: { root: [{ chat_id: 'worker', name: 'Writer' }] } };
+    test('pushed owner survives reload and missing worker body (row edited after the push stays listed)', async function() {
+        var opts = { rows: { 'o/r::main': [row(null, 'fr.md', { pushed_by_chat_id: 'worker', changed_since_push: true, pushed_pr: { url: 'https://github.com/o/r/pull/7', number: 7 } })] }, registry: { root: [{ chat_id: 'worker', name: 'Writer' }] } };
         var s = await setup(opts), reloaded = await setup(opts);
-        assert.ok(s.api.render({ id: 'root' }).includes('pull/7'));
+        var _h = s.api.render({ id: 'root' });
+        assert.ok(!_h.includes('<a '), 'no anchor in the row');
+        assert.ok(_h.indexOf('fr.md') > 0, 'row listed under Workspace Files');
+        assert.ok(!/wsf-pr\b|>#7</.test(_h), 'no per-row PR chip (PR files live under the PR row)');
+        assert.strictEqual(s.api.section()[0].pushedPr.number, 7, 'PR ref kept for the tooltip');
         reloaded.api.render({ id: 'root' });
         assert.strictEqual(reloaded.api.section()[0].workers[0], 'Writer');
         assert.strictEqual(reloaded.api.section()[0].changes.length, 0);
@@ -156,7 +163,7 @@ describe('sidebar persisted workspace ownership', function() {
         s.orphan = Object.assign({ repo: 'o/deleted::gone' }, row('root', 'orphan.js'));
         var result = await s.reader();
         assert.strictEqual(result.length, 1);
-        assert.deepStrictEqual(Object.keys(result[0]).sort(), ['isDeleted','isNew','owner','path','pushedPr','wsKey'].sort());
+        assert.deepStrictEqual(Object.keys(result[0]).sort(), ['changedSincePush','dirty','isDeleted','isNew','owner','path','prMerged','pushedPr','wsKey'].sort());
         for (var flag of ['failMeta', 'failRows', 'failOpen', 'failAbort', 'failTx']) {
             s[flag] = true;
             var rejected = false;
