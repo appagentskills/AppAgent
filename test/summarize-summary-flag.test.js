@@ -76,7 +76,7 @@ describe('summarize › isSummary flag (A2B3-01)', function() {
             return m[0];
         }).join('\n') + '\n' + ['extractHandoffSummary', '_isTypedUserMessage', 'buildHandoffUserMessages', 'buildContinuationSeed']
             .map(function(n) { return ssfDeclaration(src, n); }).join('\n');
-        var code = ssfI18n(all) + '\n' + helpers + '\n' + ssfDeclaration(src, 'completeSummaryAndCreateNewChat');
+        var code = ssfI18n(all) + '\n' + helpers + '\n' + ssfDeclaration(src, 'completeSummaryAndCreateNewChat', 'async ');
         var snacks = [], runs = 0, saves = 0;
         function noop() {}
         var env = {
@@ -94,11 +94,14 @@ describe('summarize › isSummary flag (A2B3-01)', function() {
             clearUpdateSet: noop, renderChatList: noop, renderMessages: noop, renderVersionSidebar: noop,
             updateChatTitleHeader: noop, renderWorkersStrip: noop, setChatPausedPersistent: noop,
             pushPauseToggleToOffscreen: noop, syncPauseButtonUI: noop,
-            runAgent: function() { runs++; return Promise.resolve(); }
+            runAgent: function() { runs++; return Promise.resolve(); },
+            // Chat lineage (#1327): the continuation pushes both chat skeletons to the SW.
+            _pushChatSkeletonToSW: noop
         };
         // Every production global used by this excerpt is supplied in env.
         var fn = new Function('env', 'with (env) {\n' + code + '\nreturn completeSummaryAndCreateNewChat;\n}')(env);
-        fn();
+        // #1327 made it async (handover block + SW lineage migration are awaited).
+        await fn();
         await Promise.resolve(); await Promise.resolve();
         assert.strictEqual(snacks.some(function(s) { return /Failed to generate summary/.test(s); }), false, 'no failure snackbar');
         assert.ok(env.chats.N, 'continued chat created');

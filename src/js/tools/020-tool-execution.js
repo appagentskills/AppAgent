@@ -957,7 +957,7 @@ async function executeDiffEdit(args, messageIndex, options) {
             }
             _diffToken = await Platform.getTokenForInstance(_diffInstanceUrl);
             if (!_diffToken) {
-                return { success: false, error: 'No token available for instance "' + args.instance + '" (' + _diffInstanceUrl + '). Ensure a tab is open for that instance.' };
+                return { success: false, error: 'No token available for instance "' + args.instance + '" (' + _diffInstanceUrl + '). Ensure a tab is open for that instance, or — if the user gave you (or a skill provides) credentials for it — log in with connect_instance.' };
             }
         }
         var _diffApiToken = _diffToken || Platform.getSessionToken() || '';
@@ -2225,6 +2225,41 @@ async function _executeToolInner(name, args, messageIndex, options) {
             return { success: false, error: (e && e.message) || _jsErrMsg };
             // B2-JS-EVAL-ERROR-SURFACE:END
         }
+    } else if (name === 'connect_instance') {
+        // Credential login (background.js snAutoLogin). SECURITY: the password
+        // is only passed through to snAutoLogin — never stored, logged or
+        // echoed back; the agent loop redacts it from the persisted transcript.
+        var _ciRaw = String((args && args.instance) || '').trim();
+        if (!_ciRaw) return { success: false, error: 'instance is required (URL or short name).' };
+        if (!args.username || !args.password) return { success: false, error: 'username and password are required. Use only credentials the user gave you or an active skill provides — never guess.' };
+        if (args.password === '[redacted]') {
+            return { success: false, error: 'The password for this call was redacted from the transcript (it is never stored). Ask the user for the password again, then call connect_instance with it.' };
+        }
+        var _ciUrl = (typeof Platform !== 'undefined' && Platform.resolveInstanceUrl) ? Platform.resolveInstanceUrl(_ciRaw) : null;
+        if (!_ciUrl) {
+            _ciUrl = /^https?:\/\//i.test(_ciRaw) ? _ciRaw : 'https://' + _ciRaw.replace(/\.service-now\.com.*$/i, '') + '.service-now.com';
+        }
+        try { _ciUrl = new URL(_ciUrl).origin; } catch (e) { return { success: false, error: 'Invalid instance: ' + _ciRaw }; }
+        if (!/^https:/.test(_ciUrl)) return { success: false, error: 'Only https instances are supported: ' + _ciUrl };
+        var _ciDisabled = {};
+        try {
+            _ciDisabled = await new Promise(function(r) {
+                chrome.storage.local.get('disabledInstances', function(d) { r((d && d.disabledInstances) || {}); });
+            });
+        } catch (e) { _ciDisabled = {}; }
+        if (_ciDisabled[_ciUrl]) {
+            return { success: false, error: 'Instance "' + _ciUrl + '" is disabled for agent use (toggle in the header instance picker). Ask the user to re-enable it.' };
+        }
+        var _ciLogin = (typeof self !== 'undefined' && self.snAutoLogin) || null;
+        if (typeof _ciLogin !== 'function') return { success: false, error: 'connect_instance is only available in the extension service worker.' };
+        var _ciRes;
+        try { _ciRes = await _ciLogin(_ciUrl, { username: String(args.username), password: String(args.password) }); }
+        catch (e) { return { success: false, error: 'connect_instance failed: ' + ((e && e.message) || e) }; }
+        if (_ciRes && _ciRes.success) {
+            try { if (Platform.refreshInstances) await Platform.refreshInstances(); } catch (e) {}
+            return { success: true, instance: _ciRes.instance, userName: _ciRes.userName || '', tabId: _ciRes.tabId || null, alreadyConnected: !!_ciRes.alreadyConnected };
+        }
+        return { success: false, instance: _ciUrl, reason: (_ciRes && _ciRes.reason) || 'unknown', error: (_ciRes && _ciRes.error) || 'Login failed.' };
     } else if (name === 'list_instances') {
         // List all connected ServiceNow instances.
         // ALWAYS re-probe via Platform.refreshInstances() — the same live
@@ -2353,7 +2388,7 @@ async function _executeToolInner(name, args, messageIndex, options) {
                 }
                 _attachToken = await Platform.getTokenForInstance(_attachInstanceUrl);
                 if (!_attachToken) {
-                    return { success: false, error: 'No token available for instance "' + args.instance + '". Ensure a tab is open for that instance.' };
+                    return { success: false, error: 'No token available for instance "' + args.instance + '". Ensure a tab is open for that instance, or — if the user gave you (or a skill provides) credentials for it — log in with connect_instance.' };
                 }
             }
 
@@ -2443,7 +2478,7 @@ async function _executeToolInner(name, args, messageIndex, options) {
                 }
                 _atToken = await Platform.getTokenForInstance(_atInstanceUrl);
                 if (!_atToken) {
-                    return { success: false, error: 'No token available for instance "' + args.instance + '" (' + _atInstanceUrl + '). Ensure a tab is open for that instance.' };
+                    return { success: false, error: 'No token available for instance "' + args.instance + '" (' + _atInstanceUrl + '). Ensure a tab is open for that instance, or — if the user gave you (or a skill provides) credentials for it — log in with connect_instance.' };
                 }
             }
 
@@ -2536,7 +2571,7 @@ async function _executeToolInner(name, args, messageIndex, options) {
             }
             _targetToken = await Platform.getTokenForInstance(_targetInstanceUrl);
             if (!_targetToken) {
-                return { success: false, error: 'No token available for instance "' + args.instance + '" (' + _targetInstanceUrl + '). Ensure a tab is open for that instance.' };
+                return { success: false, error: 'No token available for instance "' + args.instance + '" (' + _targetInstanceUrl + '). Ensure a tab is open for that instance, or — if the user gave you (or a skill provides) credentials for it — log in with connect_instance.' };
             }
         }
 
@@ -2654,7 +2689,7 @@ async function _executeToolInner(name, args, messageIndex, options) {
             }
             _rsTargetToken = await Platform.getTokenForInstance(_rsTargetUrl);
             if (!_rsTargetToken) {
-                return { success: false, error: 'No token available for instance "' + args.instance + '".' };
+                return { success: false, error: 'No token available for instance "' + args.instance + '". Ensure a tab is open for that instance, or — if the user gave you (or a skill provides) credentials for it — log in with connect_instance.' };
             }
         }
         // Hard admin gate (see _rsCheckAdmin) — never POST as a non-admin.
@@ -3402,6 +3437,8 @@ async function _wfMaybeTrackGitHubPr(args, method, status, bodyText, auth, optio
             title: body.title || '',
             chatId: who.chatId || null
         };
+        if (body.created_at) prInfo.created_at = String(body.created_at);
+        if (body.updated_at) prInfo.pushed_at = String(body.updated_at);
         // Durable parent attribution for sub-agent pushers — same rationale
         // as wsPush: the sub's chat row is reaped after it settles, so the
         // sidebar needs the ROOT chat id to keep attributing the PR card.
@@ -3418,6 +3455,8 @@ async function _wfMaybeTrackGitHubPr(args, method, status, bodyText, auth, optio
             if (!prInfo.title && chosen.prs[idx].title) prInfo.title = chosen.prs[idx].title;
             if (!prInfo.root_chat_id && chosen.prs[idx].root_chat_id) prInfo.root_chat_id = chosen.prs[idx].root_chat_id;
             if (chosen.prs[idx].files) prInfo.files = chosen.prs[idx].files;
+            if (!prInfo.created_at && chosen.prs[idx].created_at) prInfo.created_at = chosen.prs[idx].created_at;
+            if (!prInfo.pushed_at && chosen.prs[idx].pushed_at) prInfo.pushed_at = chosen.prs[idx].pushed_at;
             chosen.prs[idx] = prInfo;
         } else {
             chosen.prs.push(prInfo);
@@ -3493,20 +3532,29 @@ function _wsRecentlyModified(when) {
 // bundle (prefix sort 097 < tools) and the SW bundle (WORKER_SHARED_FILES
 // order). Records carry root_chat_id directly; the parent walk is a fallback
 // for legacy records, capped at depth 5 (max nesting). Missing/GC'd registry
-// entries resolve to the id itself.
+// entries resolve to the id itself. The resulting root is then followed along
+// the "Continue in a new chat" lineage (core/070 resolveLineageHead, no hop
+// cap) so an old chat, its continuation and their subs all share ownership.
+function _wsLineageHead(id) {
+    if (!id) return id;
+    try {
+        return (typeof resolveLineageHead === 'function') ? (resolveLineageHead(id) || id) : id;
+    } catch (e) { return id; }
+}
+
 function _wsRootChatId(chatId) {
     if (!chatId) return chatId;
     try {
-        if (typeof SubAgents === 'undefined' || !SubAgents.getByChatId) return chatId;
+        if (typeof SubAgents === 'undefined' || !SubAgents.getByChatId) return _wsLineageHead(chatId);
         var cur = chatId;
         for (var i = 0; i < 5; i++) {
             var rec = SubAgents.getByChatId(cur);
             if (!rec) break;
-            if (rec.root_chat_id) return rec.root_chat_id;
+            if (rec.root_chat_id) return _wsLineageHead(rec.root_chat_id);
             if (!rec.parent_chat_id || rec.parent_chat_id === cur) break;
             cur = rec.parent_chat_id;
         }
-        return cur;
+        return _wsLineageHead(cur);
     } catch (e) { return chatId; }
 }
 
@@ -3639,7 +3687,11 @@ async function _wsCasWrite(repo, path, expected, newRow) {
     return { ok: true, legacy: true };
 }
 
-async function _wsTransferOwnership(fromChatId, toChatId, out) {
+// opts.includeForceTaken (lineage migration only — worker/130
+// _swContinueChatLineage): a continued chat IS the same conversation, so its
+// force-taken rows move to the head too (the force_taken_from marker is kept,
+// so status/push still warn about the original takeover).
+async function _wsTransferOwnership(fromChatId, toChatId, out, opts) {
     if (out && !Array.isArray(out.skipped_force_taken)) out.skipped_force_taken = [];
     if (!fromChatId) return 0;
     var target = toChatId || _wsRootChatId(fromChatId) || null;
@@ -3657,7 +3709,7 @@ async function _wsTransferOwnership(fromChatId, toChatId, out) {
             // Gone, or re-owned (parent edit / force take-over / discard) since
             // the enumeration → leave it alone.
             if (!fresh || fresh.last_modified_by_chat_id !== fromChatId) continue;
-            if (fresh.force_taken_from) { if (out) out.skipped_force_taken.push(fresh.path); continue; }
+            if (fresh.force_taken_from && !(opts && opts.includeForceTaken)) { if (out) out.skipped_force_taken.push(fresh.path); continue; }
             var _toExpected = Object.assign({}, fresh);
             fresh.last_modified_by_chat_id = target;
             fresh.last_modified_by_chat_title = title;
@@ -7218,10 +7270,9 @@ function _wsWorkflowScopeHint(res, treeEntries) {
 
 // +/- line counts stored on each meta.prs[].files[] entry at push time so the
 // sidebar PR view renders them immediately (ui/115 _wsfStoredCounts).
-// Self-contained (wsPush also runs in the service-worker bundle, which has no
-// ui/090 computeDiff) but yields the SAME counts as computeDiff: common
-// prefix/suffix trimmed, LCS length on the middle (<= 4M cells), else the
-// positional fallback - so counts never change when a diff is expanded.
+// Uses the shared core/152 lineDiffOps (in both the page and the service-worker
+// bundles, see WORKER_SHARED_FILES) on CRLF-normalized lines, exactly like
+// ui/090 computeDiff - so counts never change when a diff is expanded.
 // null (the view counts lazily) when either side exceeds
 // WS_PR_COUNT_MAX_CHARS (a .length cap: UTF-16 code units, not bytes).
 var WS_PR_COUNT_MAX_CHARS = 200000;
@@ -7231,27 +7282,9 @@ function _wsPrFileLineCounts(oldText, newText) {
     var a = oldText == null ? '' : String(oldText), b = newText == null ? '' : String(newText);
     if (a.length > WS_PR_COUNT_MAX_CHARS || b.length > WS_PR_COUNT_MAX_CHARS) return null;
     try {
-        var A = a.replace(/\r\n?/g, '\n').split('\n'), B = b.replace(/\r\n?/g, '\n').split('\n');
-        var m = A.length, n = B.length, pre = 0, suf = 0;
-        while (pre < m && pre < n && A[pre] === B[pre]) pre++;
-        while (suf < m - pre && suf < n - pre && A[m - 1 - suf] === B[n - 1 - suf]) suf++;
-        var X = A.slice(pre, m - suf), Y = B.slice(pre, n - suf), xm = X.length, yn = Y.length;
-        if (!xm || !yn) return { adds: yn, dels: xm };
-        if (xm * yn <= 4000000) {
-            var prev = new Array(yn + 1).fill(0), cur = new Array(yn + 1).fill(0);
-            for (var i = 1; i <= xm; i++) {
-                for (var j = 1; j <= yn; j++) cur[j] = X[i - 1] === Y[j - 1] ? prev[j - 1] + 1 : Math.max(prev[j], cur[j - 1]);
-                var tmp = prev; prev = cur; cur = tmp;
-            }
-            var L = prev[yn];
-            return { adds: yn - L, dels: xm - L };
-        }
-        var adds = 0, dels = 0, max = Math.max(xm, yn);
-        for (var k = 0; k < max; k++) {
-            if (k >= xm) adds++;
-            else if (k >= yn) dels++;
-            else if (X[k] !== Y[k]) { adds++; dels++; }
-        }
+        var ops = lineDiffOps(a.replace(/\r\n?/g, '\n').split('\n'), b.replace(/\r\n?/g, '\n').split('\n'));
+        var adds = 0, dels = 0;
+        for (var i = 0; i < ops.length; i++) { if (ops[i].type === 'add') adds++; else if (ops[i].type === 'remove') dels++; }
         return { adds: adds, dels: dels };
     } catch (e) { return null; }
 }
@@ -7785,6 +7818,14 @@ async function wsPush(wk, args, chatId, chatTitle) {
     var _prInfoTitle = (typeof args.pr_title === 'string' && args.pr_title !== '') ? args.pr_title
         : ((prReused && existingPr && existingPr.title) ? existingPr.title : '');
     var prInfo = { url: prUrl, number: prNumber, branch: args.branch_name, title: _prInfoTitle, chatId: chatId || null };
+    // Timestamps for the header PR list's age split (PRs idle > 7 days go
+    // under "View more", 040-tools-settings.js): pushed_at = this push;
+    // created_at = GitHub's PR creation time (reused / newly created PR),
+    // else now for a brand-new PR. The tracked-entry update keeps a prior one.
+    prInfo.pushed_at = new Date().toISOString();
+    var _prCreatedAt = existingPr ? existingPr.created_at
+        : ((typeof prRes !== 'undefined' && prRes && prRes.body && prRes.body.created_at) || prInfo.pushed_at);
+    if (_prCreatedAt) prInfo.created_at = String(_prCreatedAt);
     // Base branch of the PR, stored for the PR view header (head -> base).
     var _prInfoBase = (prReused && existingPr && existingPr.base && existingPr.base.ref) ? existingPr.base.ref : baseBranch;
     if (_prInfoBase) prInfo.base = String(_prInfoBase);
@@ -8005,6 +8046,7 @@ async function wsPush(wk, args, chatId, chatTitle) {
             // instead of wiping it (mirrors getPushedPRsForChat's message scan).
             if (!prInfo.title && meta.prs[_trackedIdx] && meta.prs[_trackedIdx].title) prInfo.title = meta.prs[_trackedIdx].title;
             if (!prInfo.body && meta.prs[_trackedIdx] && meta.prs[_trackedIdx].body) prInfo.body = meta.prs[_trackedIdx].body;
+            if (meta.prs[_trackedIdx] && meta.prs[_trackedIdx].created_at && meta.prs[_trackedIdx].number === prNumber) prInfo.created_at = meta.prs[_trackedIdx].created_at;
             // Likewise keep a previously stamped root_chat_id when THIS push
             // couldn't resolve one (e.g. the parent itself appends to a PR its
             // sub opened, or the sub's registry record is already GC'd). The

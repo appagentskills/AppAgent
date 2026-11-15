@@ -32,6 +32,7 @@
 //   Handles.awaitAll(chatId, handleIds, timeoutMs) -> Promise<snapshot[]>
 //   Handles.cancel(chatId, handleId, reason) -> { ok, status, error? }
 //   Handles.cancelAwaitersForChat(chatId) -> number of awaiters stopped
+//   Handles.rekey(fromChatId, toChatId) -> number of entries moved (chat lineage)
 // =============================================================
 
 var HANDLE_TTL_MS = 24 * 60 * 60 * 1000; // 24h after settle
@@ -563,8 +564,38 @@ function _markAwaitingApproval(chatId, handleId, awaiting) {
     e.awaitingApproval = !!awaiting;
 }
 
+// "Continue in a new chat" (chat lineage): move every handle entry — pending
+// AND settled — from chat `fromChatId`'s bucket into `toChatId`'s, so the
+// continuation can poll/await the workers the old chat spawned. Entries keep
+// their identity (same object, same handleId), so live promises, awaiters and
+// the sub-agent registry's _spawnDeferreds (keyed by handle id, not chat id)
+// keep settling the moved entry. An id already present in the target bucket
+// wins (never clobber a live entry). Returns the number of entries moved.
+function _rekeyHandles(fromChatId, toChatId) {
+    if (!fromChatId || !toChatId) return 0;
+    var from = _resolvedChatId(fromChatId);
+    var to = _resolvedChatId(toChatId);
+    if (from === to) return 0;
+    var src = _handles[from];
+    if (!src) return 0;
+    if (!_handles[to]) _handles[to] = Object.create(null);
+    var dst = _handles[to];
+    var n = 0;
+    for (var hid in src) {
+        var e = src[hid];
+        delete src[hid];
+        if (!e || dst[hid]) continue;
+        e.chatId = to;
+        dst[hid] = e;
+        n++;
+    }
+    delete _handles[from];
+    return n;
+}
+
 var Handles = {
     start: _startHandle,
+    rekey: _rekeyHandles,
     restore: _restoreHandle,
     get: _getEntry,
     list: _listEntries,

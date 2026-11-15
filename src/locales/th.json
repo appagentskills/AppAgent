@@ -60,6 +60,9 @@
   "No changes tracked yet": "ยังไม่มีการติดตามการเปลี่ยนแปลง",
   "Message input": "ช่องป้อนข้อความ",
   "Continue in a new chat": "ดำเนินการต่อในแชทใหม่",
+  "Continued: ": "ต่อ: ",
+  "Sub-agent chats can't be continued in a new chat": "ไม่สามารถดำเนินแชทของเอเจนต์ย่อยต่อในแชทใหม่ได้",
+  "This chat was already continued in a new chat": "แชทนี้ดำเนินต่อในแชทใหม่แล้ว",
   "Summarize and start new chat": "สรุปและเริ่มแชทใหม่",
   "Pause or resume": "หยุดชั่วคราวหรือทำต่อ",
   "Continue": "ดำเนินการต่อ",
@@ -275,6 +278,7 @@
   "Read Version": "อ่านเวอร์ชัน",
   "Delete Document": "ลบเอกสาร",
   "List Instances": "แสดงรายการอินสแตนซ์",
+  "Connect Instance": "เชื่อมต่ออินสแตนซ์",
   "Fetch URL": "ดึง URL",
   "Web Search": "ค้นหาเว็บ",
   "Build Extension": "บิลด์ส่วนขยาย",
@@ -1923,5 +1927,12 @@
   "No edited skills": "ไม่มีทักษะที่แก้ไขแล้ว",
   "Resize sidebar": "ปรับขนาดแถบด้านข้าง",
   "Resize split view": "ปรับขนาดมุมมองแบบแยก",
-  "Drag to resize · double-click to reset": "ลากเพื่อปรับขนาด · ดับเบิลคลิกเพื่อรีเซ็ต"
+  "Drag to resize · double-click to reset": "ลากเพื่อปรับขนาด · ดับเบิลคลิกเพื่อรีเซ็ต",
+  "Chat was continued": "แชทนี้ถูกดำเนินการต่อแล้ว",
+  "Continued from": "ต่อจาก",
+  "Continued in": "ดำเนินการต่อใน",
+  "Go to the new chat": "ไปที่แชทใหม่",
+  "Send here anyway": "ส่งที่นี่ต่อไป",
+  "This chat continues in \"{title}\". Workers, PRs and widgets now live there.": "แชทนี้ดำเนินการต่อใน \"{title}\" ตอนนี้เวิร์กเกอร์ PR และวิดเจ็ตอยู่ที่นั่นแล้ว",
+  "deleted chat": "แชทที่ถูกลบ"
 }

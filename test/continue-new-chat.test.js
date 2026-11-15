@@ -133,13 +133,35 @@ describe('continue in a new chat', function() {
             appStorage: { setItem: noop }, pushFocusChatToOffscreen: noop, saveChatsToStorage: noop,
             clearUpdateSet: noop, renderChatList: noop, renderMessages: noop, renderVersionSidebar: noop,
             updateChatTitleHeader: noop, renderWorkersStrip: noop, setChatPausedPersistent: noop,
-            pushPauseToggleToOffscreen: noop, syncPauseButtonUI: noop,
-            runAgent: function() { return Promise.resolve(); }
+            pushPauseToggleToOffscreen: noop, syncPauseButtonUI: noop
         };
-        var fn = new Function('env', 'with (env) {\n' + i18n + '\n' + cnHandoffSrc(src) + '\n' + cnCut(src, ['completeSummaryAndCreateNewChat']) + '\nreturn completeSummaryAndCreateNewChat;\n}')(env);
-        fn();
-        await Promise.resolve();
+        var order = [], migDone, stripCalls = 0, splitCalls = 0;
+        env.chats.OLD1.versionHistory = [{ id: 'v1', chatId: 'OLD1' }];
+        env.registerLineageLink = function(a, b, o) { order.push('link:' + a + '>' + b + (o && o.stamp ? ':stamp' : '')); env.chats[a].continuedTo = b; return true; };
+        env.registerLineageLinkOnSW = function(a, b) { order.push('swlink:' + a + '>' + b); return true; };
+        env._pushChatSkeletonToSW = function(id) { order.push('push:' + id); };
+        env.buildLineageHandoverBlock = function() { order.push('handover'); return Promise.resolve('<handover_state>\nX\n</handover_state>'); };
+        env.migrateChatLineageOnSW = function(a, b) { order.push('migrate:' + a + '>' + b); return new Promise(function(r) { migDone = r; }); };
+        env.renderWorkersStrip = function() { stripCalls++; };
+        env.renderSplitViewPane = function() { splitCalls++; };
+        env.runAgent = function(id) { order.push('run:' + id); return Promise.resolve(); };
+        var fn = new Function('env', 'with (env) {\n' + i18n + '\n' + cnHandoffSrc(src) + '\n' + cnCut(src, ['completeSummaryAndCreateNewChat', 'copyLineagePageState']) + '\nreturn completeSummaryAndCreateNewChat;\n}')(env);
+        var p = fn();
+        // Everything before the first await is synchronous: the SW learns the link first.
+        assert.deepStrictEqual(order.slice(0, 5), ['link:OLD1>NEW1:stamp', 'swlink:OLD1>NEW1', 'push:OLD1', 'push:NEW1', 'handover']);
+        for (var k = 0; k < 10 && !migDone; k++) await Promise.resolve();
+        assert.ok(migDone, 'migration requested');
+        assert.strictEqual(order[order.length - 1], 'migrate:OLD1>NEW1');
+        assert.strictEqual(order.indexOf('run:NEW1'), -1, 'runAgent waits for the migration');
+        migDone({ ok: true });
+        await p;
+        assert.ok(order.indexOf('run:NEW1') > order.indexOf('migrate:OLD1>NEW1'), 'runAgent(NEW1) after migration resolves');
+        assert.deepStrictEqual(env.versionHistory, [{ id: 'v1', chatId: 'NEW1' }], 'versionHistory is the copied one (not reset)');
+        assert.ok(stripCalls >= 1, 'Workers strip re-rendered');
+        assert.ok(splitCalls >= 1, 'split pane re-rendered');
         var nc = env.chats.NEW1;
+        assert.ok(nc.messages[0].content.indexOf('<handover_state>') > 0, 'handover appended to the seed');
+        assert.strictEqual(env.chats.OLD1.continuedTo, 'NEW1');
         assert.ok(nc, 'continued chat created');
         assert.strictEqual(nc.continuedFrom, 'OLD1');
         assert.strictEqual(nc.messages[0].isContinuationSeed, true);

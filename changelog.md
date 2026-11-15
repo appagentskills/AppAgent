@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.1.43
+
+### New
+- The agent can log in to a disconnected instance with credentials you provide (password never stored).
+- Faster background-tab screenshots.
+- Download button for every file the agent writes.
+- Sub-agent concurrency adapts to rate limits.
+- Older PRs move under "View more" in the Workspace pill.
+
+### Fixes
+- "Continue in a new chat" keeps workers, progress and history.
+- Impersonation works on any instance and stops reliably.
+
+---
+
 ## v1.1.42
 
 ### New

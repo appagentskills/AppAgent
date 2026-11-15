@@ -60,6 +60,9 @@
   "No changes tracked yet": "Henüz izlenen değişiklik yok",
   "Message input": "Mesaj girişi",
   "Continue in a new chat": "Yeni sohbette devam et",
+  "Continued: ": "Devam: ",
+  "Sub-agent chats can't be continued in a new chat": "Alt ajan sohbetlerine yeni bir sohbette devam edilemez",
+  "This chat was already continued in a new chat": "Bu sohbete zaten yeni bir sohbette devam edildi",
   "Summarize and start new chat": "Özetle ve yeni sohbet başlat",
   "Pause or resume": "Duraklat veya sürdür",
   "Continue": "Devam et",
@@ -275,6 +278,7 @@
   "Read Version": "Sürümü Oku",
   "Delete Document": "Belgeyi Sil",
   "List Instances": "Örnekleri Listele",
+  "Connect Instance": "Örneğe Bağlan",
   "Fetch URL": "URL Getir",
   "Web Search": "Web Araması",
   "Build Extension": "Uzantıyı Derle",
@@ -1923,5 +1927,12 @@
   "No edited skills": "Düzenlenmiş beceri yok",
   "Resize sidebar": "Kenar çubuğunu yeniden boyutlandır",
   "Resize split view": "Bölünmüş görünümü yeniden boyutlandır",
-  "Drag to resize · double-click to reset": "Yeniden boyutlandırmak için sürükleyin · sıfırlamak için çift tıklayın"
+  "Drag to resize · double-click to reset": "Yeniden boyutlandırmak için sürükleyin · sıfırlamak için çift tıklayın",
+  "Chat was continued": "Sohbet devam ettirildi",
+  "Continued from": "Devamı olduğu sohbet",
+  "Continued in": "Devam ettiği sohbet",
+  "Go to the new chat": "Yeni sohbete git",
+  "Send here anyway": "Yine de buraya gönder",
+  "This chat continues in \"{title}\". Workers, PRs and widgets now live there.": "Bu sohbet \"{title}\" içinde devam ediyor. Çalışanlar, PR'lar ve widget'lar artık orada.",
+  "deleted chat": "silinmiş sohbet"
 }

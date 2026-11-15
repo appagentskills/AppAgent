@@ -60,6 +60,9 @@
   "No changes tracked yet": "Ingen endringer registrert ennå",
   "Message input": "Meldingsfelt",
   "Continue in a new chat": "Fortsett i en ny chat",
+  "Continued: ": "Fortsatt: ",
+  "Sub-agent chats can't be continued in a new chat": "Underagent-chatter kan ikke fortsettes i en ny chat",
+  "This chat was already continued in a new chat": "Denne chatten er allerede fortsatt i en ny chat",
   "Summarize and start new chat": "Oppsummer og start ny chat",
   "Pause or resume": "Pause eller fortsett",
   "Continue": "Fortsett",
@@ -275,6 +278,7 @@
   "Read Version": "Les versjon",
   "Delete Document": "Slett dokument",
   "List Instances": "List opp instanser",
+  "Connect Instance": "Koble til instans",
   "Fetch URL": "Hent URL",
   "Web Search": "Nettsøk",
   "Build Extension": "Bygg utvidelse",
@@ -1923,5 +1927,12 @@
   "No edited skills": "Ingen redigerte ferdigheter",
   "Resize sidebar": "Endre størrelse på sidefeltet",
   "Resize split view": "Endre størrelse på delt visning",
-  "Drag to resize · double-click to reset": "Dra for å endre størrelse · dobbeltklikk for å tilbakestille"
+  "Drag to resize · double-click to reset": "Dra for å endre størrelse · dobbeltklikk for å tilbakestille",
+  "Chat was continued": "Chatten ble videreført",
+  "Continued from": "Fortsatt fra",
+  "Continued in": "Fortsatt i",
+  "Go to the new chat": "Gå til den nye chatten",
+  "Send here anyway": "Send her likevel",
+  "This chat continues in \"{title}\". Workers, PRs and widgets now live there.": "Denne chatten fortsetter i «{title}». Workers, PR-er og widgets ligger nå der.",
+  "deleted chat": "slettet chat"
 }

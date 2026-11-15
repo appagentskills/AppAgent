@@ -32,7 +32,7 @@ Core principles:
 
 3. **Sync to latest**: `workspace` `status` on the existing main workspace — it auto-syncs with the remote so reviewers judge latest code. ⚠️ Don't `workspace clone`: clone deletes the workspace files **and** its meta (including the `meta.prs` history step 2 relies on) and wipes other chats' uncommitted edits.
 
-4. **Spawn reviewers** (`spawn_sub_agent` with explicit `tier: "medium"`; pool limits are per connection group — 2 concurrent for Anthropic-OAuth subs, 4 per other endpoint, 6 overall; excess spawns queue, so serialize fan-outs beyond your group's cap):
+4. **Spawn reviewers** (`spawn_sub_agent` with explicit `tier: "medium"`; pool limits are per connection group and adaptive (see agent_status `pool.group_limits`), 6 overall; excess spawns queue, so serialize fan-outs beyond your group's current limit):
    - One sub-agent per PR (batch several small PRs into one agent if > 4 PRs in scope).
    - Instructions per agent: fetch `GET /pulls/{n}/files` + PR body; inspect the **current** state of every touched function via workspace read/grep; hunt for undefined symbols, broken references (CSS classes/IDs never defined, renamed functions with stale callers), listener leaks, inverted conditions, missed call sites, races, null derefs; do a déroulement of the changed feature; **no edits**; report via `report_to_parent`.
    - Pass an `output_schema` like: `{pr, findings: [{id, severity (critical|major|minor), file, symbol, problem, evidence, suggested_fix}], verified_ok: []}`.

@@ -469,6 +469,17 @@ function processUserMessageForCache(chatId, content) {
 // executeCachedContent* tools below, which run in BOTH realms (this file
 // is in WORKER_SHARED_FILES): the SW serves the agent loop's tool calls,
 // the page serves widget-tier executeTool calls.
+// Lineage union-on-read: a continued chat's head keeps only the newest
+// cachedToolResults (ui/170 copyLineagePageState cap), so a `cache_…` id
+// cited from an older chat in the chain is served from the predecessor
+// that still holds it (core/070 findLineageChatWithEntry).
+function _cachedResultsOwnerChatId(chatId, contentId) {
+    try {
+        if (typeof findLineageChatWithEntry === 'function') return findLineageChatWithEntry(chatId, 'cachedToolResults', contentId) || chatId;
+    } catch (e) {}
+    return chatId;
+}
+
 async function ensureCachedContent(chatId, contentId) {
     try {
         var chat = (typeof chats !== 'undefined' && chats) ? chats[chatId] : null;
@@ -496,6 +507,7 @@ async function executeCachedContentOutline(chatId, args) {
     var arrayOffset = args.array_offset || 0;
     var arrayLimit = args.array_limit || null;
 
+    chatId = _cachedResultsOwnerChatId(chatId, contentId);
     await ensureCachedContent(chatId, contentId);
     var chat = chats[chatId];
     if (!chat || !chat.cachedToolResults || !chat.cachedToolResults[contentId]) {
@@ -678,6 +690,7 @@ async function executeCachedContentOutline(chatId, args) {
 
 // Execute cached_content_search tool
 async function executeCachedContentSearch(chatId, args) {
+    chatId = _cachedResultsOwnerChatId(chatId, args.content_id);
     await ensureCachedContent(chatId, args.content_id);
     var contentId = args.content_id;
     var query = args.query;
@@ -846,6 +859,7 @@ async function executeCachedContentSearch(chatId, args) {
 
 // Execute cached_content_read tool
 async function executeCachedContentRead(chatId, args) {
+    chatId = _cachedResultsOwnerChatId(chatId, args.content_id);
     await ensureCachedContent(chatId, args.content_id);
     var contentId = args.content_id;
     var path = args.path;

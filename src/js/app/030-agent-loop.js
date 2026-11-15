@@ -400,6 +400,141 @@ function isMutationDispatched(chat, toolCallId) {
     return true;
 }
 
+// --- Secret tool-argument redaction (connect_instance password) ---
+// connect_instance's password/passwd/secret arguments are NEVER persisted in
+// the chat, broadcast in events or logged: at finalize the assistant turn's
+// tool_call arguments are rewritten with "[redacted]" and the real string is
+// kept ONLY in this in-memory map until the call is parsed for execution. A
+// replay after a SW restart sees "[redacted]" and the tool asks for it again.
+// SCOPE: only connect_instance is redacted — other tools (e.g. servicenow_api
+// writing a credential record) must keep their literal args, otherwise a
+// replay would execute them with the placeholder. _redactedSecretArgError is
+// the fail-closed backstop for any non-connect_instance call that still
+// carries the placeholder (e.g. persisted by an older build).
+var _secretToolArgs = {};   // tool_call id -> raw arguments string (memory only)
+var SECRET_ARG_KEY_RE = /^(password|passwd|secret)$/i;
+var SECRET_REDACT_TOOLS = { connect_instance: true };
+function _isSecretRedactedTool(tc) {
+    return !!(tc && tc.function && SECRET_REDACT_TOOLS[tc.function.name] === true);
+}
+// Error string when parsed args carry the "[redacted]" placeholder as a
+// password/passwd/secret value (any depth <= 6), else null.
+function _redactedSecretArgError(toolName, args) {
+    function scan(v, d) {
+        if (!v || typeof v !== 'object' || d > 6) return null;
+        var keys = Object.keys(v);
+        for (var i = 0; i < keys.length; i++) {
+            var k = keys[i];
+            if (SECRET_ARG_KEY_RE.test(k) && v[k] === '[redacted]') return k;
+            var hit = scan(v[k], d + 1);
+            if (hit) return hit;
+        }
+        return null;
+    }
+    var key = scan(args, 0);
+    if (!key) return null;
+    return 'Refused to run ' + toolName + ': argument "' + key + '" holds the "[redacted]" placeholder, not a real value (secrets are never stored in the transcript). Ask the user for the value again and re-issue the call.';
+}
+// Mask every occurrence of the given secret values inside the assistant
+// turn's free text (content, thinking, reasoning_details) — in place.
+function _maskSecretValuesInTurn(msg, values) {
+    if (!msg || !Array.isArray(values)) return 0;
+    var vals = values.filter(function(v) { return typeof v === 'string' && v.length >= 1; });
+    if (!vals.length) return 0;
+    var n = 0;
+    function maskStr(s) {
+        if (typeof s !== 'string') return s;
+        var out = s;
+        vals.forEach(function(v) {
+            if (out.indexOf(v) !== -1) { out = out.split(v).join('[redacted]'); }
+            var ev = JSON.stringify(v).slice(1, -1);   // JSON-escaped form
+            if (ev !== v && out.indexOf(ev) !== -1) { out = out.split(ev).join('[redacted]'); }
+        });
+        if (out !== s) n++;
+        return out;
+    }
+    function walk(o, d) {
+        if (!o || typeof o !== 'object' || d > 8) return;
+        Object.keys(o).forEach(function(k) {
+            if (k === 'signature' || k === 'data') return;   // opaque/encrypted blobs
+            if (typeof o[k] === 'string') o[k] = maskStr(o[k]);
+            else walk(o[k], d + 1);
+        });
+    }
+    msg.content = maskStr(msg.content);
+    msg.thinking = maskStr(msg.thinking);
+    if (msg.reasoning_details) walk(msg.reasoning_details, 0);
+    return n;
+}
+// Exact secret values carried by a raw connect_instance arguments string.
+function _secretValuesFromRaw(raw) {
+    var out = [];
+    try {
+        var o = JSON.parse(raw);
+        if (o && typeof o === 'object') Object.keys(o).forEach(function(k) {
+            if (SECRET_ARG_KEY_RE.test(k) && typeof o[k] === 'string' && o[k] && o[k] !== '[redacted]') out.push(o[k]);
+        });
+    } catch (e) { /* unparseable: nothing exact to mask */ }
+    return out;
+}
+function _maskSecretArgString(s) {
+    if (typeof s !== 'string' || !/pass|secret/i.test(s)) return s;
+    // Also masks a partial (still-streaming, unterminated) value.
+    return s.replace(/("(?:password|passwd|secret)"\s*:\s*)"(?:[^"\\]|\\.)*(?:"|\\?$)/gi, '$1"[redacted]"');
+}
+function _redactSecretArgsObject(args) {
+    if (!args || typeof args !== 'object' || Array.isArray(args)) return args;
+    var out = null;
+    Object.keys(args).forEach(function(k) {
+        if (SECRET_ARG_KEY_RE.test(k) && args[k] !== '' && args[k] != null) {
+            if (!out) out = Object.assign({}, args);
+            out[k] = '[redacted]';
+        }
+    });
+    return out || args;
+}
+// In-place: rewrite tool_calls' arguments, stash the raw strings by id.
+// When assistantMsg is given, the exact secret values are also masked inside
+// that turn's content / thinking / reasoning_details.
+function _redactSecretToolCalls(toolCalls, assistantMsg) {
+    if (!Array.isArray(toolCalls)) return 0;
+    var n = 0;
+    var secrets = [];
+    toolCalls.forEach(function(tc) {
+        if (!_isSecretRedactedTool(tc) || typeof tc.function.arguments !== 'string') return;
+        var raw = tc.function.arguments;
+        var masked = _maskSecretArgString(raw);
+        if (masked === raw) return;
+        if (tc.id) _secretToolArgs[tc.id] = raw;
+        secrets = secrets.concat(_secretValuesFromRaw(raw));
+        tc.function.arguments = masked;
+        n++;
+    });
+    if (assistantMsg && secrets.length) _maskSecretValuesInTurn(assistantMsg, secrets);
+    return n;
+}
+// Streaming view: copies of secret-bearing calls with masked arguments, so the
+// live (persistable) assistantMsg never holds the raw password mid-stream.
+function _maskStreamingToolCalls(toolCalls) {
+    if (!Array.isArray(toolCalls)) return toolCalls;
+    var changed = false;
+    var out = toolCalls.map(function(tc) {
+        if (!_isSecretRedactedTool(tc) || typeof tc.function.arguments !== 'string') return tc;
+        var masked = _maskSecretArgString(tc.function.arguments);
+        if (masked === tc.function.arguments) return tc;
+        changed = true;
+        return Object.assign({}, tc, { function: Object.assign({}, tc.function, { arguments: masked }) });
+    });
+    return changed ? out : toolCalls;
+}
+// Take (and forget) the raw arguments for execution.
+function _takeSecretToolArgs(tc) {
+    if (!tc || !tc.id || !Object.prototype.hasOwnProperty.call(_secretToolArgs, tc.id)) return null;
+    var raw = _secretToolArgs[tc.id];
+    delete _secretToolArgs[tc.id];
+    return raw;
+}
+
 // Called immediately before a mutating REST request is issued. Marks the
 // placeholder and waits for the mark to commit so a crash after this point is
 // correctly classified as indeterminate on replay. Reads are not marked.
@@ -916,10 +1051,15 @@ var NORMALIZE_ARGS_STRING_ONLY = { content: 1, code: 1, html: 1, script: 1, body
 // (end-of-input / unterminated string / parser position at the very end) and
 // tell the model WHAT happened and HOW to recover (split the content). Any other
 // parse error keeps the parser's own message unchanged.
-function _toolArgsParseErrorMessage(rawArgs, parseErr) {
+function _toolArgsParseErrorMessage(rawArgs, parseErr, toolName) {
     var em = String((parseErr && parseErr.message) || parseErr || '');
-    var base = 'Invalid tool arguments: ' + em;
     var raw = typeof rawArgs === 'string' ? rawArgs : '';
+    // Secret-bearing tools: the parser message can quote a slice of the input
+    // (V8: `... "<snippet>" is not valid JSON`) — report the length only.
+    if (toolName && SECRET_REDACT_TOOLS[toolName] === true) {
+        return 'Invalid tool arguments (' + raw.length + ' chars; content withheld because it may contain a password). Re-issue the call with valid JSON arguments.';
+    }
+    var base = 'Invalid tool arguments: ' + em;
     if (!raw || !(parseErr instanceof SyntaxError)) return base;
     var truncated = /unexpected end of (json )?input|unterminated string|end of data/i.test(em);
     if (!truncated) {
@@ -1300,16 +1440,26 @@ async function runAgent(overrideChatId) {
             }
             var args;
             try {
-                args = JSON.parse((tc && tc.function && tc.function.arguments) || '{}');
+                // Raw (unredacted) args if still held in memory from this session.
+                var _pendRawSecret = _takeSecretToolArgs(tc);
+                args = JSON.parse(_pendRawSecret || (tc && tc.function && tc.function.arguments) || '{}');
+                _pendRawSecret = null;
                 args = normalizeToolArgs(args);
                 if (!args || typeof args !== 'object' || Array.isArray(args)) {
                     throw new Error('arguments must be a JSON object');
                 }
             } catch (parseErr) {
-                console.error('Failed to parse tool arguments:', tc && tc.function ? tc.function.arguments : undefined, parseErr);
-                recordToolResult(chat, tc && tc.id, toolName, JSON.stringify({ success: false, error: _toolArgsParseErrorMessage(tc && tc.function && tc.function.arguments, parseErr) }));
+                if (SECRET_REDACT_TOOLS[toolName] === true) console.error('Failed to parse ' + toolName + ' arguments (' + String((tc && tc.function && tc.function.arguments) || '').length + ' chars, content withheld)');
+                else console.error('Failed to parse tool arguments:', tc && tc.function ? tc.function.arguments : undefined, parseErr);
+                recordToolResult(chat, tc && tc.id, toolName, JSON.stringify({ success: false, error: _toolArgsParseErrorMessage(tc && tc.function && tc.function.arguments, parseErr, toolName) }));
                 saveChatsToStorage();
                 AgentEvents.emit('toolCallResult', { chatId: streamingChatId, toolCallId: tc.id, name: toolName, error: parseErr });
+                continue;
+            }
+            var _pendRedactedErr = SECRET_REDACT_TOOLS[toolName] === true ? null : _redactedSecretArgError(toolName, args);
+            if (_pendRedactedErr) {
+                await recordDurableToolResult(chat, tc.id, toolName, JSON.stringify({ success: false, error: _pendRedactedErr }));
+                AgentEvents.emit('toolCallResult', { chatId: streamingChatId, toolCallId: tc.id, name: toolName, result: { success: false } });
                 continue;
             }
 
@@ -1330,7 +1480,7 @@ async function runAgent(overrideChatId) {
             }
 
             var displayName = getToolDisplayName(toolName, args.method || args.action);
-            AgentEvents.emit('toolCallStarted', { chatId: streamingChatId, toolCallId: tc.id, name: toolName, displayName: displayName, input: args });
+            AgentEvents.emit('toolCallStarted', { chatId: streamingChatId, toolCallId: tc.id, name: toolName, displayName: displayName, input: SECRET_REDACT_TOOLS[toolName] === true ? _redactSecretArgsObject(args) : args });
             await markMutationDispatched(chat, tc.id, toolName, args);
             // Tool throws are now converted into failed results by _toolThrowToResult
             // (executeToolWithInterrupt); this catch arm is a SAFETY NET for
@@ -1680,14 +1830,16 @@ async function runAgent(overrideChatId) {
                     AgentEvents.emit('streamDelta', { chatId: streamingChatId, turn: lastUserMsgIndex, msgIndex: msgIndex, message: assistantMsg, kind: 'text', delta: content });
                 },
                 function(toolCalls) {
-                    assistantMsg.tool_calls = toolCalls;
-                    AgentEvents.emit('streamDelta', { chatId: streamingChatId, turn: lastUserMsgIndex, msgIndex: msgIndex, message: assistantMsg, kind: 'tool_input', delta: toolCalls });
+                    var _maskedTcs = _maskStreamingToolCalls(toolCalls);
+                    assistantMsg.tool_calls = _maskedTcs;
+                    AgentEvents.emit('streamDelta', { chatId: streamingChatId, turn: lastUserMsgIndex, msgIndex: msgIndex, message: assistantMsg, kind: 'tool_input', delta: _maskedTcs });
                 },
                 function(final) {
                     assistantMsg.thinking = final.thinking || '';
                     assistantMsg.content = final.content || '';
                     assistantMsg.tool_calls = final.tool_calls;
                     assistantMsg.reasoning_details = final.reasoning_details; // Preserve for OpenRouter API continuity
+                    _redactSecretToolCalls(assistantMsg.tool_calls, assistantMsg);   // before anything can persist it (also masks the value in thinking/reasoning)
                     // Anthropic content-block order (Opus 5.5 / Fable 5.1+ thinking
                     // binding) — replayed by transformMessageToAnthropic. Absent for
                     // non-Claude-OAuth streams; never leave a stale value behind.
@@ -1915,6 +2067,9 @@ async function runAgent(overrideChatId) {
         // per-tool save inside the execution loop can't strand an orphan because
         // the placeholder satisfies the invariant; the actual tool result just
         // overwrites the placeholder content in-place when it completes.
+        // Redact password-like tool args BEFORE the first save/emit of this
+        // turn; the raw string stays only in memory for execution below.
+        _redactSecretToolCalls(assistantMsg.tool_calls, assistantMsg);
         seedPlaceholderToolResults(chat, assistantMsg.tool_calls);
 
         // #9: tag empty turns BEFORE the save/emit so the persisted row and the
@@ -1987,20 +2142,30 @@ async function runAgent(overrideChatId) {
             var tc = assistantMsg.tool_calls[i];
             var toolName = tc.function.name;
             var args;
+            var _rawSecretArgs = _takeSecretToolArgs(tc);
             try {
-                args = JSON.parse(tc.function.arguments || '{}');
+                args = JSON.parse(_rawSecretArgs || tc.function.arguments || '{}');
                 args = normalizeToolArgs(args);
             } catch (parseErr) {
-                console.error('Failed to parse tool arguments:', tc.function.arguments, parseErr);
+                // tc.function.arguments is the redacted form — never log the raw one.
+                if (SECRET_REDACT_TOOLS[toolName] === true) console.error('Failed to parse ' + toolName + ' arguments (' + String(tc.function.arguments || '').length + ' chars, content withheld)');
+                else console.error('Failed to parse tool arguments:', tc.function.arguments, parseErr);
                 _answerCardOnlyTurn = false; // let the model see the parse error
-                recordToolResult(chat, tc.id, toolName, JSON.stringify({ success: false, error: _toolArgsParseErrorMessage(tc.function.arguments, parseErr) }));
+                recordToolResult(chat, tc.id, toolName, JSON.stringify({ success: false, error: _toolArgsParseErrorMessage(tc.function.arguments, parseErr, toolName) }));
                 saveChatsToStorage();
                 AgentEvents.emit('toolCallResult', { chatId: streamingChatId, toolCallId: tc.id, name: toolName, error: parseErr });
                 continue;
             }
+            var _redactedArgErr = SECRET_REDACT_TOOLS[toolName] === true ? null : _redactedSecretArgError(toolName, args);
+            if (_redactedArgErr) {
+                _answerCardOnlyTurn = false; // let the model see the refusal
+                await recordDurableToolResult(chat, tc.id, toolName, JSON.stringify({ success: false, error: _redactedArgErr }));
+                AgentEvents.emit('toolCallResult', { chatId: streamingChatId, toolCallId: tc.id, name: toolName, result: { success: false } });
+                continue;
+            }
 
             var displayName = getToolDisplayName(toolName, args.method || args.action);
-            AgentEvents.emit('toolCallStarted', { chatId: streamingChatId, toolCallId: tc.id, name: toolName, displayName: displayName, input: args });
+            AgentEvents.emit('toolCallStarted', { chatId: streamingChatId, toolCallId: tc.id, name: toolName, displayName: displayName, input: SECRET_REDACT_TOOLS[toolName] === true ? _redactSecretArgsObject(args) : args });
             await markMutationDispatched(chat, tc.id, toolName, args);
             // Every tool_use already has a placeholder tool_result (seeded by
             // `seedPlaceholderToolResults` when the assistant turn was finalized).
@@ -2241,6 +2406,19 @@ async function runAgent(overrideChatId) {
     var _hookDeferredPending = _hookRunDeferred && !!(pendingInjectionsByChatId[streamingChatId]
         && (pendingInjectionsByChatId[streamingChatId].text
             || (pendingInjectionsByChatId[streamingChatId].images && pendingInjectionsByChatId[streamingChatId].images.length)));
+    // Lineage: a continued chat's leftover injection belongs to the head
+    // (the SW migration skipped it while this run was live). Forward it and
+    // start the head if it is idle; the follow-up drain below then finds
+    // nothing for this (old) chat.
+    if (chat && chat.continuedTo && typeof forwardLineageInjection === 'function') {
+        try {
+            var _fwdHead = forwardLineageInjection(streamingChatId);
+            if (_fwdHead && chats[_fwdHead] && !runningChatIds[_fwdHead] && !isChatPaused(_fwdHead) && typeof runAgent === 'function') {
+                Promise.resolve().then(function() { return runAgent(_fwdHead); })
+                    .catch(function(err) { console.warn('[agent-loop] lineage head run for forwarded injection failed', _fwdHead, err); });
+            }
+        } catch (eFwd) { console.warn('[agent-loop] lineage injection forward failed', eFwd); }
+    }
     if (!isChatPaused(streamingChatId)) {
         pendingInjection = null;
         pendingInjectionImages = null;

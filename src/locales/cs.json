@@ -60,6 +60,9 @@
   "No changes tracked yet": "Zatím nejsou sledovány žádné změny",
   "Message input": "Vstup zprávy",
   "Continue in a new chat": "Pokračovat v novém chatu",
+  "Continued: ": "Pokračování: ",
+  "Sub-agent chats can't be continued in a new chat": "Chaty dílčích agentů nelze pokračovat v novém chatu",
+  "This chat was already continued in a new chat": "Tento chat již pokračuje v novém chatu",
   "Summarize and start new chat": "Shrnout a začít nový chat",
   "Pause or resume": "Pozastavit nebo pokračovat",
   "Continue": "Pokračovat",
@@ -275,6 +278,7 @@
   "Read Version": "Čtení verze",
   "Delete Document": "Odstranění dokumentu",
   "List Instances": "Výpis instancí",
+  "Connect Instance": "Připojit instanci",
   "Fetch URL": "Načtení URL",
   "Web Search": "Hledání na webu",
   "Build Extension": "Sestavení rozšíření",
@@ -1923,5 +1927,12 @@
   "No edited skills": "Žádné upravené dovednosti",
   "Resize sidebar": "Změnit velikost postranního panelu",
   "Resize split view": "Změnit velikost rozděleného zobrazení",
-  "Drag to resize · double-click to reset": "Přetažením změníte velikost · dvojklikem obnovíte"
+  "Drag to resize · double-click to reset": "Přetažením změníte velikost · dvojklikem obnovíte",
+  "Chat was continued": "Chat byl přenesen",
+  "Continued from": "Pokračování z",
+  "Continued in": "Pokračuje v",
+  "Go to the new chat": "Přejít do nového chatu",
+  "Send here anyway": "Přesto odeslat sem",
+  "This chat continues in \"{title}\". Workers, PRs and widgets now live there.": "Tento chat pokračuje v „{title}“. Pracovníci, PR a widgety jsou nyní tam.",
+  "deleted chat": "smazaný chat"
 }

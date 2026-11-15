@@ -281,6 +281,8 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
     if (!isHuggingFace) _stampCacheHeartbeat(chatId, requestBody, currentProvider);
 
     var reader;
+    // Adaptive pool: set when this call already reported a non-ok outcome.
+    var _poolReported = false;
 
     // Claude OAuth: route through the SW's runClaudeOAuthStream proxy.
     // Two code paths:
@@ -296,6 +298,14 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
                 var resolveRead = null;
                 var streamDone = false;
                 function onEnvelope(env) {
+                    if (env && (env.type === 'error' || env.type === 'status')) {
+                        var _po = _poolClassifyEnvelope(env);
+                        if (_po) {
+                            if (env.type === 'error') _poolReported = true;
+                            var _pr = _poolReport(chatId, _po);
+                            if (env.type === 'error' && _po.kind === 'quota_exhausted' && _pr) env.error = String(env.error || '') + _poolPauseSuffix(_pr);
+                        }
+                    }
                     if (env.type === 'error') {
                         // Preserve transport classification through the synthetic SSE
                         // bridge. The parser below rehydrates these fields onto Error,
@@ -423,9 +433,14 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
             if (hfRoutedProvider) reqMetrics.routedProvider = hfRoutedProvider;
         }
 
+        var _poolHttp = null;
         if (!res.ok) {
             setLLMConnectionStatus('disconnected');
             var errorText = await res.text();
+            _poolHttp = _poolClassifyHttpOutcome(res.status, res.headers, errorText);
+            var _poolPr = _poolHttp ? _poolReport(chatId, _poolHttp) : null;
+            _poolReported = true;
+            var _poolSuffix = (_poolHttp && _poolHttp.kind === 'quota_exhausted' && _poolPr) ? _poolPauseSuffix(_poolPr) : '';
             var requestBodyStr = JSON.stringify(requestBody);
             console.error('API Error Response:', errorText);
             console.error('Request size:', Math.round(requestBodyStr.length / 1024) + 'KB, messages:', requestBody.messages.length);
@@ -451,6 +466,7 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
                 if (typeof errorData.message === 'string' && errorData.message && !errorData.error) throw new Error(errorData.message);
                 throw new Error(errorData.error?.message || 'API request failed');
             } catch (e) {
+                if (_poolSuffix && e && e.message && !e.message.includes('JSON')) e.message += _poolSuffix;
                 // F5-1: attach the HTTP status to whatever error propagates so
                 // the agent-loop throttle classifier can detect a 429/502/503/529
                 // even when the proxy body is an HTML page whose markup the
@@ -458,12 +474,15 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
                 if (e.message && !e.message.includes('JSON')) { e._httpStatus = res.status; throw e; }
                 // Cap the raw body — full text is already console.error'd above;
                 // a multi-KB provider payload must not flood downstream UIs.
-                var _apiErr = new Error('API request failed: ' + String(errorText).slice(0, 300));
+                var _apiErr = new Error('API request failed: ' + String(errorText).slice(0, 300) + _poolSuffix);
                 _apiErr._httpStatus = res.status;
                 throw _apiErr;
             }
         }
 
+        // 2xx: remaining-quota headers may already signal a rate limit.
+        _poolHttp = _poolClassifyHttpOutcome(res.status, res.headers, '');
+        if (_poolHttp && _poolHttp.kind !== 'ok') { _poolReport(chatId, _poolHttp); _poolReported = true; }
         reader = res.body.getReader();
     }
     // Badge fix: a 200 response is NOT proof the OAuth session is valid for the
@@ -864,6 +883,8 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
         if (blockOrder) blockOrder.push({ t: 'x', s: preRefusalLen, e: content.length });
     }
 
+    // Adaptive pool: a completed call is a success-streak signal.
+    if (!_poolReported) _poolReport(chatId, { kind: 'ok' });
     // IMPORTANT: Only pass back reasoning_details that came from the API
     // Do NOT construct it ourselves - that can cause issues with subsequent calls
     onDone({
@@ -873,6 +894,145 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
         reasoning_details: reasoningDetails.length > 0 ? reasoningDetails : null,
         block_order: (blockOrder && blockOrder.length > 0) ? blockOrder : null
     });
+}
+
+// ─── Adaptive sub-agent pool signals (core/097 poolReportLLMOutcome) ───
+// Classify an LLM response into ok | rate_limited | quota_exhausted |
+// overloaded. Quota exhaustion (spend cap, unified 5h/7d window, ChatGPT
+// usage limit, OpenRouter insufficient credits) is NOT a concurrency signal:
+// the registry pauses the group instead of shrinking it. Headers may be a
+// fetch Headers object or a plain map; every header is optional.
+function _poolHdr(headers, name) {
+    if (!headers) return null;
+    try {
+        if (typeof headers.get === 'function') return headers.get(name);
+        return headers[name] != null ? headers[name] : null;
+    } catch (e) { return null; }
+}
+
+// Reset/retry value → absolute epoch ms. Accepts epoch s/ms, RFC3339/HTTP
+// date, delta seconds, or OpenAI-style durations ("6m0s", "250ms").
+function _poolParseResetMs(v, now) {
+    if (v == null || v === '') return null;
+    now = now || Date.now();
+    var s = String(v).trim();
+    if (/^\d+(\.\d+)?$/.test(s)) {
+        var n = parseFloat(s);
+        if (n > 1e12) return Math.round(n);
+        if (n > 1e9) return Math.round(n * 1000);
+        return now + Math.round(n * 1000);
+    }
+    var dm = /^(?:(\d+)h)?(?:(\d+)m(?!s))?(?:(\d+(?:\.\d+)?)s)?(?:(\d+)ms)?$/.exec(s);
+    if (dm && (dm[1] || dm[2] || dm[3] || dm[4])) {
+        return now + ((+dm[1] || 0) * 3600 + (+dm[2] || 0) * 60 + (+dm[3] || 0)) * 1000 + (+dm[4] || 0);
+    }
+    var t = Date.parse(s);
+    return isNaN(t) ? null : t;
+}
+
+function _poolClassifyHttpOutcome(status, headers, bodyText) {
+    var now = Date.now();
+    var ra = _poolParseResetMs(_poolHdr(headers, 'retry-after'), now);
+    var retryAfterMs = ra ? Math.max(0, ra - now) : 0;
+    var body = String(bodyText || '');
+    var j = null;
+    try { j = body ? JSON.parse(body) : null; } catch (e) {}
+    var err = (j && j.error && typeof j.error === 'object') ? j.error : {};
+    var code = (err.details && err.details.error_code) || err.code || (j && j.type) || '';
+    // Every code-ish field: a credits/quota code anywhere wins over "429".
+    var codes = [err.details && err.details.error_code, err.code, err.type, err.status, j && j.code, j && j.type]
+        .filter(function(c) { return typeof c === 'string'; }).join(' ');
+    var quotaCode = /\b(enforced_spend_limit_reached|usage_limit_reached|insufficient_quota|billing_hard_limit_reached|billing_not_active|quota_exceeded|insufficient_credits)\b/.test(codes);
+    // Credit/quota wording. Checked BEFORE the rate-limit fallback and
+    // REGARDLESS of retry-after: a credits-ran-out 429 must never shrink the
+    // concurrency limit (worst case a real rate limit only pauses the group).
+    var quotaText = /usage[ _-]?limit|insufficient[ _-]?quota|exceeded your current quota|spend[ _-]?limit|credit|billing/i.test(body);
+    // Claude OAuth unified window status (5h / 7d / overall).
+    var unified = null, uReset = null;
+    ['', '5h-', '7d-'].forEach(function(w) {
+        var st = _poolHdr(headers, 'anthropic-ratelimit-unified-' + w + 'status');
+        if (st === 'rate_limited' && !unified) { unified = 'rate_limited'; uReset = _poolParseResetMs(_poolHdr(headers, 'anthropic-ratelimit-unified-' + w + 'reset'), now); }
+        else if (st === 'warning' && !unified) unified = 'warning';
+    });
+    if (status >= 200 && status < 300) {
+        var rem = ['anthropic-ratelimit-requests-remaining', 'anthropic-ratelimit-tokens-remaining', 'x-ratelimit-remaining-requests', 'x-ratelimit-remaining-tokens'];
+        for (var i = 0; i < rem.length; i++) {
+            var rv = _poolHdr(headers, rem[i]);
+            if (rv != null && rv !== '' && parseFloat(rv) <= 0) {
+                var rk = rem[i].replace('-remaining', '-reset').replace('remaining-', 'reset-');
+                return { kind: 'rate_limited', resetAt: _poolParseResetMs(_poolHdr(headers, rk), now), detail: rem[i] + '=0' };
+            }
+        }
+        if (unified === 'rate_limited') return { kind: 'quota_exhausted', resetAt: uReset, detail: 'Claude usage window exhausted' };
+        return { kind: 'ok', detail: unified === 'warning' ? 'unified usage warning' : undefined };
+    }
+    // Anthropic API key with no balance answers 400 "credit balance is too low".
+    if (status === 400 && (quotaCode || /credit balance is too low/i.test(body))) return { kind: 'quota_exhausted', resetAt: null, detail: 'credit balance too low' };
+    if (status === 402) {
+        if (/in_flight_budget/.test(body)) return { kind: 'rate_limited', retryAfterMs: retryAfterMs, detail: 'openrouter in-flight budget' };
+        return { kind: 'quota_exhausted', resetAt: null, detail: 'insufficient credits (HTTP 402)' };
+    }
+    if (status === 429) {
+        if (code === 'enforced_spend_limit_reached') return { kind: 'quota_exhausted', resetAt: null, detail: 'Anthropic spend limit reached' };
+        if (unified === 'rate_limited') return { kind: 'quota_exhausted', resetAt: uReset, detail: 'Claude usage window exhausted' };
+        if (quotaCode || quotaText) {
+            var rs = (j && (j.resets_at || (j.error && j.error.resets_at))) || null;
+            var qReset = rs ? _poolParseResetMs(rs, now) : (retryAfterMs ? now + retryAfterMs : null);
+            return { kind: 'quota_exhausted', resetAt: qReset, detail: code === 'usage_limit_reached' || /usage[ _-]?limit/i.test(body) ? 'usage limit reached' : 'quota / credits exhausted' };
+        }
+        var reset = _poolParseResetMs(_poolHdr(headers, 'anthropic-ratelimit-requests-reset') || _poolHdr(headers, 'x-ratelimit-reset-requests'), now);
+        return { kind: 'rate_limited', retryAfterMs: retryAfterMs, resetAt: reset, detail: 'HTTP 429' };
+    }
+    if (status === 529 || (status >= 500 && status < 600)) return { kind: 'overloaded', detail: 'HTTP ' + status };
+    return null;
+}
+
+// "resets in 2h 5m" / "12m" / "under a minute" (background.js formatResetDelta).
+function _poolParseResetsIn(text, now) {
+    var m = /resets in (under a minute|(?:(\d+)h\s*)?(?:(\d+)m)?)/i.exec(String(text || ''));
+    if (!m) return null;
+    if (/under a minute/i.test(m[1])) return (now || Date.now()) + 60000;
+    if (!m[2] && !m[3]) return null;
+    return (now || Date.now()) + ((+m[2] || 0) * 60 + (+m[3] || 0)) * 60000;
+}
+
+// OAuth SW envelopes (runClaudeOAuthStream / runChatGPTOAuthStream).
+function _poolClassifyEnvelope(env) {
+    if (!env) return null;
+    var now = Date.now();
+    var msg = String(env.type === 'error' ? (env.error || '') : (env.message || ''));
+    var quotaRe = /usage[ _-]?limit|out of credits|won't help until|spend[ _-]?limit|credit balance|insufficient[ _-]?quota|exceeded your current quota/i;
+    if (env.type === 'status' && env.status === 'rate_limited') {
+        var r = env.reason;
+        if (r === 'concurrents') return { kind: 'rate_limited', detail: 'concurrent-stream cap' };
+        if (r === 529 || (r >= 500 && r < 600)) return { kind: 'overloaded', detail: 'HTTP ' + r };
+        if (r === 429 && quotaRe.test(msg)) return { kind: 'quota_exhausted', resetAt: _poolParseResetsIn(msg, now) || (env.waitMs > 0 ? now + env.waitMs : null), detail: msg.split(' — ')[0] };
+        if (r === 429) return { kind: 'rate_limited', retryAfterMs: env.waitMs > 0 ? env.waitMs : 0, detail: 'HTTP 429' };
+        return null;
+    }
+    if (env.type !== 'error') return null;
+    if (env.code === 'usage_exhausted') {
+        return { kind: 'quota_exhausted', resetAt: env.resetsAt ? _poolParseResetMs(env.resetsAt, now) : _poolParseResetsIn(msg, now), detail: 'ChatGPT usage limit reached' };
+    }
+    var hm = /(?:API error|HTTP) (\d{3})/.exec(msg);
+    var st = hm ? +hm[1] : 0;
+    if ((st === 429 || st === 402 || st === 400) && quotaRe.test(msg)) return { kind: 'quota_exhausted', resetAt: _poolParseResetsIn(msg, now), detail: msg.replace(/^API error 429:\s*/, '').split(' — ')[0] };
+    if (st === 429) return { kind: 'rate_limited', detail: 'HTTP 429 (retries exhausted)' };
+    if (st === 529 || (st >= 500 && st < 600)) return { kind: 'overloaded', detail: 'HTTP ' + st };
+    return null;
+}
+
+function _poolReport(chatId, outcome) {
+    try {
+        if (!chatId || !outcome) return null;
+        if (typeof poolReportLLMOutcome === 'function') return poolReportLLMOutcome(chatId, outcome);
+    } catch (e) {}
+    return null;
+}
+
+function _poolPauseSuffix(pr) {
+    if (!pr || !pr.pause_reason) return '';
+    return ' [sub-agent pool group ' + pr.group + ' paused until ' + (pr.paused_until ? new Date(pr.paused_until).toISOString() : 'the limit is cleared') + ']';
 }
 
 // ─── Prompt-cache heartbeat ─────────────────────────────────────────────

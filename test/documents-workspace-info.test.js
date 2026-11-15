@@ -15,7 +15,7 @@ describe('documents workspace info + diffs', function() {
             escDisplay: esc, escapeHtml: esc,
             appStorage: { getItem: function() { return null; }, setItem: function() {} }
         }, g || {});
-        return U.loadUi(['src/js/core/060-ui-constants.js', 'src/js/ui/120-ui-utils.js', 'src/js/tools/110-smart-documents.js'], { globals: globals });
+        return U.loadUi(['src/js/core/060-ui-constants.js', 'src/js/core/152-line-diff.js', 'src/js/ui/120-ui-utils.js', 'src/js/tools/110-smart-documents.js'], { globals: globals });
     }
     var PR = { number: 7, url: 'https://github.com/o/r/pull/7' };
 

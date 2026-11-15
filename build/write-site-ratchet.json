@@ -17,6 +17,7 @@
     "saveChatsToStorage": {
       "src/js/app/020-api-messages.js": 3,
       "src/js/app/030-agent-loop.js": 29,
+      "src/js/app/045-agent-port-bridge-page.js": 1,
       "src/js/app/040-send-message.js": 3,
       "src/js/app/050-image-attachments.js": 1,
       "src/js/core/097-sub-agent-registry.js": 10,
@@ -34,7 +35,7 @@
       "src/js/ui/090-version-history.js": 2,
       "src/js/ui/130-data-management.js": 1,
       "src/js/ui/160-notifications.js": 2,
-      "src/js/ui/170-chat-management.js": 3,
+      "src/js/ui/170-chat-management.js": 4,
       "src/js/ui/175-sub-agent-ui.js": 1,
       "src/js/ui/210-chat-menus.js": 3,
       "src/js/ui/260-content-format.js": 1,
@@ -43,7 +44,7 @@
       "src/js/worker/100-agent-event-broadcast.js": 1,
       "src/js/worker/115-storage.js": 4,
       "src/js/worker/120-tool-routing.js": 6,
-      "src/js/worker/130-port-bridge.js": 5,
+      "src/js/worker/130-port-bridge.js": 6,
       "src/platform/extension/background.js": 1
     },
     "renderMessages": {
@@ -92,6 +93,7 @@
       "src/js/app/030-agent-loop.js": 9,
       "src/js/app/036-agent-event-handlers-page.js": 1,
       "src/js/app/050-image-attachments.js": 2,
+      "src/js/core/070-permissions.js": 2,
       "src/js/core/097-sub-agent-registry.js": 1,
       "src/js/core/100-cached-results.js": 2,
       "src/js/core/130-indexeddb.js": 8,

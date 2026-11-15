@@ -502,7 +502,9 @@ function _sdocAccessible(doc, options) {
 // Walk the sub-agent chat lineage upward from `chatId`, returning the chain
 // [chatId, parent_chat_id, ...] up to the root human chat. Bounded to 10 hops
 // (cycle/runaway guard). Uses the SW-global SubAgents registry (core/097); a
-// top-level human chat has no registry record so the walk stops there.
+// top-level human chat has no registry record so the walk stops there; the
+// chain then also includes that chat's whole "Continue in a new chat" lineage
+// (core/070 getLineageChatIds), so a continued chat keeps its private docs.
 function _sdocChatChain(chatId) {
     var chain = [];
     var cur = chatId;
@@ -512,6 +514,14 @@ function _sdocChatChain(chatId) {
         var rec = SubAgents.getByChatId(cur);
         if (!rec || !rec.parent_chat_id || rec.parent_chat_id === cur) break;
         cur = rec.parent_chat_id;
+    }
+    if (cur && typeof getLineageChatIds === 'function') {
+        try {
+            var lineage = getLineageChatIds(cur) || [];
+            for (var j = 0; j < lineage.length; j++) {
+                if (chain.indexOf(lineage[j]) === -1) chain.push(lineage[j]);
+            }
+        } catch (e) { /* lineage is best-effort */ }
     }
     return chain;
 }
@@ -534,7 +544,12 @@ function sdocCopyDisplays(doc, content, options) {
     var chatId = _sdocChatId(options);
     while ((match = re.exec(content)) !== null) {
         var did = match[1];
-        var chat = chats[chatId];
+        // Lineage union-on-read: the head of a continued chat keeps only the
+        // newest displays (ui/170 copyLineagePageState cap) — an older one
+        // is read from the predecessor that still holds it.
+        var ownerId = chatId;
+        try { if (typeof findLineageChatWithEntry === 'function') ownerId = findLineageChatWithEntry(chatId, 'displays', did) || chatId; } catch (eLn) { ownerId = chatId; }
+        var chat = chats[ownerId];
         if (chat && chat.displays && chat.displays[did]) {
             doc.displays[did] = { template: chat.displays[did].template, args: chat.displays[did].args };
         }
@@ -980,8 +995,7 @@ function sdocDiffExpand(btn) {
     if (gap.parentNode) gap.parentNode.removeChild(gap);
 }
 
-// [{type:'add'|'del'|'ctx', text}] via the trimmed LCS of _sdocLineDiffArr (whole-rewrite
-// fallback past SDOC_DIFF_MAX_CELLS).
+// [{type:'add'|'del'|'ctx', text}] via _sdocLineDiffArr (shared core/152 lineDiffOps).
 function sdocComputeDiff(oldLines, newLines) {
     var out = [];
     _sdocLineDiffArr(oldLines || [], newLines || []).forEach(function(g) {
@@ -3214,8 +3228,10 @@ function sdocWsInfoHtml(info, compact) {
     if (info.pinned) h += '<span class="sdoc-ws-chip sdoc-ws-pinned">' + (I.pin || '') + '<span>' + _sdsEsc(t('Pinned')) + '</span></span>';
     return h + '</span>';
 }
-// Line diff (common prefix/suffix trimmed, LCS in between) -> [{type:'eq'|'add'|'del', lines:[...]}].
-// Past SDOC_DIFF_MAX_CELLS the middle becomes one removed block + one added block.
+// Line diff -> [{type:'eq'|'add'|'del', lines:[...]}] via the shared core/152
+// lineDiffOps (trimmed prefix/suffix + linear-space Myers, patience fallback past
+// its step budget; dels precede adds inside each change block).
+// SDOC_DIFF_MAX_CELLS is kept for compatibility only (no longer a whole-rewrite cap).
 var SDOC_DIFF_MAX_CELLS = 4000000;
 function sdocLineDiff(oldText, newText) {
     return _sdocLineDiffArr(oldText ? String(oldText).split('\n') : [], newText ? String(newText).split('\n') : []);
@@ -3223,27 +3239,11 @@ function sdocLineDiff(oldText, newText) {
 function _sdocLineDiffArr(a, b) {
     var out = [];
     function push(type, line) { var last = out[out.length - 1]; if (last && last.type === type) last.lines.push(line); else out.push({ type: type, lines: [line] }); }
-    var pre = 0, suf = 0;
-    while (pre < a.length && pre < b.length && a[pre] === b[pre]) pre++;
-    while (suf < a.length - pre && suf < b.length - pre && a[a.length - 1 - suf] === b[b.length - 1 - suf]) suf++;
-    var i, j;
-    for (i = 0; i < pre; i++) push('eq', a[i]);
-    var am = a.slice(pre, a.length - suf), bm = b.slice(pre, b.length - suf), n = am.length, m = bm.length;
-    if (n * m > SDOC_DIFF_MAX_CELLS) {
-        am.forEach(function(l) { push('del', l); }); bm.forEach(function(l) { push('add', l); });
-    } else if (n || m) {
-        var w = m + 1, L = new Uint32Array((n + 1) * w);
-        for (i = n - 1; i >= 0; i--) for (j = m - 1; j >= 0; j--) L[i * w + j] = am[i] === bm[j] ? L[(i + 1) * w + j + 1] + 1 : Math.max(L[(i + 1) * w + j], L[i * w + j + 1]);
-        i = 0; j = 0;
-        while (i < n && j < m) {
-            if (am[i] === bm[j]) { push('eq', am[i]); i++; j++; }
-            else if (L[(i + 1) * w + j] >= L[i * w + j + 1]) push('del', am[i++]);
-            else push('add', bm[j++]);
-        }
-        while (i < n) push('del', am[i++]);
-        while (j < m) push('add', bm[j++]);
-    }
-    for (i = a.length - suf; i < a.length; i++) push('eq', a[i]);
+    lineDiffOps(a, b).forEach(function(op) {
+        if (op.type === 'same') push('eq', a[op.oldIndex]);
+        else if (op.type === 'remove') push('del', a[op.oldIndex]);
+        else push('add', b[op.newIndex]);
+    });
     return out;
 }
 function sdocDiffStats(segs) {

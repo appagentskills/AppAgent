@@ -147,9 +147,9 @@ var TOOLS = [
                     expected_version: { type: 'integer', description: 'Required for edit_html: the saved widget version, read first via html_widget action=read.' },
                     operation_id: { type: 'string', description: 'Stable retry key for edit_html; reuse only with identical edits and expected_version.' },
                     widget_id: { type: 'string', description: 'Target an html_widget by ID. Required for open_widget and edit_html; optional for get_visible_text, get_dom, click, fill (targets the widget instead of the browser).' },
-                    user: { type: 'string', description: 'For impersonate: username, display name, or sys_id; "stop" ends impersonation.' },
-                    instance: { type: 'string', description: 'Optional. ServiceNow instance (short name from list_instances, hostname or URL) used only as the base for relative navigate urls (e.g. "/incident_list.do"). Omit it for absolute urls and non-ServiceNow websites; an unknown value is ignored with a warning. The tab is chosen only by tab_id.' },
-                    tab_id: { type: ['integer', 'string'], description: 'Required for every browser action (all actions except widget actions with widget_id, and close); there is no fallback to the active tab or any remembered tab. A Chrome tab id number from list_instances — any website tab works, not just ServiceNow: instances[].activeTabs[].id (ServiceNow tabs), otherTabs[].id (every other open website tab), or selfTabId / extensionTabs[].id for the agent\'s own tab, or the tab_id returned by a previous browser action / take_screenshot. navigate only: "new" opens a new background tab (its id is returned as tab_id; reuse it). The agent\'s own tab can be read/screenshotted but not navigated. Browser-internal pages (chrome://, other extensions, Chrome Web Store; otherTabs[].restricted) cannot be read/clicked/captured — only navigated away from or closed. A closed/unknown id is an error.' },
+                    user: { type: 'string', description: 'For impersonate: username, display name, or sys_id; "stop" ends impersonation on that instance (back to the real user). Target instance = instance, else the tab_id tab\'s instance, else the active instance; tab_id (optional) is reloaded afterwards.' },
+                    instance: { type: 'string', description: 'Optional. ServiceNow instance (short name from list_instances, hostname or URL). For navigate: base for relative urls (e.g. "/incident_list.do"); omit it for absolute urls and non-ServiceNow websites; an unknown value is ignored with a warning. For impersonate: the instance to impersonate on (unknown = error). The tab is chosen only by tab_id.' },
+                    tab_id: { type: ['integer', 'string'], description: 'Required for every browser action (all actions except widget actions with widget_id, and close); there is no fallback to the active tab or any remembered tab. A Chrome tab id number from list_instances — any website tab works, not just ServiceNow: instances[].activeTabs[].id (ServiceNow tabs), otherTabs[].id (every other open website tab), or selfTabId / extensionTabs[].id for the agent\'s own tab, or the tab_id returned by a previous browser action / take_screenshot. navigate only: "new" opens a new background tab (its id is returned as tab_id; reuse it) — also the way to connect a ServiceNow instance that list_instances does not show (open its root URL, then re-call list_instances). The agent\'s own tab can be read/screenshotted but not navigated. Browser-internal pages (chrome://, other extensions, Chrome Web Store; otherTabs[].restricted) cannot be read/clicked/captured — only navigated away from or closed. A closed/unknown id is an error.' },
                     edits: {
                         type: 'array',
                         description: 'For edit_html: find/replace operations on the widget HTML.',
@@ -467,6 +467,8 @@ var TOOLS = [
                     tab_id: { type: 'integer', description: 'Required for target="browser" and target="element": the Chrome tab to capture — any website tab, not only ServiceNow (list_instances instances[].activeTabs[].id for ServiceNow tabs, otherTabs[].id for any other website tab, selfTabId for the agent\'s own tab, or the tab_id returned by a previous iframe_tool call). Browser-internal pages (chrome://, Chrome Web Store, other extensions) cannot be captured. No fallback to the active tab. The result carries tab_id. Not used for target="widget".' },
                     selector: { type: 'string', description: 'For target="element": CSS selector of the element.' },
                     max_width: { type: 'number', description: 'Max width in px, for token efficiency. Default 1568; larger values give finer detail but cost more tokens; the long edge is always capped at 3000px. Captured at native device resolution and downscaled with high-quality resampling so text stays sharp; height may reach 2x this value; width is never scaled below 1024px.' },
+                    fast: { type: 'boolean', description: 'For target="browser": fast mode for repeated captures of a background tab. If the tab is already active it is captured directly (no activation/focus/settle delays); if not, it is activated once and left active (no switch back), so later fast calls are instant. Captures are spaced >=510ms internally to respect Chrome\'s 2/s capture quota instead of failing. Visibly switches the user\'s tab; pass restore_tab:true on the last call of a burst to return to the original tab. Fast captures are JPEG (base64 is a data:image/jpeg URL, quality ~70-85) with a lightweight resize/encode, aiming at ~2 captures/s; result.fast_mode.timing_ms splits the time. Default false (switch, capture, switch back; PNG).' },
+                    restore_tab: { type: 'boolean', description: 'For target="browser": after this capture, re-activate the tab(s) that were active before the first fast:true switch (ends a fast burst). Default false.' },
                     include_header: { type: 'boolean', description: 'For target="split_widget": also include the pane header, progress card and "New update" pill. Default false (widget area only).' },
                     grid: { type: 'boolean', description: 'If true, overlays a labeled coordinate grid — to find x,y for click/fill when CSS selectors are hard to determine. Default: false.' },
                     name: { type: 'string', description: 'Short name, max 3-4 words (e.g. "Users list", "Form error", "Dashboard"); used for display and download.' },
@@ -657,11 +659,11 @@ var TOOLS = [
         type: 'function',
         function: {
             name: 'local_folder',
-            description: 'Read/write files in the user\'s connected folders: the built-in virtual folder "virtual" ("Agent Files", always read/write — your scratch space, and where the user uploads files for you) plus local folders the user connected as read-only ("read") or read/write ("readwrite"). Paths are relative to the folder root (".." is rejected); folder defaults to "virtual".\nActions: list (folders + access + permission), ls {path?, recursive?}, read {path, encoding?:"base64"}, grep {pattern, path?}, write {path, content | base64 | file_id | source:{folder,path}, append?}, mkdir {path}, delete {path, recursive?}, request {reason, access?, folder?} (asks the user to connect a new folder, or re-grant permission for folder).\nread of a binary file (images, PDFs…) returns a file_id instead of content (encoding:"base64" also returns data_url). Use that file_id directly: servicenow_api attachment upload (attachment_file_id, or attachment_source:{folder,path}), web_fetch (body_file_id, or form:{file:{file_id}}), get_file {attach:true} to view it. write is refused on read-only folders.\ndata_url size limit: direct tool calls inline data_url only up to ~1 MB encoded; programmatic callers (executeTool from js_eval or an html_widget) get the full data_url up to ~48 MB encoded. Over the limit the result has data_url_omitted:true + data_url_limit_chars + note, and the file_id still carries the full bytes (get_file {id} returns them as a data URL to js_eval/widgets). max_bytes overrides the limit; thumbnail:{max:512} adds a small JPEG thumbnail {data_url,width,height} for images.',
+            description: 'Read/write files in the user\'s connected folders: the built-in virtual folder "virtual" ("Agent Files", always read/write — your scratch space, and where the user uploads files for you) plus local folders the user connected as read-only ("read") or read/write ("readwrite"). Paths are relative to the folder root (".." is rejected); folder defaults to "virtual".\nActions: list (folders + access + permission), ls {path?, recursive?}, read {path, encoding?:"base64"}, grep {pattern, path?}, write {path, content | base64 | file_id | source:{folder,path}, append?}, mkdir {path}, delete {path, recursive?}, share {path} (Agent Files only: shows the user a Download button for an existing file), request {reason, access?, folder?} (asks the user to connect a new folder, or re-grant permission for folder).\nAgent Files is how you hand files to the user: a write there returns file_id + download_url and (direct calls) shows a Download button in chat; share:false skips the button, share:true adds it for js_eval/widget callers.\nread of a binary file (images, PDFs…) returns a file_id instead of content (encoding:"base64" also returns data_url). Use that file_id directly: servicenow_api attachment upload (attachment_file_id, or attachment_source:{folder,path}), web_fetch (body_file_id, or form:{file:{file_id}}), get_file {attach:true} to view it. write is refused on read-only folders.\ndata_url size limit: direct tool calls inline data_url only up to ~1 MB encoded; programmatic callers (executeTool from js_eval or an html_widget) get the full data_url up to ~48 MB encoded. Over the limit the result has data_url_omitted:true + data_url_limit_chars + note, and the file_id still carries the full bytes (get_file {id} returns them as a data URL to js_eval/widgets). max_bytes overrides the limit; thumbnail:{max:512} adds a small JPEG thumbnail {data_url,width,height} for images.',
             parameters: {
                 type: 'object',
                 properties: {
-                    action: { type: 'string', enum: ['list', 'ls', 'read', 'grep', 'write', 'mkdir', 'delete', 'request'] },
+                    action: { type: 'string', enum: ['list', 'ls', 'read', 'grep', 'write', 'mkdir', 'delete', 'share', 'request'] },
                     folder: { type: 'string', description: 'Folder id or label from list. Default "virtual" (Agent Files).' },
                     path: { type: 'string', description: 'Path relative to the folder root, e.g. "images/logo.png". Empty = root.' },
                     recursive: { type: 'boolean', description: 'ls: walk sub-folders (skips .git/node_modules). delete: remove a non-empty directory.' },
@@ -677,6 +679,7 @@ var TOOLS = [
                     file_id: { type: 'string', description: 'write: copy a file-store file (screenshot, web_fetch save_file, read result, attachment).' },
                     source: { type: 'object', description: 'write: copy from another folder file {folder, path}.' },
                     append: { type: 'boolean', description: 'write: append instead of overwrite.' },
+                    share: { type: 'boolean', description: 'write (Agent Files): Download button in chat. Default on for direct calls, off for js_eval/widget callers; false = link fields only.' },
                     access: { type: 'string', enum: ['read', 'readwrite'], description: 'request: access to suggest for the new folder (user can change it).' },
                     label: { type: 'string', description: 'request: suggested label for the new folder.' },
                     reason: { type: 'string', description: 'request: why you need the folder (shown to the user).' },
@@ -847,7 +850,7 @@ var TOOLS = [
         type: 'function',
         function: {
             name: 'list_instances',
-            description: 'List connected ServiceNow instances with connection status, user info (incl. roles — the user\'s directly-granted roles; check for `admin` before servicenow_run_script; empty = unknown/probe failed; the `maint` login — no sys_user, no roles, admin-level read of the roles table — is reported as isMaint:true with roles ["maint","admin"] and counts as admin) and short names — use it before targeting an instance with servicenow_api or iframe_tool. Tab ids for browser actions (iframe_tool / take_screenshot require an explicit tab_id; any website is allowed, not only ServiceNow): instances[].activeTabs[].id = ServiceNow tabs; otherTabs[].id = every other open website tab (restricted:true = browser-internal page such as chrome:// or the Web Store: navigate/close only); extensionTabs = the extension\'s own pages; selfTabId = the tab hosting this agent UI in full-tab mode (null in the sidepanel) — it can be screenshotted/read but never navigated. Instances the user disabled for agent use (header instance picker) are excluded and returned in disabledInstances: never target them — any call against a disabled instance (explicit instance arg or the active instance) is refused until re-enabled.',
+            description: 'List connected ServiceNow instances with connection status, user info (incl. roles — the user\'s directly-granted roles; check for `admin` before servicenow_run_script; empty = unknown/probe failed; the `maint` login — no sys_user, no roles, admin-level read of the roles table — is reported as isMaint:true with roles ["maint","admin"] and counts as admin) and short names — use it before targeting an instance with servicenow_api or iframe_tool. Tab ids for browser actions (iframe_tool / take_screenshot require an explicit tab_id; any website is allowed, not only ServiceNow): instances[].activeTabs[].id = ServiceNow tabs; otherTabs[].id = every other open website tab (restricted:true = browser-internal page such as chrome:// or the Web Store: navigate/close only); extensionTabs = the extension\'s own pages; selfTabId = the tab hosting this agent UI in full-tab mode (null in the sidepanel) — it can be screenshotted/read but never navigated. Instances the user disabled for agent use (header instance picker) are excluded and returned in disabledInstances: never target them — any call against a disabled instance (explicit instance arg or the active instance) is refused until re-enabled. Instance missing / not connected? Open a tab to it (iframe_tool navigate tab_id:"new") and re-call this tool a few times over ~20s — an existing session or SSO often connects it.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -855,6 +858,23 @@ var TOOLS = [
                     include_roles: { type: 'boolean', description: 'Optional. true = re-fetch each connected instance\'s roles live (direct only: sys_user_has_role inherited=false) and return them with rolesSource:"direct" (rolesError on lookup failure). Default false returns the cached probe roles.' },
                     status_message: { type: 'string', description: 'Short human-friendly description of this call, shown in the UI header.' }
                 }
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'connect_instance',
+            description: 'Log in to a ServiceNow instance with a username + password when it is not connected (no open tab / no session) — use it only when the user gave you the credentials in this chat or an active skill provides them; never guess or invent credentials. Opens <instance>/login.do in a new background tab (reuses a tab only if it already shows that instance\'s login.do; your other tabs are never navigated), submits the classic login form and waits up to 30s for a session. Without credentials, first try iframe_tool navigate {tab_id:"new", url:<instance root>} and re-check list_instances — an existing session or SSO often connects the instance; if not, ask the user to log in in that tab. On success the tab stays open, the instance becomes usable by servicenow_api / iframe_tool (and becomes the active instance if none is), and {success, instance, userName, tabId} is returned. On failure returns reason: bad_credentials (after 2 consecutive rejections for the same user the login is paused for 10 min to avoid lockout — reason paused), mfa_required, password_change_required, sso_redirect, timeout. The password is never stored or returned and is redacted from the chat transcript — if a retry is needed after a restart, ask the user for it again. Call this tool directly, never from js_eval (js_eval code is persisted verbatim, so the password would be stored in the chat). Disabled instances are refused.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    instance: { type: 'string', description: 'Instance URL (https://acme.service-now.com) or short name (acme).' },
+                    username: { type: 'string', description: 'ServiceNow user name.' },
+                    password: { type: 'string', description: 'Password supplied by the user or a skill. Never persisted.' },
+                    status_message: { type: 'string', description: 'Short human-friendly description of this call, shown in the UI header.' }
+                },
+                required: ['instance', 'username', 'password']
             }
         }
     },
@@ -917,8 +937,8 @@ var TOOLS = [
     // multi-record audits, log scraping). Each sub gets its own chat + context
     // window, runs to completion, and reports back a distilled summary via
     // `report_to_parent`. Pool limits are per connection group (Orchestrator
-    // §5): 2 concurrent for Anthropic-OAuth-backed subs, 4 per endpoint for
-    // other providers, 6 overall; excess spawns queue.
+    // §5) and adaptive (start 2 / 4 pinned endpoint, AIMD on rate limits,
+    // paused on quota exhaustion), 6 overall; excess spawns queue.
     {
         type: 'function',
         function: {
@@ -1236,6 +1256,8 @@ var HEADLESS_TOOLS = {
     read_attached_file: true,
     document: true,
     list_instances: true,
+    // connect_instance runs in the SW (self.snAutoLogin, chrome.tabs/scripting) — headless.
+    connect_instance: true,
     // Handle-await helpers — pure in-memory registry reads, fully headless
     await_handle: true,
     await_any: true,
@@ -1319,6 +1341,7 @@ var TOOL_SHORT_DESCRIPTIONS = {
     read_attached_file: 'Read a text file the user attached to this conversation.',
     document: 'Create, read, edit, and manage persistent versioned Smart Documents rendered inline.',
     list_instances: 'List connected ServiceNow instances with status and user info.',
+    connect_instance: 'Log in to a ServiceNow instance with user-supplied credentials (never stored).',
     await_handle: 'Block until one sub-agent handle settles and return its snapshot.',
     await_any: 'Wait for the first of several sub-agent handles to settle.',
     await_all: 'Wait for all of several sub-agent handles to settle.',

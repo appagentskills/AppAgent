@@ -60,6 +60,9 @@
   "No changes tracked yet": "Ancora nessuna modifica registrata",
   "Message input": "Campo messaggio",
   "Continue in a new chat": "Continua in una nuova chat",
+  "Continued: ": "Continuazione: ",
+  "Sub-agent chats can't be continued in a new chat": "Le chat dei sub-agenti non possono essere continuate in una nuova chat",
+  "This chat was already continued in a new chat": "Questa chat è già stata continuata in una nuova chat",
   "Summarize and start new chat": "Riepiloga e avvia una nuova chat",
   "Pause or resume": "Metti in pausa o riprendi",
   "Continue": "Continua",
@@ -275,6 +278,7 @@
   "Read Version": "Leggi versione",
   "Delete Document": "Elimina documento",
   "List Instances": "Elenca istanze",
+  "Connect Instance": "Connetti istanza",
   "Fetch URL": "Recupera URL",
   "Web Search": "Ricerca web",
   "Build Extension": "Compila estensione",
@@ -1923,5 +1927,12 @@
   "No edited skills": "Nessuna skill modificata",
   "Resize sidebar": "Ridimensiona la barra laterale",
   "Resize split view": "Ridimensiona la vista divisa",
-  "Drag to resize · double-click to reset": "Trascina per ridimensionare · doppio clic per ripristinare"
+  "Drag to resize · double-click to reset": "Trascina per ridimensionare · doppio clic per ripristinare",
+  "Chat was continued": "La chat è stata continuata",
+  "Continued from": "Continuazione di",
+  "Continued in": "Continua in",
+  "Go to the new chat": "Vai alla nuova chat",
+  "Send here anyway": "Invia comunque qui",
+  "This chat continues in \"{title}\". Workers, PRs and widgets now live there.": "Questa chat continua in \"{title}\". Worker, PR e widget ora si trovano lì.",
+  "deleted chat": "chat eliminata"
 }

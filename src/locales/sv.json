@@ -60,6 +60,9 @@
   "No changes tracked yet": "Inga ändringar har spårats ännu",
   "Message input": "Meddelandefält",
   "Continue in a new chat": "Fortsätt i en ny chatt",
+  "Continued: ": "Fortsättning: ",
+  "Sub-agent chats can't be continued in a new chat": "Underagent-chattar kan inte fortsättas i en ny chatt",
+  "This chat was already continued in a new chat": "Den här chatten har redan fortsatt i en ny chatt",
   "Summarize and start new chat": "Sammanfatta och starta ny chatt",
   "Pause or resume": "Pausa eller återuppta",
   "Continue": "Fortsätt",
@@ -275,6 +278,7 @@
   "Read Version": "Läs version",
   "Delete Document": "Ta bort dokument",
   "List Instances": "Lista instanser",
+  "Connect Instance": "Anslut instans",
   "Fetch URL": "Hämta URL",
   "Web Search": "Webbsökning",
   "Build Extension": "Bygg tillägg",
@@ -1923,5 +1927,12 @@
   "No edited skills": "Inga redigerade färdigheter",
   "Resize sidebar": "Ändra storlek på sidofältet",
   "Resize split view": "Ändra storlek på delad vy",
-  "Drag to resize · double-click to reset": "Dra för att ändra storlek · dubbelklicka för att återställa"
+  "Drag to resize · double-click to reset": "Dra för att ändra storlek · dubbelklicka för att återställa",
+  "Chat was continued": "Chatten fortsattes",
+  "Continued from": "Fortsättning från",
+  "Continued in": "Fortsätter i",
+  "Go to the new chat": "Gå till den nya chatten",
+  "Send here anyway": "Skicka här ändå",
+  "This chat continues in \"{title}\". Workers, PRs and widgets now live there.": "Den här chatten fortsätter i \"{title}\". Workers, PR:er och widgetar finns nu där.",
+  "deleted chat": "borttagen chatt"
 }

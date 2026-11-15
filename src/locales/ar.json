@@ -60,6 +60,9 @@
   "No changes tracked yet": "لم يتم تتبّع أي تغييرات بعد",
   "Message input": "حقل إدخال الرسالة",
   "Continue in a new chat": "المتابعة في محادثة جديدة",
+  "Continued: ": "متابعة: ",
+  "Sub-agent chats can't be continued in a new chat": "لا يمكن متابعة محادثات الوكلاء الفرعيين في محادثة جديدة",
+  "This chat was already continued in a new chat": "تمت متابعة هذه المحادثة بالفعل في محادثة جديدة",
   "Summarize and start new chat": "تلخيص وبدء محادثة جديدة",
   "Pause or resume": "إيقاف مؤقت أو استئناف",
   "Continue": "متابعة",
@@ -275,6 +278,7 @@
   "Read Version": "قراءة الإصدار",
   "Delete Document": "حذف المستند",
   "List Instances": "سرد المثيلات",
+  "Connect Instance": "الاتصال بالمثيل",
   "Fetch URL": "جلب عنوان URL",
   "Web Search": "البحث في الويب",
   "Build Extension": "بناء الإضافة",
@@ -1923,5 +1927,12 @@
   "No edited skills": "لا توجد مهارات معدَّلة",
   "Resize sidebar": "تغيير حجم الشريط الجانبي",
   "Resize split view": "تغيير حجم العرض المقسّم",
-  "Drag to resize · double-click to reset": "اسحب لتغيير الحجم · انقر مرتين لإعادة التعيين"
+  "Drag to resize · double-click to reset": "اسحب لتغيير الحجم · انقر مرتين لإعادة التعيين",
+  "Chat was continued": "تمت متابعة المحادثة",
+  "Continued from": "متابعة من",
+  "Continued in": "متابعة في",
+  "Go to the new chat": "الانتقال إلى المحادثة الجديدة",
+  "Send here anyway": "الإرسال هنا على أي حال",
+  "This chat continues in \"{title}\". Workers, PRs and widgets now live there.": "تتابع هذه المحادثة في \"{title}\". أصبح العمال وطلبات السحب والأدوات موجودة هناك الآن.",
+  "deleted chat": "محادثة محذوفة"
 }

@@ -87,6 +87,7 @@ var TOOL_DISPLAY_NAMES = {
     'document:read_version': N_('Read Version'),
     'document:delete': N_('Delete Document'),
     'list_instances': N_('List Instances'),
+    'connect_instance': N_('Connect Instance'),
     'web_fetch': N_('Fetch URL'),
     'web_search': N_('Web Search'),
     'extension_build': N_('Build Extension'),
@@ -412,7 +413,7 @@ function getToolIcon(toolName) {
     if (toolName === 'take_screenshot') return UI_ICONS.eye;
     if (toolName === 'read_attached_file') return UI_ICONS.file;
     if (toolName === 'document') return UI_ICONS.file;
-    if (toolName === 'list_instances') return UI_ICONS.api;
+    if (toolName === 'list_instances' || toolName === 'connect_instance') return UI_ICONS.api;
     if (toolName === 'get_cookie') return UI_ICONS.lock;
     if (toolName === 'workspace') return UI_ICONS.gitBranch;
     if (toolName === 'web_fetch') return UI_ICONS.globe;

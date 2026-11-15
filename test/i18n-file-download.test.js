@@ -90,7 +90,7 @@ describe('i18n file-download page: English identity', function() {
         assert.strictEqual(none.fetched.length, 0, 'uiLanguage=en never fetches');
         assert.strictEqual(none.card.querySelector('p.error').textContent, 'No file ID provided.');
         var miss = await fdBoot({ search: '?id=f%201' });
-        assert.deepStrictEqual(miss.opened, ['AppAgentDB', 'iframe_AppAgentDB'], 'both DBs tried');
+        assert.deepStrictEqual(miss.opened, ['appagent-files', 'AppAgentDB', 'iframe_AppAgentDB'], 'file store then both DBs tried');
         assert.strictEqual(miss.card.querySelector('p.error').textContent, 'File not found: f 1');
     }, { tags: ['unit'], timeout: 5000 });
 });
@@ -196,7 +196,7 @@ describe('i18n file-download page: hostile id is rendered as text (#1032)', func
     test('?id=<img src=x onerror=alert(1)> -> no <img> element, the id shows literally (en + fr)', async function() {
         var HOSTILE = '<img src=x onerror=alert(1)>';
         var r = await fdBoot({ search: '?id=' + encodeURIComponent(HOSTILE) });
-        assert.deepStrictEqual(r.opened, ['AppAgentDB', 'iframe_AppAgentDB'], 'reached the not-found branch');
+        assert.deepStrictEqual(r.opened, ['appagent-files', 'AppAgentDB', 'iframe_AppAgentDB'], 'reached the not-found branch');
         assert.strictEqual(r.card.querySelectorAll('img').length, 0, 'no injected <img>');
         assert.strictEqual(r.doc.querySelectorAll('img, [onerror]').length, 0, 'nothing with onerror anywhere');
         var p = r.card.querySelector('p.error');

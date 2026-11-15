@@ -60,6 +60,9 @@
   "No changes tracked yet": "Nog geen wijzigingen bijgehouden",
   "Message input": "Berichtinvoer",
   "Continue in a new chat": "Doorgaan in een nieuwe chat",
+  "Continued: ": "Vervolg: ",
+  "Sub-agent chats can't be continued in a new chat": "Subagent-chats kunnen niet in een nieuwe chat worden voortgezet",
+  "This chat was already continued in a new chat": "Deze chat is al voortgezet in een nieuwe chat",
   "Summarize and start new chat": "Samenvatten en nieuwe chat starten",
   "Pause or resume": "Pauzeren of hervatten",
   "Continue": "Doorgaan",
@@ -275,6 +278,7 @@
   "Read Version": "Versie lezen",
   "Delete Document": "Document verwijderen",
   "List Instances": "Instanties weergeven",
+  "Connect Instance": "Instantie verbinden",
   "Fetch URL": "URL ophalen",
   "Web Search": "Zoeken op het web",
   "Build Extension": "Extensie bouwen",
@@ -1923,5 +1927,12 @@
   "No edited skills": "Geen bewerkte skills",
   "Resize sidebar": "Formaat van zijbalk wijzigen",
   "Resize split view": "Formaat van gesplitste weergave wijzigen",
-  "Drag to resize · double-click to reset": "Sleep om het formaat te wijzigen · dubbelklik om te herstellen"
+  "Drag to resize · double-click to reset": "Sleep om het formaat te wijzigen · dubbelklik om te herstellen",
+  "Chat was continued": "Chat is voortgezet",
+  "Continued from": "Voortgezet uit",
+  "Continued in": "Voortgezet in",
+  "Go to the new chat": "Naar de nieuwe chat",
+  "Send here anyway": "Toch hier verzenden",
+  "This chat continues in \"{title}\". Workers, PRs and widgets now live there.": "Deze chat gaat verder in \"{title}\". Workers, PR's en widgets staan nu daar.",
+  "deleted chat": "verwijderde chat"
 }

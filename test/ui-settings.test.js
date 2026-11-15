@@ -873,6 +873,57 @@ describe('ui settings › workspace header dropdown', function() {
         assert.strictEqual(rows(), 7);
         assert.strictEqual(btn(), null);
     }, { tags: ['unit'] });
+    test('_wsSplitDropdownPRs: PRs idle > 7 days always hidden; no timestamp = recent; recent capped by limit', async function() {
+        var L = await load({});
+        var now = new Date(2026, 9, 10, 12, 0, 0).getTime();
+        var day = 24 * 3600e3;
+        var prs = [
+            { url: 'a', activityAt: new Date(now - 1 * day).toISOString() },
+            { url: 'b', activityAt: new Date(now - 8 * day).toISOString() },
+            { url: 'c' },
+            { url: 'd', activityAt: now - 7 * day + 60e3 },
+            { url: 'e', activityAt: 'garbage' },
+            { url: 'f', activityAt: new Date(now - 30 * day).toISOString() }
+        ];
+        var ids = function(a) { return a.map(function(p) { return p.url; }); };
+        var s = L.m._wsSplitDropdownPRs(prs, { now: now, limit: 7 });
+        assert.deepStrictEqual(ids(s.shown), ['a', 'c', 'd', 'e'], 'recent / untimestamped / just under 7d / unparseable shown');
+        assert.deepStrictEqual(ids(s.hidden), ['b', 'f'], 'older than 7 days hidden');
+        var s2 = L.m._wsSplitDropdownPRs(prs, { now: now, limit: 2 });
+        assert.deepStrictEqual(ids(s2.shown), ['a', 'c']);
+        assert.deepStrictEqual(ids(s2.hidden), ['d', 'e', 'b', 'f'], 'recent overflow first, then stale');
+        assert.deepStrictEqual(ids(L.m._wsSplitDropdownPRs([{ url: 'x' }], { now: now }).hidden), []);
+        assert.strictEqual(L.m._wsLatestTs(null, '2026-01-02T00:00:00Z', 'bad', '2026-01-01T00:00:00Z'), '2026-01-02T00:00:00Z');
+        assert.strictEqual(L.m._wsLatestTs(null, undefined), null);
+    }, { tags: ['unit'] });
+    test('PR section: PRs older than a week go under "View more"; live GitHub activity time counts', async function() {
+        var day = 24 * 3600e3;
+        var prs = [{ url: 'https://github.com/o/b/pull/10', number: 10, title: 'Ten', pushed_at: new Date(Date.now() - day).toISOString() },
+            { url: 'https://github.com/o/b/pull/9', number: 9, title: 'Nine', created_at: new Date(Date.now() - 10 * day).toISOString() },
+            { url: 'https://github.com/o/b/pull/8', number: 8, title: 'Eight' },
+            { url: 'https://github.com/o/b/pull/7', number: 7, title: 'Seven', state: 'closed', created_at: new Date(Date.now() - 20 * day).toISOString(), pushed_at: new Date(Date.now() - 2 * day).toISOString() }];
+        var L = await open({ prs: prs });
+        var nums = function() { return Array.prototype.map.call(L.dd.querySelectorAll('.ws-pr-entry'), function(e) { return e.getAttribute('data-pr-url').split('/').pop(); }); };
+        var btn = function() { return L.dd.querySelector('.ws-pr-section .ws-pr-more'); };
+        assert.deepStrictEqual(nums(), ['10', '8', '7'], 'stale #9 hidden; latest push wins over old created_at; no timestamp = recent');
+        assert.strictEqual(L.dd.querySelector('.ws-pr-title').textContent, 'Pull Requests (4)', 'header still counts all PRs');
+        assert.strictEqual(btn().textContent, 'View more (1)');
+        U.click(btn());
+        assert.deepStrictEqual(nums(), ['10', '8', '7', '9'], 'expanded: stale rows appended');
+        assert.strictEqual(btn().textContent, 'Collapse');
+        U.click(btn());
+        // Live GitHub updated_at (legacy entry without stamps) can make it stale.
+        L.m.__scope._sidebarPRActivityAt = { 'https://github.com/o/b/pull/8': new Date(Date.now() - 9 * day).toISOString() };
+        L.m._reconcileWsPrSection();
+        assert.deepStrictEqual(nums(), ['10', '7']);
+        assert.strictEqual(btn().textContent, 'View more (2)');
+        // All recent and under the cap: no button.
+        L.m.__scope._sidebarPRActivityAt = {};
+        L.m.__scope._wsHeaderCaches['o/b::dev'].meta.prs = [prs[0], prs[2]];
+        L.m._reconcileWsPrSection();
+        assert.deepStrictEqual(nums(), ['10', '8']);
+        assert.strictEqual(btn(), null);
+    }, { tags: ['unit'] });
     test('opening the dropdown kicks the meta-PR loader only when _sidebarMetaPRs is not loaded', async function() {
         var kick = U.recorder();
         var L = await open({ globals: { _sidebarMetaPRs: null, _refreshSidebarMetaPRs: kick } });

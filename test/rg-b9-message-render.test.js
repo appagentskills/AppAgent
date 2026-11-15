@@ -201,7 +201,7 @@ describe('rg-b9 P2: attachment-group placeholders carry no duplicate msg-N id', 
   }
   var PARTS = ['isAttachmentRole', 'renderAttachmentContent', 'findAdjacentForAttachmentGroup', '_renderSig',
     '_sigHasWidget', '_tryIncrementalRender', '_sweepOrphanedParkedWidgets', '_renderCompactThinking',
-    '_userMsgNavButtonsHtml', 'renderMessages'].map(function(n) { return declaration(renderSrc, n); });
+    '_userMsgNavButtonsHtml', 'maskSecretToolArgs', 'renderMessages'].map(function(n) { return declaration(renderSrc, n); });
   function noop() {}
   function esc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
   function makeEnv(messages, compact) {

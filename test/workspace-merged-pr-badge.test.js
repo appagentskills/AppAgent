@@ -63,7 +63,7 @@ function row(path, content, extra) { return Object.assign({ id: WK + '::' + path
 async function setup(prMerged) {
     var idb = fakeIDB();
     var s = await loadModules(['src/js/core/130-indexeddb.js'], { lenient: true, globals: { STORAGE_PREFIX: 'test_', skillAssetsStoreName: 'skillAssets', indexedDB: idb.indexedDB, console: { warn: function() {}, error: function() {}, log: function() {} } } });
-    var m = await loadModules(['src/js/tools/020-tool-execution.js'], { lenient: true, globals: { window: fakeWindow(), chrome: fakeChrome() } });
+    var m = await loadModules(['src/js/core/152-line-diff.js', 'src/js/tools/020-tool-execution.js'], { lenient: true, globals: { window: fakeWindow(), chrome: fakeChrome() } });
     var metas = {}; metas[WK] = { repo: WK, branch: 'main', github_repo: 'o/r', head_sha: 'H', prs: [Object.assign({}, PR)] };
     var sc = m.__scope;
     sc.getWorkspaceFile = s.getWorkspaceFile; sc.setWorkspaceFile = s.setWorkspaceFile; sc.setWorkspaceFileIf = s.setWorkspaceFileIf;
@@ -293,6 +293,46 @@ describe('#1083 review: wsPush stamping (tools/020)', function() {
         assert.strictEqual(res.success, true, JSON.stringify(res).slice(0, 400));
         var s = await w.s.getWorkspaceFile(WK, 's.js');
         assert.deepStrictEqual(s.pushed_shas, ['sx']); assert.strictEqual(s.pushed_pr.number, 5); assert.strictEqual(s.pushed_pr_merged, true);
+    });
+
+    // PR #1324: wsPush stores prInfo.base and per-file adds/dels (the PR view
+    // renders them without loading blobs); files over WS_PR_COUNT_MAX_BYTES
+    // get no counts (the view counts lazily).
+    test('wsPush stores base + per-file adds/dels matching the real computeDiff; >200 KB files get none', async function() {
+        var w = await base(); gh(w);
+        var BIG = new Array(30001).join('line\n'); // 150 KB per copy, > 200 KB below
+        var cases = {
+            'm.js': ['k\nold\nz\n', 'k\nnew1\nnew2\nz\n'],
+            'n.js': [null, 'a\nb\n'],
+            'd.js': ['x\ny\nz\n', null],
+            'big.js': [BIG + BIG, BIG + BIG + 'tail\n']
+        };
+        await w.s.setWorkspaceFile(row('m.js', cases['m.js'][0], { content: cases['m.js'][1], dirty: true, last_modified_by_chat_id: 'c1' }));
+        await w.s.setWorkspaceFile(row('n.js', null, { original_content: null, sha: null, content: cases['n.js'][1], dirty: true, last_modified_by_chat_id: 'c1' }));
+        await w.s.setWorkspaceFile(row('d.js', cases['d.js'][0], { content: '', deleted: true, dirty: true, last_modified_by_chat_id: 'c1' }));
+        await w.s.setWorkspaceFile(row('big.js', cases['big.js'][0], { content: cases['big.js'][1], dirty: true, last_modified_by_chat_id: 'c1' }));
+        var res = await w.m.wsPush(WK, { branch_name: 'feat', commit_message: 'c', pr_title: 'T', files: ['m.js', 'n.js', 'd.js', 'big.js'] }, 'c1', 'C1');
+        assert.strictEqual(res.success, true, JSON.stringify(res).slice(0, 400));
+        var entry = w.metas[WK].prs.filter(function(p) { return p.number === 9; })[0];
+        assert.ok(entry, 'PR entry stored');
+        assert.strictEqual(entry.base, 'main', 'prInfo.base stored');
+        var byPath = {}; (entry.files || []).forEach(function(f) { byPath[f.path] = f; });
+        var ui = await loadModules(['src/js/core/152-line-diff.js', 'src/js/ui/090-version-history.js'], { lenient: true });
+        function real(o, n) { var d = ui.computeDiff(o || '', n || ''); return { adds: d.filter(function(x) { return x.type === 'add'; }).length, dels: d.filter(function(x) { return x.type === 'remove'; }).length }; }
+        assert.deepStrictEqual({ adds: byPath['m.js'].adds, dels: byPath['m.js'].dels }, { adds: 2, dels: 1 }, 'small edit');
+        assert.deepStrictEqual({ adds: byPath['n.js'].adds, dels: byPath['n.js'].dels }, { adds: 2, dels: 0 }, 'new file');
+        assert.deepStrictEqual({ adds: byPath['d.js'].adds, dels: byPath['d.js'].dels }, { adds: 0, dels: 3 }, 'deleted file');
+        ['m.js', 'n.js', 'd.js'].forEach(function(p) {
+            assert.deepStrictEqual({ adds: byPath[p].adds, dels: byPath[p].dels }, real(cases[p][0], cases[p][1]), p + ' matches computeDiff');
+        });
+        assert.ok(byPath['big.js'], 'big file still recorded');
+        assert.ok(!('adds' in byPath['big.js']) && !('dels' in byPath['big.js']), 'no counts over 200 KB');
+        // The counter itself: same as computeDiff on LCS / CRLF inputs; null over the cap.
+        var cnt = w.m._wsPrFileLineCounts;
+        [['a\nb\nc\nd\n', 'a\nc\nb\nd\ne\n'], ['x\r\ny\r\n', 'x\nY\n'], ['', ''], ['same\n', 'same\n']].forEach(function(c) {
+            assert.deepStrictEqual(cnt(c[0], c[1]), real(c[0], c[1]), JSON.stringify(c));
+        });
+        assert.strictEqual(cnt(new Array(w.m.__scope.WS_PR_COUNT_MAX_BYTES + 2).join('x'), ''), null, 'over the cap');
     });
 });
 

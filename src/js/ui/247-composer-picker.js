@@ -326,13 +326,19 @@ function _composerPickerAttachmentEntries(kind) {
     return out;
 }
 
-// Chat-scoped docs are private to their chat (as on the Documents page).
+// Chat-scoped docs are private to their chat lineage (as in the tool).
 function _composerPickerDocEntries(kind) {
     var all = (typeof smartDocuments !== 'undefined' && smartDocuments) ? Object.values(smartDocuments) : [];
     var chatId = _composerPickerChatId(kind);
     return all.filter(function(d) {
         if (!d || !d.id) return false;
-        return d.scope !== 'chat' || (!!chatId && d.ownerChatId === chatId);
+        if (d.scope !== 'chat') return true;
+        if (!chatId) return false;
+        if (d.ownerChatId === chatId) return true;
+        // Same lineage check as the tool (tools/110 _sdocSameLineage): docs
+        // owned by a "Continue" predecessor or a sub-agent on the chain.
+        try { return typeof _sdocSameLineage === 'function' && !!d.ownerChatId && _sdocSameLineage(chatId, d.ownerChatId); }
+        catch (e) { return false; }
     }).map(function(d) {
         var ts = d.updatedAt || d.createdAt || 0;
         return _composerPickerEntry({ type: 'doc', id: d.id, label: d.title || d.id, detail: _composerPickerAgo(ts),

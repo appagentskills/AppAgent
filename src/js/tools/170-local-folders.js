@@ -528,11 +528,11 @@ async function lfGrep(folder, path, pattern, opts) {
 // Registers through the unified registerFile (tools/040-file-store.js) and
 // waits for the IndexedDB write, so the other realm (SW <-> panel) can
 // resolve the file_id as soon as this tool returns.
-async function _lfRegister(pointer) {
+async function _lfRegister(pointer, fixedId) {
     var nid = _lfDeps.newFileId || (typeof newFileId === 'function' ? newFileId : null);
     var reg = _lfDeps.registerFile || (typeof registerFile === 'function' ? registerFile : null);
     if (!nid || !reg) throw _lfErr('File store unavailable', 'NO_FILE_STORE');
-    var id = nid();
+    var id = fixedId || nid();
     reg(id, pointer);
     var ready = _lfDeps.registerFileReady || (typeof registerFileReady === 'function' ? registerFileReady : null);
     if (ready) await ready(id);
@@ -720,6 +720,47 @@ var LF_DATA_URL_MAX_CHARS = 1024 * 1024;
 var LF_DATA_URL_PROGRAMMATIC_MAX_CHARS = 48 * 1024 * 1024;
 var LF_DATA_URL_DIRECT_OVERRIDE_MAX_CHARS = 4 * 1024 * 1024;
 function lfIsProgrammaticCaller(options) { return !!(options && (options.fromSandbox || options.fromWidget)); }
+function lfIsVirtualFolderRef(ref) {
+    return ref == null || ref === '' || ref === LOCAL_FOLDER_VIRTUAL_ID || (typeof ref === 'string' && ref.toLowerCase() === LOCAL_FOLDER_VIRTUAL_LABEL.toLowerCase());
+}
+// SHARE: an Agent Files file -> a folder-pointer file_id + get_file's download
+// card (tools/040-file-store.js executeGetFile download mode), so the user gets
+// a Download button in chat. card:false returns the link fields only.
+// file-download.html resolves the pointer straight from OPFS.
+// Stable file_id per Agent Files path (same /file_\d+_\d+/ shape as newFileId,
+// which can never produce it: its 2nd part is a 13-digit Date.now()). Re-sharing
+// / re-writing a path overwrites ONE folder pointer record instead of adding a
+// new one per write (folder records are never evicted by fileStoreCleanup).
+function lfShareFileId(folder, path) {
+    var s = String(folder) + '/' + String(path), h1 = 0x811c9dc5, h2 = 0x01000193;
+    for (var i = 0; i < s.length; i++) {
+        var c = s.charCodeAt(i);
+        h1 = Math.imul(h1 ^ c, 0x01000193) >>> 0;
+        h2 = Math.imul(h2 + c, 0x5bd1e995) >>> 0; h2 = (h2 ^ (h2 >>> 15)) >>> 0;
+    }
+    return 'file_' + h1 + '_' + h2;
+}
+async function lfShareFile(folder, path, opts) {
+    opts = opts || {};
+    if (!lfIsVirtualFolderRef(folder)) throw _lfErr('share only works for Agent Files (folder "virtual"). Copy the file first: write {path, source:{folder, path}}.', 'NOT_VIRTUAL');
+    var st = await lfStatFile(LOCAL_FOLDER_VIRTUAL_ID, path, 32);
+    var id = await _lfRegister({ kind: 'folder', type: 'folder', folder: st.folder, path: st.path, name: st.name, size: st.size, mime: st.mime, lastModified: st.lastModified }, lfShareFileId(st.folder, st.path));
+    var out = { file_id: id, name: st.name, mime: st.mime, size: st.size };
+    var share = _lfDeps.shareFile || (typeof executeGetFile === 'function' ? executeGetFile : null);
+    if (opts.card !== false && share) {
+        // A failed card never loses the file_id / download_url below.
+        var r = null;
+        try { r = await share({ id: id, download: true }, null, { meta: { name: st.name, mime: st.mime, size: st.size } }); }
+        catch (e) { r = { success: false, error: (e && e.message) || String(e) }; }
+        if (r && r.success) { out.download_url = r.download_url; if (r.widgetId) out.widgetId = r.widgetId; }
+        else out.share_error = (r && r.error) || 'download card unavailable';
+    }
+    if (!out.download_url) {
+        var u = 'file-download.html?id=' + encodeURIComponent(id) + '&name=' + encodeURIComponent(st.name);
+        out.download_url = (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.getURL) ? chrome.runtime.getURL(u) : u;
+    }
+    return out;
+}
 function lfDataUrlCharLimit(args, options) {
     var prog = lfIsProgrammaticCaller(options);
     var ceiling = prog ? LF_DATA_URL_PROGRAMMATIC_MAX_CHARS : LF_DATA_URL_DIRECT_OVERRIDE_MAX_CHARS;
@@ -737,6 +778,7 @@ async function executeLocalFolder(args, options) {
         if (action === 'grep') return Object.assign({ success: true }, await lfGrep(args.folder, args.path, args.pattern, { ignore_case: args.ignore_case, limit: args.limit }));
         if (action === 'mkdir') { await lfMkdir(args.folder, args.path); return { success: true, path: lfNormalizePath(args.path) }; }
         if (action === 'delete') { await lfDeleteEntry(args.folder, args.path, !!args.recursive); return { success: true, deleted: lfNormalizePath(args.path) }; }
+        if (action === 'share') return Object.assign({ success: true, folder: LOCAL_FOLDER_VIRTUAL_ID, path: lfNormalizePath(args.path) }, await lfShareFile(args.folder, args.path));
         if (action === 'read') {
             var wantB64 = args.encoding === 'base64';
             var st = await lfStatFile(args.folder, args.path);
@@ -786,9 +828,18 @@ async function executeLocalFolder(args, options) {
             var src = args.source || null;
             var bin = await lfResolveBinaryInput({ file_id: args.file_id, source: src, base64: args.base64, content: args.content }, options);
             var w = await lfWriteFileBytes(args.folder, args.path, bin.bytes, { append: !!args.append });
-            return Object.assign({ success: true }, w);
+            var wout = Object.assign({ success: true }, w);
+            // Agent Files writes come with a download link; direct tool calls
+            // also render the Download card (share:false opts out, share:true
+            // opts js_eval/widget callers in). A failed share never fails the write.
+            if (lfIsVirtualFolderRef(args.folder) && args.share !== false) {
+                var card = args.share === true || !lfIsProgrammaticCaller(options);
+                try { Object.assign(wout, await lfShareFile(args.folder, w.path, { card: card }), { size: w.size }); }
+                catch (se) { wout.share_error = (se && se.message) || String(se); }
+            }
+            return wout;
         }
-        return { success: false, error: 'Unknown action "' + action + '". Use list, ls, read, grep, write, mkdir, delete or request.' };
+        return { success: false, error: 'Unknown action "' + action + '". Use list, ls, read, grep, write, mkdir, delete, share or request.' };
     } catch (e) {
         var msg = (e && e.message) || String(e);
         if (lfShouldRouteToPanel(e, { inServiceWorker: lfInServiceWorker(), action: action, alreadyRouted: !!args._lf_panel_fallback })) {

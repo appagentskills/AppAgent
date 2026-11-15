@@ -60,6 +60,9 @@
   "No changes tracked yet": "尚未追蹤到任何變更",
   "Message input": "訊息輸入框",
   "Continue in a new chat": "在新對話中繼續",
+  "Continued: ": "續: ",
+  "Sub-agent chats can't be continued in a new chat": "子代理聊天無法在新聊天中繼續",
+  "This chat was already continued in a new chat": "此聊天已在新聊天中繼續",
   "Summarize and start new chat": "摘要並開始新對話",
   "Pause or resume": "暫停或繼續",
   "Continue": "繼續",
@@ -275,6 +278,7 @@
   "Read Version": "讀取版本",
   "Delete Document": "刪除文件",
   "List Instances": "列出執行個體",
+  "Connect Instance": "連線執行個體",
   "Fetch URL": "擷取 URL",
   "Web Search": "網頁搜尋",
   "Build Extension": "建置擴充功能",
@@ -1923,5 +1927,12 @@
   "No edited skills": "沒有已編輯的技能",
   "Resize sidebar": "調整側邊欄大小",
   "Resize split view": "調整分割檢視大小",
-  "Drag to resize · double-click to reset": "拖曳以調整大小 · 按兩下以重設"
+  "Drag to resize · double-click to reset": "拖曳以調整大小 · 按兩下以重設",
+  "Chat was continued": "對話已延續",
+  "Continued from": "延續自",
+  "Continued in": "延續至",
+  "Go to the new chat": "前往新對話",
+  "Send here anyway": "仍要在此傳送",
+  "This chat continues in \"{title}\". Workers, PRs and widgets now live there.": "此對話已在「{title}」中延續。工作者、PR 和小工具現在都在那裡。",
+  "deleted chat": "已刪除的對話"
 }

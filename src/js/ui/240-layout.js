@@ -560,9 +560,14 @@ function updateContextIndicator() {
     // Past CONTEXT_CONTINUE_THRESHOLD % the icon-only ring grows into a labeled
     // "Continue in a new chat" pill (same click/Enter/Space handler →
     // summarizeAndStartNewChat). At or below it: ring only, as before.
-    var showContinue = percentage > CONTEXT_CONTINUE_THRESHOLD;
+    // Gate (ui/170 continueChatBlockReason): a worker chat never offers the
+    // pill (ring only; summarizeAndStartNewChat refuses), and an already
+    // continued chat offers "Go to the new chat" (the click jumps to the
+    // lineage head) instead of forking the lineage.
+    var continueBlock = (typeof continueChatBlockReason === 'function') ? continueChatBlockReason(chat, currentChatId) : null;
+    var showContinue = percentage > CONTEXT_CONTINUE_THRESHOLD && continueBlock !== 'subagent';
     var label = document.getElementById('context-label');
-    var continueText = t('Continue in a new chat');
+    var continueText = continueBlock === 'continued' ? t('Go to the new chat') : t('Continue in a new chat');
     if (showContinue) indicator.classList.add('continue-cta');
     if (label) {
         label.textContent = showContinue ? continueText : '';

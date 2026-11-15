@@ -234,15 +234,18 @@ test('TA-9: continue-from-summary resets a stale composer hint (A6A3-02)', async
         pushFocusChatToOffscreen: noop, saveChatsToStorage: noop, clearUpdateSet: noop, renderChatList: noop,
         renderMessages: noop, renderVersionSidebar: noop, updateChatTitleHeader: noop, renderWorkersStrip: noop,
         setChatPausedPersistent: noop, pushPauseToggleToOffscreen: noop, syncPauseButtonUI: noop,
-        runAgent: function() { return Promise.resolve(); }
+        runAgent: function() { return Promise.resolve(); },
+        // Chat lineage (#1327): the continuation pushes both chat skeletons to the SW.
+        _pushChatSkeletonToSW: noop
     };
     // Handoff helpers the excerpt calls (seed builder + summary extraction).
     var helpers = (/\nvar HANDOFF_USER_MSG_VERBATIM_MAX = \d+;\nvar HANDOFF_USER_MSG_HEAD = \d+;/.exec(src) || [''])[0] + '\n' +
         ['extractHandoffSummary', '_isTypedUserMessage', 'buildHandoffUserMessages', 'buildContinuationSeed']
             .map(function(n) { return dclDeclaration(src, 'function ' + n); }).join('\n');
     var fn = new Function('env', 'with (env) {\n' + dclI18n(all) + '\n' + helpers + '\n' + dclDeclaration(src, 'function resetComposerPlaceholder') + '\n' +
-        dclDeclaration(src, 'function completeSummaryAndCreateNewChat') + '\nreturn completeSummaryAndCreateNewChat;\n}')(env);
-    fn();
+        dclDeclaration(src, 'async function completeSummaryAndCreateNewChat') + '\nreturn completeSummaryAndCreateNewChat;\n}')(env);
+    // #1327 made it async (handover block + SW lineage migration are awaited).
+    await fn();
     await Promise.resolve();
     assert.strictEqual(env.currentChatId, 'N', 'did not switch to the continued chat');
     assert.strictEqual(input.placeholder, 'Send a message...', 'stale composer hint survived: ' + input.placeholder);

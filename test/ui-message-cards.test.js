@@ -11,7 +11,7 @@ var FILES = ['src/js/core/055-emoji-shortcodes.js', 'src/js/core/060-ui-constant
 var CSS = ['src/css/00-tokens.css', 'src/css/03-chat.css', 'src/css/05-tools.css'];
 // typeof-probed (lenient) globals renderMessages/formatContent touch; anything
 // else unstubbed fails loadUi/assertUnstubbed.
-var ALLOW = ['smartDocuments', '_isChatInSilentHook', 'currentEditingWidget', 'getDisplayHtmlForMessage', 'isChatRunning', 'AgentEvents', 'updateScrollToBottomButton'];
+var ALLOW = ['smartDocuments', '_isChatInSilentHook', 'currentEditingWidget', 'getDisplayHtmlForMessage', 'isChatRunning', 'AgentEvents', 'updateScrollToBottomButton', 'renderLineageBanner'];
 var HOSTILE = '<img src=x onerror="window.__pwn=1"><script>window.__pwn=2</script>';
 
 function noop() { return ''; }

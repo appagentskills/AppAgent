@@ -1588,10 +1588,264 @@ async function snGetTokenForInstance(instanceUrl, opts) {
         : 'No open tab for ' + instanceUrl };
 }
 
+// --- connect_instance: log in with credentials the user/skill supplied ---
+// SECURITY: credentials are NEVER persisted. The password lives only in this
+// call's arguments; nothing below writes it to chrome.storage, logs it, or keeps
+// it after the call returns. Lockout guard: consecutive bad_credentials per
+// origin+username (NO password, NO hash of it) in chrome.storage.session (survives
+// SW unloads, cleared with the browser session; in-memory fallback when the
+// session area is unavailable). 2 consecutive failures pause that user for
+// 10 min; a success resets the counter.
+var _snAutoLoginInflight = {};   // origin|username -> pending Promise (single-flight)
+var _snAutoLoginOriginTail = {}; // origin -> last queued run (different users wait their turn)
+var _snAutoLoginFailsMem = {};   // fallback when chrome.storage.session is unavailable
+var SN_AUTO_LOGIN_PAUSE_MS = 10 * 60 * 1000;
+var SN_AUTO_LOGIN_MAX_FAILS = 2;
+var SN_AUTO_LOGIN_FAILS_KEY = 'snAutoLoginFails';
+var _snAutoLoginFailsTail = null; // serializes snAutoLoginFailState read-modify-writes
+
+function snAutoLoginId(origin, username) {
+    return String(origin) + '|' + String(username || '').toLowerCase();
+}
+
+// Read (update omitted) or update the { count, until } failure entry for id.
+// update(cur) returns the next entry, or null to delete it.
+// All calls run one at a time (one promise chain): the whole fails object is
+// read-modify-written, so concurrent logins on different origins / users
+// would otherwise lose each other's counts.
+function snAutoLoginFailState(id, update) {
+    var run = async function() {
+    var area = null, all = null;
+    try { area = (chrome.storage && chrome.storage.session) || null; } catch (e) { area = null; }
+    if (area) {
+        try { var d = await area.get(SN_AUTO_LOGIN_FAILS_KEY); all = (d && d[SN_AUTO_LOGIN_FAILS_KEY]) || {}; } catch (e) { area = null; }
+    }
+    if (!area) all = _snAutoLoginFailsMem;
+    var cur = all[id] || null;
+    if (!update) return cur;
+    var next = update(cur);
+    if (next) all[id] = next; else delete all[id];
+    if (area) {
+        var o = {}; o[SN_AUTO_LOGIN_FAILS_KEY] = all;
+        try { await area.set(o); } catch (e) { _snAutoLoginFailsMem = all; }
+    }
+    return next;
+    };
+    var p = (_snAutoLoginFailsTail || Promise.resolve()).then(run, run);
+    _snAutoLoginFailsTail = p.catch(function() {});
+    return p;
+}
+
+// Runs IN the login tab (isolated world): fill + submit the classic login form.
+function snLoginFillAndSubmit(username, password) {
+    try {
+        var u = document.getElementById('user_name');
+        var p = document.getElementById('user_password');
+        if (!u || !p) return { submitted: false, noForm: true, path: location.pathname };
+        var set = function(el, v) {
+            el.focus(); el.value = v;
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+        };
+        set(u, username); set(p, password);
+        var btn = document.getElementById('sysverb_login');
+        if (btn) { btn.click(); return { submitted: true, via: 'click' }; }
+        var form = p.form || document.querySelector('form');
+        if (form) { form.submit(); return { submitted: true, via: 'submit' }; }
+        return { submitted: false, noForm: true, path: location.pathname };
+    } catch (e) { return { submitted: false, error: String(e && e.message || e) }; }
+}
+
+// Runs IN the login tab (MAIN world): report session / MFA / error state.
+function snLoginProbeState() {
+    var errEl = document.querySelector('.outputmsg_error, .notification-error, #output_messages .outputmsg_text');
+    var errText = errEl ? (errEl.textContent || '').trim() : '';
+    if (!errText && /user name or password invalid|invalid (user ?name|password)/i.test((document.body && document.body.innerText) || '')) errText = 'User name or password invalid';
+    return {
+        token: window.g_ck || '',
+        userName: (window.NOW && window.NOW.user_name) || '',
+        path: location.pathname,
+        hasLoginForm: !!document.getElementById('user_password'),
+        mfa: /multifactor|mfa/i.test(location.pathname) || !!document.querySelector('#txtResponse, input[name="txtResponse"], input[name="mfa_code"], #validate_multifactor_auth_code'),
+        pwChange: /change_?password|password_?change|pwd_?(reset|change)|password_?reset|expired/i.test(location.pathname) ||
+            !!document.querySelector('#new_password, input[name="new_password"], #user_password_new, input[name="user_password_new"], #confirm_password'),
+        // Page-load time: a login error is only trusted from a page loaded AFTER submit.
+        navStart: Math.round((performance && (performance.timeOrigin || (performance.timing && performance.timing.navigationStart))) || 0),
+        errText: errText.slice(0, 200)
+    };
+}
+
+// Positive post-login evidence: a session token on a page that is not the
+// login form, an MFA step or a password-change step.
+function snLoginLooksSignedIn(st) {
+    if (!st || !st.token || st.hasLoginForm || st.mfa || st.pwChange) return false;
+    return !/(^|\/)(login|login_redirect|logout|welcome)\.do$|multifactor|mfa|password|pwd_/i.test(st.path || '');
+}
+
+function snAutoLoginSleep(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
+
+// Log into `origin` with { username, password } in a background tab (an open tab
+// of that origin is reused ONLY when it already sits on login.do — a user tab is
+// never navigated away). Returns { success, instance, userName, tabId } or
+// { success:false, reason: bad_credentials|paused|mfa_required|password_change_required|sso_redirect|timeout|..., error }.
+// Never returns or stores the password.
+async function snAutoLogin(origin, creds, opts) {
+    opts = opts || {};
+    creds = creds || {};
+    var username = String(creds.username || '');
+    var password = String(creds.password || '');
+    if (!/^https:\/\/[^\/]+$/.test(origin || '')) return { success: false, reason: 'invalid_instance', error: 'Instance must be an https origin, got: ' + origin };
+    if (!username || !password) return { success: false, reason: 'missing_credentials', error: 'username and password are required' };
+    var id = snAutoLoginId(origin, username);
+    if (_snAutoLoginInflight[id]) return _snAutoLoginInflight[id];
+    var fs = null;
+    try { fs = await snAutoLoginFailState(id); } catch (e) { fs = null; }
+    if (_snAutoLoginInflight[id]) return _snAutoLoginInflight[id];
+    if (fs && fs.until) {
+        if (fs.until > Date.now()) {
+            return { success: false, reason: 'paused', error: 'Login for "' + username + '" was rejected by ' + origin + ' ' + (fs.count || SN_AUTO_LOGIN_MAX_FAILS) + ' times in a row; not retrying for ' + Math.ceil((fs.until - Date.now()) / 60000) + ' more minute(s) to avoid an account lockout. Ask the user to confirm the username/password.' };
+        }
+        try { await snAutoLoginFailState(id, function() { return null; }); } catch (e) {}   // pause over: fresh start
+        // A concurrent call may have started the run during that await.
+        if (_snAutoLoginInflight[id]) return _snAutoLoginInflight[id];
+    }
+    // Single-flight per origin+username; a different user on the same origin
+    // waits for the running login, then runs.
+    var prev = _snAutoLoginOriginTail[origin] || Promise.resolve();
+    var p = prev.catch(function() {}).then(function() { return snAutoLoginRun(origin, username, password, id, opts); });
+    _snAutoLoginInflight[id] = p;
+    _snAutoLoginOriginTail[origin] = p;
+    try { return await p; } finally {
+        if (_snAutoLoginInflight[id] === p) delete _snAutoLoginInflight[id];
+        if (_snAutoLoginOriginTail[origin] === p) delete _snAutoLoginOriginTail[origin];
+    }
+}
+
+async function snAutoLoginRun(origin, username, password, id, opts) {
+    var pollMs = opts.pollMs || 1000;
+    var timeoutMs = opts.timeoutMs || 30000;
+    // Already connected? Don't log in again.
+    try {
+        var have = await snGetTokenForInstance(origin, { validate: true });
+        if (have && have.token) {
+            await snAutoLoginActivate(origin, have.token, have.userName);
+            var already = { success: true, alreadyConnected: true, instance: origin, userName: have.userName || '', tabId: have.tabId || null };
+            if (have.userName && String(have.userName).toLowerCase() !== username.toLowerCase()) {
+                already.userMismatch = true;
+                already.note = 'The browser already has a session on ' + origin + ' as "' + have.userName + '" (not "' + username + '"); no new login was attempted. Ask the user to sign out first if a different user is needed.';
+            }
+            return already;
+        }
+    } catch (e) {}
+
+    // Reuse a tab of this origin ONLY if it already shows login.do (never
+    // navigate a user's working tab away); otherwise open a background tab.
+    var loginUrl = origin + '/login.do';
+    var tabId = null, opened = false;
+    var all = await chrome.tabs.query({});
+    for (var i = 0; i < all.length; i++) {
+        try {
+            var u = new URL(all[i].url);
+            if (u.origin === origin && /^\/login\.do$/i.test(u.pathname)) { tabId = all[i].id; break; }
+        } catch (e) {}
+    }
+    if (tabId == null) { var t = await chrome.tabs.create({ url: loginUrl, active: false }); tabId = t.id; opened = true; }
+
+    var fail = async function(reason, error) {
+        if (reason === 'bad_credentials') {
+            try {
+                await snAutoLoginFailState(id, function(cur) {
+                    var count = ((cur && cur.count) || 0) + 1;
+                    return { count: count, until: count >= SN_AUTO_LOGIN_MAX_FAILS ? Date.now() + SN_AUTO_LOGIN_PAUSE_MS : 0 };
+                });
+            } catch (e) {}
+        }
+        // Close only a tab this call opened; never a tab the user already had.
+        if (opened) { try { await chrome.tabs.remove(tabId); } catch (e) {} }
+        return { success: false, reason: reason, instance: origin, error: error };
+    };
+
+    var deadline = Date.now() + timeoutMs;
+    var submitted = false;
+    var submitAt = 0;
+    while (Date.now() < deadline) {
+        await snAutoLoginSleep(pollMs);
+        var tab = null;
+        try { tab = await chrome.tabs.get(tabId); } catch (e) { return { success: false, reason: 'tab_closed', instance: origin, error: 'The login tab was closed.' }; }
+        var tabOrigin = '';
+        try { tabOrigin = new URL(tab.url || tab.pendingUrl || '').origin; } catch (e) {}
+        if (tabOrigin && tabOrigin !== origin) return fail('sso_redirect', origin + ' redirected to ' + tabOrigin + ' (SSO). Credential login is not possible; ask the user to sign in in the browser.');
+        if (tab.status !== 'complete') continue;
+        var st = null;
+        try {
+            var r = await chrome.scripting.executeScript({ target: { tabId: tabId }, world: 'MAIN', func: snLoginProbeState });
+            st = r && r[0] && r[0].result;
+        } catch (e) { continue; }
+        if (!st) continue;
+        // MFA / password-change BEFORE any success check: both pages can carry g_ck.
+        if (st.mfa) return fail('mfa_required', origin + ' requires multi-factor authentication; ask the user to complete the sign-in in the browser.');
+        if (st.pwChange) return fail('password_change_required', origin + ' requires a password change for this user; ask the user to complete it in the browser.');
+        // A login error counts only from a page loaded after our submit (a
+        // stale message from an earlier attempt is ignored).
+        if (submitted && st.errText && st.navStart && st.navStart > submitAt) {
+            return fail('bad_credentials', 'Login rejected by ' + origin + ': ' + st.errText);
+        }
+        if (snLoginLooksSignedIn(st)) {
+            try { await snAutoLoginFailState(id, function() { return null; }); } catch (e) {}   // success resets the counter
+            await snRememberInstanceToken(origin, st.token, st.userName || username);
+            await snAutoLoginActivate(origin, st.token, st.userName || username);
+            return { success: true, instance: origin, userName: st.userName || username, tabId: tabId };
+        }
+        if (!submitted && st.hasLoginForm) {
+            try {
+                var submitTs = Date.now();
+                var s = await chrome.scripting.executeScript({ target: { tabId: tabId }, func: snLoginFillAndSubmit, args: [username, password] });
+                var sr = s && s[0] && s[0].result;
+                if (sr && sr.submitted) { submitted = true; submitAt = submitTs; }
+            } catch (e) {}
+        }
+    }
+    return fail('timeout', 'No session on ' + origin + ' after ' + Math.round(timeoutMs / 1000) + 's (login page ' + (submitted ? 'submitted' : 'never showed a login form') + ').');
+}
+
+// Make `origin` the active instance only when none is active yet.
+function snAutoLoginActivate(origin, token, userName) {
+    return new Promise(function(resolve) {
+        chrome.storage.local.get('instanceUrl', function(d) {
+            if (d && d.instanceUrl) return resolve(false);
+            snSetActiveInstance(origin, token, userName, function() { resolve(true); });
+        });
+    });
+}
+
+// Persist the active instance + its session (single write site shared by the
+// switch-sn-instance handler and connect_instance).
+function snSetActiveInstance(instanceUrl, token, userName, cb) {
+    // Read the currently-active instance so we can tell a real cross-instance
+    // switch from re-selecting the same one.
+    chrome.storage.local.get('instanceUrl', function(cur) {
+        var updates = { instanceUrl: instanceUrl };
+        if (token) updates.sessionToken = token;
+        if (userName) updates.userName = userName;
+        // Switching to a DIFFERENT instance but no token resolved (e.g. logged out
+        // mid-switch): drop the previous instance's cached session so tools never
+        // send instance A's g_ck to instance B. A same-instance transient read
+        // failure keeps the existing token (defensive — avoids killing a live
+        // session over one bad probe).
+        if (!token && cur && cur.instanceUrl && cur.instanceUrl !== instanceUrl) {
+            updates.sessionToken = '';
+            updates.userName = '';
+        }
+        chrome.storage.local.set(updates);
+        if (cb) cb();
+    });
+}
+
 // Exposed on `self` so the SW Platform stub (which runs first via importScripts)
 // can lazy-reference them at call time.
 self.snGetInstancesDetailed = snGetInstancesDetailed;
 self.snGetTokenForInstance = snGetTokenForInstance;
+self.snAutoLogin = snAutoLogin;
 
 // --- Notifications ---
 
@@ -1919,6 +2173,13 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
         // Every browser action except 'close' needs an explicit target tab. There is
         // deliberately NO fallback to the active tab (it silently hijacked whatever
         // tab the user happened to be looking at).
+        // 'restore_fast_tabs' ends a take_screenshot fast burst whose target
+        // tab is gone (no target tab needed).
+        if (message.action === 'restore_fast_tabs') {
+            _ssRestoreFastTabs().then(function(ids) { sendResponse({ success: true, restored_tab_ids: ids }); },
+                function(e) { sendResponse({ error: (e && e.message) || String(e) }); });
+            return true;
+        }
         if (message.action !== 'close' && !(typeof message.targetTabId === 'number' && isFinite(message.targetTabId))
             && !(message.action === 'navigate' && message.targetTabId === 'new')) {
             sendResponse({ error: BROWSER_ACTION_TAB_REQUIRED_ERROR });
@@ -1930,7 +2191,7 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
         }
 
         if (message.action === 'take_screenshot') {
-            handleScreenshot(message.targetTabId, sendResponse);
+            handleScreenshot(message.targetTabId, sendResponse, message.args || {});
             return true;
         }
 
@@ -2086,22 +2347,7 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
         // a tab is open and readable, else the cached heartbeat token — so a tab-less but
         // still-connected instance can be selected without forcing open a new tab.
         var _finishSwitch = function(token, userName) {
-            // Read the currently-active instance so we can tell a real cross-instance
-            // switch from re-selecting the same one.
-            chrome.storage.local.get('instanceUrl', function(cur) {
-                var updates = { instanceUrl: message.instanceUrl };
-                if (token) updates.sessionToken = token;
-                if (userName) updates.userName = userName;
-                // Switching to a DIFFERENT instance but no token resolved (e.g. logged out
-                // mid-switch): drop the previous instance's cached session so tools never
-                // send instance A's g_ck to instance B. A same-instance transient read
-                // failure keeps the existing token (defensive — avoids killing a live
-                // session over one bad probe).
-                if (!token && cur && cur.instanceUrl && cur.instanceUrl !== message.instanceUrl) {
-                    updates.sessionToken = '';
-                    updates.userName = '';
-                }
-                chrome.storage.local.set(updates);
+            snSetActiveInstance(message.instanceUrl, token, userName, function() {
                 sendResponse({ success: true, token: token || '' });
             });
         };
@@ -2531,7 +2777,204 @@ async function injectAgentScripts(tabId) {
     await injectInterceptors(tabId);
 }
 
-async function handleScreenshot(targetTabId, sendResponse) {
+// take_screenshot fast mode state (args.fast). A fast capture of a
+// background tab activates it and does NOT switch back, so a burst of
+// captures pays the tab switch once. The tab that was active BEFORE the first
+// fast switch in each window is remembered here (first switch wins, so a burst
+// across several tabs still returns to the user's original tab) until a call
+// with args.restore_tab hands it back. In-memory only: lost if the service
+// worker is torn down mid-burst (then restore_tab is a no-op).
+var _ssFastPrevActiveByWindow = {};
+var _ssLastCaptureAt = 0;
+// Chrome allows ~2 captureVisibleTab calls/s (MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND);
+// fast mode spaces captures by this much instead of failing on the quota.
+var SS_FAST_MIN_INTERVAL_MS = 510;
+// Fast captures are JPEG (not PNG): Chrome encodes a DPR-2 viewport as JPEG
+// several times faster, the data URL shipped to the page is ~5-10x smaller,
+// and the page-side fast post-process (_ssFastPostProcess in
+// 060-take-screenshot.js) can return it untouched when no resize is needed.
+// High-ish quality because a downscaled capture is re-encoded once more.
+var SS_FAST_CAPTURE_JPEG_QUALITY = 85;
+
+// Every captureVisibleTab call (fast AND default path) goes through
+// _ssCaptureVisible: calls are serialized on _ssCaptureTail so concurrent
+// screenshots cannot both pass the interval check, _ssLastCaptureAt is
+// updated on every path, and a MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND quota
+// error is retried once after the interval. Each captureVisibleTab is raced
+// against SS_CAPTURE_TIMEOUT_MS so a hung capture rejects instead of blocking
+// _ssCaptureTail (and every later screenshot) forever. preCapture (optional)
+// runs inside the serialized section, before the interval wait — e.g. the
+// default path's window focus, so it cannot interleave with another capture.
+var SS_CAPTURE_TIMEOUT_MS = 10000;
+var _ssCaptureTail = Promise.resolve();
+function _ssCaptureWithTimeout(windowId, captureOpts) {
+    var _timer = null;
+    var _timeout = new Promise(function(_res, rej) {
+        _timer = setTimeout(function() { rej(new Error('captureVisibleTab timed out after ' + SS_CAPTURE_TIMEOUT_MS + ' ms')); }, SS_CAPTURE_TIMEOUT_MS);
+    });
+    return Promise.race([chrome.tabs.captureVisibleTab(windowId, captureOpts), _timeout])
+        .finally(function() { clearTimeout(_timer); });
+}
+function _ssIsCaptureQuotaError(e) {
+    return /MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND/i.test((e && e.message) || String(e));
+}
+function _ssCaptureVisible(windowId, captureOpts, preCapture) {
+    var _run = _ssCaptureTail.then(async function() {
+        if (typeof preCapture === 'function') { try { await preCapture(); } catch (e) {} }
+        for (var _attempt = 0; ; _attempt++) {
+            var _wait = SS_FAST_MIN_INTERVAL_MS - (Date.now() - _ssLastCaptureAt);
+            if (_wait > 0) await new Promise(function(r) { setTimeout(r, _wait); });
+            try {
+                return await _ssCaptureWithTimeout(windowId, captureOpts);
+            } catch (e) {
+                if (_attempt === 0 && _ssIsCaptureQuotaError(e)) continue;
+                throw e;
+            } finally {
+                _ssLastCaptureAt = Date.now();
+            }
+        }
+    });
+    _ssCaptureTail = _run.catch(function() {});
+    return _run;
+}
+
+async function _ssFastCapture(windowId) {
+    return _ssCaptureVisible(windowId, { format: 'jpeg', quality: SS_FAST_CAPTURE_JPEG_QUALITY });
+}
+
+// m2: per-window screenshot lock. _ssCaptureVisible only serializes the
+// captureVisibleTab call itself; the activate -> (un-minimize/focus) ->
+// capture -> restore sequence of two concurrent screenshots of DIFFERENT tabs
+// in the SAME window could interleave (A activates, B activates, A captures
+// B's page). Each handler run holds its window's lock for the whole sequence.
+// The lock is a promise chain per windowId: released when the run settles
+// (resolve OR reject), entry deleted when no run is queued behind it.
+// Every step inside is bounded (capture timeout, activation fallbacks).
+var _ssWindowLocks = {};
+function _ssWithWindowLock(windowId, fn) {
+    var _key = String(windowId);
+    var _prev = _ssWindowLocks[_key] || Promise.resolve();
+    var _run = _prev.then(function() { return fn(); });
+    var _tail = _run.then(function() {}, function() {});
+    _ssWindowLocks[_key] = _tail;
+    _tail.then(function() { if (_ssWindowLocks[_key] === _tail) delete _ssWindowLocks[_key]; });
+    return _run;
+}
+
+// m2 guard: after a capture, if the window's active tab is no longer the
+// target (e.g. the user or a non-screenshot caller switched tabs), re-activate
+// the target and capture once more. Lookup failures keep the first capture.
+async function _ssRecaptureIfNotActive(windowId, targetTabId, dataUrl, capture) {
+    try {
+        var _a = await chrome.tabs.query({ active: true, windowId: windowId });
+        if (!_a || !_a[0] || _a[0].id === targetTabId) return dataUrl;
+        await chrome.tabs.update(targetTabId, { active: true });
+    } catch (e) { return dataUrl; }
+    return await capture();
+}
+
+async function _ssRestoreFastTabs() {
+    var _restored = [];
+    var _wins = Object.keys(_ssFastPrevActiveByWindow);
+    for (var _i = 0; _i < _wins.length; _i++) {
+        var _prevTabId = _ssFastPrevActiveByWindow[_wins[_i]];
+        delete _ssFastPrevActiveByWindow[_wins[_i]];
+        if (_prevTabId == null) continue;
+        try {
+            await chrome.tabs.update(_prevTabId, { active: true });
+            _restored.push(_prevTabId);
+        } catch (e) { /* original tab may have been closed */ }
+    }
+    return _restored;
+}
+
+// Fast path (args.fast): no focus juggling, no fixed settle delays, no
+// switch-back. Already-active target -> captureVisibleTab directly.
+async function _handleScreenshotFast(targetTabId, sendResponse, opts) {
+    var _t0 = Date.now(), _tCap0 = 0, _tCap1 = 0;
+    var targetTab;
+    try {
+        targetTab = await chrome.tabs.get(targetTabId);
+    } catch (e) {
+        // restore_tab must still hand the user's tab back when the target
+        // tab is gone (e.g. closed at the end of a recording burst).
+        var _restoredGone = opts.restore_tab ? await _ssRestoreFastTabs() : undefined;
+        sendResponse({ error: 'tab_id ' + targetTabId + ' is not an open tab (it may have been closed). Get a current id from list_instances (instances[].activeTabs[].id, otherTabs[].id, selfTabId for the agent\'s own tab).', restored_tab_ids: _restoredGone });
+        return;
+    }
+    var windowId = targetTab.windowId;
+    var switched = false;
+    try {
+        // A minimized window cannot be captured (captureVisibleTab throws):
+        // restore it first. Only touches the window when it is minimized.
+        try {
+            var _win = await chrome.windows.get(windowId);
+            if (_win && _win.state === 'minimized') await chrome.windows.update(windowId, { state: 'normal' });
+        } catch (e) {}
+        if (!targetTab.active) {
+            if (!Object.prototype.hasOwnProperty.call(_ssFastPrevActiveByWindow, windowId)) {
+                try {
+                    var _a = await chrome.tabs.query({ active: true, windowId: windowId });
+                    _ssFastPrevActiveByWindow[windowId] = (_a && _a[0]) ? _a[0].id : null;
+                } catch (e) { _ssFastPrevActiveByWindow[windowId] = null; }
+            }
+            // Wait only for the activation event (bounded), no extra settle delay.
+            var _activated = new Promise(function(resolve) {
+                function listener(activeInfo) {
+                    if (activeInfo.tabId === targetTabId) {
+                        chrome.tabs.onActivated.removeListener(listener);
+                        clearTimeout(fallback);
+                        resolve();
+                    }
+                }
+                chrome.tabs.onActivated.addListener(listener);
+                var fallback = setTimeout(function() {
+                    chrome.tabs.onActivated.removeListener(listener);
+                    resolve();
+                }, 300);
+            });
+            await chrome.tabs.update(targetTabId, { active: true });
+            await _activated;
+            switched = true;
+        }
+        var dataUrl;
+        _tCap0 = Date.now();
+        try {
+            dataUrl = await _ssFastCapture(windowId);
+        } catch (capErr) {
+            var _capMsg = (capErr && capErr.message) || String(capErr);
+            // Cold-start activeTab grant: focusing the window is only done when required.
+            if (!/activeTab|not in effect/i.test(_capMsg)) throw capErr;
+            try { await chrome.windows.update(windowId, { focused: true }); } catch (e) {}
+            await new Promise(function(r) { setTimeout(r, 150); });
+            dataUrl = await _ssFastCapture(windowId);
+        }
+        dataUrl = await _ssRecaptureIfNotActive(windowId, targetTabId, dataUrl, function() { return _ssFastCapture(windowId); });
+        _tCap1 = Date.now();
+        var restored = opts.restore_tab ? await _ssRestoreFastTabs() : undefined;
+        sendResponse({ success: true, tabId: targetTabId, base64: dataUrl, width: targetTab.width || 1280, height: targetTab.height || 900, url: targetTab.url || '', title: targetTab.title || '', fast: true, switched: switched, restored_tab_ids: restored, bg_ms: Date.now() - _t0, activate_ms: _tCap0 - _t0, capture_ms: _tCap1 - _tCap0 });
+    } catch (e) {
+        var _restoredErr = opts.restore_tab ? await _ssRestoreFastTabs() : undefined;
+        sendResponse({ error: 'Screenshot failed: ' + e.message, restored_tab_ids: _restoredErr });
+    }
+}
+
+async function handleScreenshot(targetTabId, sendResponse, opts) {
+    opts = opts || {};
+    var _isTabId = typeof targetTabId === 'number' && isFinite(targetTabId);
+    var _impl = (opts.fast && _isTabId) ? _handleScreenshotFast : _handleScreenshotDefault;
+    // m2: hold the target window's lock for the whole activate -> capture ->
+    // restore sequence (both paths). Unknown/closed tab: no lock needed, the
+    // handler reports the error itself.
+    var _lockWin = null;
+    if (_isTabId) {
+        try { _lockWin = (await chrome.tabs.get(targetTabId)).windowId; } catch (e) {}
+    }
+    if (_lockWin == null) return _impl(targetTabId, sendResponse, opts);
+    return _ssWithWindowLock(_lockWin, function() { return _impl(targetTabId, sendResponse, opts); });
+}
+
+async function _handleScreenshotDefault(targetTabId, sendResponse, opts) {
     // Remember what had focus BEFORE we activate/focus anything for the
     // capture, so we can hand focus back afterwards (the user's previously
     // active tab in each touched window + the previously focused window).
@@ -2573,7 +3016,9 @@ async function handleScreenshot(targetTabId, sendResponse) {
         // Explicit target tab only (no active-tab fallback). The extension's own
         // tab is a valid target. Ensure it is active and visible before capture.
         if (!(typeof targetTabId === 'number' && isFinite(targetTabId))) {
-            sendResponse({ error: BROWSER_ACTION_TAB_REQUIRED_ERROR });
+            // m3: report restored_tab_ids like the outer catch does.
+            var _restoredNoTab = opts.restore_tab ? await _ssRestoreFastTabs() : undefined;
+            sendResponse({ error: BROWSER_ACTION_TAB_REQUIRED_ERROR, restored_tab_ids: _restoredNoTab });
             return;
         }
         {
@@ -2603,7 +3048,9 @@ async function handleScreenshot(targetTabId, sendResponse) {
                     });
                 }
             } catch(e) {
-                sendResponse({ error: 'tab_id ' + targetTabId + ' is not an open tab (it may have been closed). Get a current id from list_instances (instances[].activeTabs[].id, otherTabs[].id, selfTabId for the agent\'s own tab).' });
+                await _restoreFocus(windowId);
+                var _restoredClosed = opts.restore_tab ? await _ssRestoreFastTabs() : undefined;
+                sendResponse({ error: 'tab_id ' + targetTabId + ' is not an open tab (it may have been closed). Get a current id from list_instances (instances[].activeTabs[].id, otherTabs[].id, selfTabId for the agent\'s own tab).', restored_tab_ids: _restoredClosed });
                 return;
             }
         }
@@ -2615,8 +3062,11 @@ async function handleScreenshot(targetTabId, sendResponse) {
         // the tab and retry once.
         _capWindowId = windowId;
         var _doCapture = async function() {
-            try { if (_capWindowId != null) await chrome.windows.update(_capWindowId, { focused: true }); } catch (e) {}
-            return await chrome.tabs.captureVisibleTab(_capWindowId, { format: 'png' });
+            // Focus runs inside the serialized capture section (preCapture),
+            // so it cannot steal focus from another in-flight capture.
+            return await _ssCaptureVisible(_capWindowId, { format: 'png' }, async function() {
+                if (_capWindowId != null) await chrome.windows.update(_capWindowId, { focused: true });
+            });
         };
         var dataUrl;
         try {
@@ -2635,16 +3085,21 @@ async function handleScreenshot(targetTabId, sendResponse) {
                     }
                 } catch (focusErr) { /* defensive */ }
                 await new Promise(function(r){ setTimeout(r, 150); });
-                dataUrl = await chrome.tabs.captureVisibleTab(_capWindowId, { format: 'png' });
+                dataUrl = await _ssCaptureVisible(_capWindowId, { format: 'png' });
             } else {
                 throw capErr;
             }
         }
+        dataUrl = await _ssRecaptureIfNotActive(_capWindowId, targetTabId, dataUrl, function() { return _ssCaptureVisible(_capWindowId, { format: 'png' }); });
         await _restoreFocus(_capWindowId);
+        // restore_tab without fast: also hand back any tab left switched by an
+        // earlier fast burst (no-op when there was none; default path unchanged).
+        if (opts.restore_tab) await _ssRestoreFastTabs();
         sendResponse({ success: true, tabId: targetTabId, base64: dataUrl, width: tabWidth, height: tabHeight, url: tabUrl, title: tabTitle });
     } catch (e) {
         await _restoreFocus(_capWindowId);
-        sendResponse({ error: 'Screenshot failed: ' + e.message });
+        var _restoredDef = opts.restore_tab ? await _ssRestoreFastTabs() : undefined;
+        sendResponse({ error: 'Screenshot failed: ' + e.message, restored_tab_ids: _restoredDef });
     }
 }
 

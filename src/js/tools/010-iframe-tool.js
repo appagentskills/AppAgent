@@ -972,7 +972,7 @@ async function _executeIframeToolImpl(args, _ifChatId, options, _ifTabId) {
                 if (!widget) return { success: false, error: 'Widget/base version not found: ' + widgetId };
                 var editResult = applySearchReplaceEdits(widget.html, args.edits);
                 if (editResult.error) return { success: false, error: 'Edit failed', validationErrors: editResult.messages };
-                var result = await saveWidgetRevision(widget, editResult.content, args.expected_version, await widgetOperationId(args, options));
+                var result = await saveWidgetRevision(widget, editResult.content, args.expected_version, await widgetOperationId(args, options, { targetId: widgetId, data: Object.assign({}, widget, { html: editResult.content }) }));
                 if (result.success) {
                     result.appliedEdits = editResult.appliedEdits.length;
                     // PER-TURN RENDER: show the edited version at this turn of the
@@ -1196,56 +1196,7 @@ async function _executeIframeToolImpl(args, _ifChatId, options, _ifTabId) {
             case 'impersonate':
                 if (!args.user) return { success: false, error: 'user is required (username, name, sys_id, or "stop")' };
                 try {
-                    var impHeaders = { 'X-UserToken': window.sessionToken, 'Accept': 'application/json' };
-                    if (args.user === 'stop') {
-                        if (!impersonateOriginalUserSysId) {
-                            return { success: false, error: 'No active impersonation to stop (original user sys_id not stored).' };
-                        }
-                        var stopRes = await fetch('/api/now/ui/impersonate/' + impersonateOriginalUserSysId, {
-                            method: 'POST',
-                            headers: Object.assign({ 'Content-Type': 'application/json' }, impHeaders)
-                        });
-                        if (!stopRes.ok) return { success: false, error: 'Failed to stop impersonation: HTTP ' + stopRes.status };
-                        impersonateOriginalUserSysId = null;
-                        appStorage.removeItem('impersonateOriginalUserSysId');
-                        if (typeof _ifTabId === 'number') Platform.sendBrowserAction('reload', {}, _ifTabId);
-                        return { success: true, message: 'Impersonation ended. Switched back to original user. Iframe reloaded.' };
-                    }
-                    // Store original user sys_id before first impersonation
-                    if (!impersonateOriginalUserSysId) {
-                        if (cachedUserSysId) {
-                            impersonateOriginalUserSysId = cachedUserSysId;
-                            appStorage.setItem('impersonateOriginalUserSysId', impersonateOriginalUserSysId);
-                        } else {
-                            var meRes = await fetch('/api/now/table/sys_user?sysparm_query=user_name=' + encodeURIComponent(window.NOW?.user_name || 'admin') + '&sysparm_fields=sys_id&sysparm_limit=1', { headers: impHeaders });
-                            var meData = await meRes.json();
-                            if (meData.result && meData.result[0]) {
-                                impersonateOriginalUserSysId = meData.result[0].sys_id;
-                                appStorage.setItem('impersonateOriginalUserSysId', impersonateOriginalUserSysId);
-                                cachedUserSysId = impersonateOriginalUserSysId;
-                            }
-                        }
-                    }
-                    // Resolve user sys_id
-                    var userSysId = args.user;
-                    if (!/^[0-9a-f]{32}$/.test(args.user)) {
-                        var lookupRes = await fetch('/api/now/table/sys_user?sysparm_query=user_name=' + encodeURIComponent(args.user) + '^ORnameLIKE' + encodeURIComponent(args.user) + '&sysparm_fields=sys_id,user_name,name&sysparm_limit=5', { headers: impHeaders });
-                        var lookupData = await lookupRes.json();
-                        if (!lookupData.result || lookupData.result.length === 0) {
-                            return { success: false, error: 'User not found: ' + args.user };
-                        }
-                        userSysId = lookupData.result[0].sys_id;
-                    }
-                    // Call impersonation API
-                    var impRes = await fetch('/api/now/ui/impersonate/' + userSysId, {
-                        method: 'POST',
-                        headers: Object.assign({ 'Content-Type': 'application/json' }, impHeaders)
-                    });
-                    if (!impRes.ok) {
-                        return { success: false, error: 'Impersonation failed: HTTP ' + impRes.status };
-                    }
-                    if (typeof _ifTabId === 'number') Platform.sendBrowserAction('reload', {}, _ifTabId);
-                    return { success: true, message: 'Now impersonating user (sys_id: ' + userSysId + '). Iframe reloaded.' };
+                    return await runImpersonation(args, _ifTabId);
                 } catch(e) {
                     return { success: false, error: 'Impersonate failed: ' + e.message };
                 }
@@ -1256,4 +1207,273 @@ async function _executeIframeToolImpl(args, _ifChatId, options, _ifTabId) {
     } catch(e) {
         return { success: false, error: e.message };
     }
+}
+
+// --- impersonate ---------------------------------------------------------
+// The impersonation runs against an EXPLICIT instance (args.instance, else the
+// origin of args.tab_id's tab, else the active instance) with that instance's
+// own token and ABSOLUTE urls — relative urls would go through the page fetch
+// shim (platform-bridge.js), which always targets the active instance + token.
+// The real (original) user is kept per instance URL in appStorage and read at
+// call time (never a module variable cached at panel init), so impersonations
+// on several instances and calls routed to another panel stay independent.
+// Stopping = POST /api/now/ui/impersonate/<original sys_id>: ServiceNow has no
+// separate end-impersonation endpoint (the stock UI "unimpersonate" also
+// impersonates back to the real user's sys_id).
+var IMPERSONATE_STATE_KEY = 'impersonateOriginalUsers';   // JSON {instanceUrl: {sys_id, user_name}}
+var IMPERSONATE_LEGACY_KEY = 'impersonateOriginalUserSysId'; // pre per-instance global key
+
+function _impNormUrl(u) { return u ? String(u).replace(/\/+$/, '') : u; }
+
+function _impReadStateMap() {
+    var raw = null;
+    try { raw = appStorage.getItem(IMPERSONATE_STATE_KEY); } catch (e) { raw = null; }
+    if (!raw) return {};
+    try {
+        var parsed = JSON.parse(raw);
+        return (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) ? parsed : {};
+    } catch (e) { return {}; }
+}
+
+// Original (real) user recorded for instanceUrl, or null. The legacy global key
+// was always written against the active instance, so it is only honoured there.
+function getImpersonationOriginal(instanceUrl) {
+    var key = _impNormUrl(instanceUrl);
+    var map = _impReadStateMap();
+    if (map[key] && map[key].sys_id) return map[key];
+    var legacy = null;
+    try { legacy = appStorage.getItem(IMPERSONATE_LEGACY_KEY); } catch (e) { legacy = null; }
+    if (legacy && key && key === _impNormUrl(Platform.instanceUrl)) {
+        // Migrate the legacy global key into the per-instance map on first read.
+        var entry = { sys_id: legacy };
+        map[key] = entry;
+        try {
+            appStorage.setItem(IMPERSONATE_STATE_KEY, JSON.stringify(map));
+            appStorage.removeItem(IMPERSONATE_LEGACY_KEY);
+        } catch (e) {}
+        return entry;
+    }
+    return null;
+}
+
+// Record (entry = {sys_id, user_name}) or clear (entry = null) the original user.
+function setImpersonationOriginal(instanceUrl, entry) {
+    var key = _impNormUrl(instanceUrl);
+    var map = _impReadStateMap();
+    if (entry) map[key] = entry; else delete map[key];
+    appStorage.setItem(IMPERSONATE_STATE_KEY, JSON.stringify(map));
+    if (!entry && key === _impNormUrl(Platform.instanceUrl)) {
+        try { appStorage.removeItem(IMPERSONATE_LEGACY_KEY); } catch (e) {}
+    }
+}
+
+function _impIsKnownInstance(url) {
+    var key = _impNormUrl(url);
+    if (key && key === _impNormUrl(Platform.instanceUrl)) return true;
+    var list = Platform.instances || [];
+    for (var i = 0; i < list.length; i++) { if (list[i] && _impNormUrl(list[i].url) === key) return true; }
+    return false;
+}
+
+// Target instance: args.instance > origin of the tab_id tab (only when it is a
+// known/connected ServiceNow instance) > active instance. An explicit instance
+// that disagrees with a known instance tab is an error (the reload would
+// otherwise hit the wrong instance's page).
+function resolveImpersonationTarget(args, tab) {
+    var tabOrigin = null;
+    var tabUrl = tab && (tab.url || tab.pendingUrl);
+    if (tabUrl && /^https?:/i.test(tabUrl)) {
+        try { tabOrigin = new URL(tabUrl).origin; } catch (e) { tabOrigin = null; }
+    }
+    if (tabOrigin && !_impIsKnownInstance(tabOrigin)) tabOrigin = null;
+    if (args.instance) {
+        var u = Platform.resolveInstanceUrl(args.instance);
+        if (!u) return { error: 'Unknown instance "' + args.instance + '". Use list_instances to see available instances.' };
+        u = _impNormUrl(u);
+        if (tabOrigin && tabOrigin !== u) {
+            return { error: 'tab_id ' + (tab && tab.id) + ' shows ' + tabOrigin + ', not instance ' + u + '. Pass a tab_id of that instance (or omit tab_id).' };
+        }
+        return { url: u, source: 'instance' };
+    }
+    if (tabOrigin) return { url: tabOrigin, source: 'tab' };
+    if (!Platform.instanceUrl) return { error: 'No ServiceNow instance connected. Pass instance or a tab_id of a ServiceNow tab.' };
+    return { url: _impNormUrl(Platform.instanceUrl), source: 'active' };
+}
+
+async function _impResponseText(res) {
+    try { return String(await res.text()).slice(0, 500); } catch (e) { return ''; }
+}
+
+async function _impJson(res) {
+    try { return await res.json(); } catch (e) { return null; }
+}
+
+// Reload the tab and wait until it has finished loading (bounded), so the
+// page's fresh g_ck can be read right after.
+async function _impReloadTab(tabId) {
+    var r = await Platform.sendBrowserAction('reload', {}, tabId);
+    if (r && r.error) return { ok: false, error: String(r.error) };
+    if (typeof chrome === 'undefined' || !chrome.tabs || !chrome.tabs.get) return { ok: true };
+    var start = Date.now();
+    var sawLoading = false;
+    while (Date.now() - start < 15000) {
+        await new Promise(function(res) { setTimeout(res, 250); });
+        var t = null;
+        try { t = await chrome.tabs.get(tabId); } catch (e) { return { ok: false, error: 'tab ' + tabId + ' was closed during reload' }; }
+        if (!t) return { ok: false, error: 'tab ' + tabId + ' was closed during reload' };
+        if (t.status === 'loading') sawLoading = true;
+        else if (t.status === 'complete' && (sawLoading || Date.now() - start > 1500)) return { ok: true };
+    }
+    return { ok: false, error: 'timed out waiting for tab ' + tabId + ' to finish reloading' };
+}
+
+async function _impRefreshToken(instanceUrl, staleToken) {
+    if (typeof Platform.refreshTokenForInstance !== 'function') return '';
+    try { return (await Platform.refreshTokenForInstance(instanceUrl, staleToken)) || ''; } catch (e) { return ''; }
+}
+
+// A tab of instanceUrl to reload when no tab_id was given (open tabs keep the
+// pre-switch g_ck until reloaded), or null.
+function _impInstanceTab(instanceUrl) {
+    if (typeof Platform.getTabForInstance !== 'function') return null;
+    try { var id = Platform.getTabForInstance(instanceUrl); return (typeof id === 'number') ? id : null; } catch (e) { return null; }
+}
+
+function _impIsStop(user) { return String(user == null ? '' : user).trim().toLowerCase() === 'stop'; }
+
+async function runImpersonation(args, tabId) {
+    var tab = null;
+    if (typeof tabId === 'number' && typeof chrome !== 'undefined' && chrome.tabs && chrome.tabs.get) {
+        try { tab = await chrome.tabs.get(tabId); } catch (e) { tab = null; }
+        if (!tab) return { success: false, error: 'tab_id ' + tabId + ' is not an open tab (it may have been closed).' };
+    }
+    var tgt = resolveImpersonationTarget(args, tab);
+    if (tgt.error) return { success: false, error: tgt.error };
+    var base = tgt.url;
+    var token = await Platform.getTokenForInstance(base);
+    if (!token) {
+        return { success: false, instance: base, error: 'No session token available for ' + base + '. Open (or log in to) a tab of that instance and retry — or, if the user gave you (or a skill provides) credentials, log in with connect_instance.' };
+    }
+
+    // Absolute url + this instance's token (bypasses the active-instance fetch
+    // shim). One retry with a re-probed token on 401 (rotated session token).
+    var req = async function(path, method) {
+        var send = function() {
+            var o = { method: method || 'GET', credentials: 'include', headers: { 'Accept': 'application/json', 'X-UserToken': token } };
+            if (o.method === 'POST') { o.headers['Content-Type'] = 'application/json'; o.body = '{}'; }
+            return fetch(base + path, o);
+        };
+        var res = await send();
+        if (res.status === 401) {
+            var fresh = await _impRefreshToken(base, token);
+            if (!fresh) {
+                // Every open tab may still hold the rotated-out g_ck: reload one
+                // tab of the instance, then re-probe.
+                var rt = (typeof tabId === 'number') ? tabId : _impInstanceTab(base);
+                if (rt != null && (await _impReloadTab(rt)).ok) fresh = await _impRefreshToken(base, token);
+            }
+            if (fresh && fresh !== token) { token = fresh; res = await send(); }
+        }
+        return res;
+    };
+    // Current session user plus, when the session is already impersonated
+    // outside this tool, the real user (gs.getImpersonatingUserName() in an
+    // encoded-query javascript: filter; best effort — an empty/blocked answer
+    // just means "not detectable", and the current user is used).
+    var readUsers = async function() {
+        var fields = '&sysparm_fields=sys_id,user_name,name&sysparm_limit=2';
+        var meRes = await req('/api/now/table/sys_user?sysparm_query=' + encodeURIComponent('sys_id=javascript:gs.getUserID()') + fields);
+        if (!meRes.ok) return { res: meRes };
+        var meData = await _impJson(meRes);
+        var me = meData && meData.result && meData.result[0];
+        if (!me || !me.sys_id) return { error: 'Could not read the current user on ' + base + '.' };
+        var real = null;
+        try {
+            var irRes = await req('/api/now/table/sys_user?sysparm_query=' + encodeURIComponent('user_name=javascript:gs.getImpersonatingUserName()') + fields);
+            if (irRes.ok) {
+                var irData = await _impJson(irRes);
+                var rows = (irData && irData.result) || [];
+                if (rows.length === 1 && rows[0].sys_id && rows[0].user_name && rows[0].sys_id !== me.sys_id) real = rows[0];
+            }
+        } catch (e) { real = null; }
+        return { current: me, real: real };
+    };
+    var fail = async function(what, res) {
+        return { success: false, instance: base, status: res.status, error: what + ' on ' + base + ': HTTP ' + res.status, body: await _impResponseText(res) };
+    };
+    // After the session switched: reload the given tab (awaited) and re-read a
+    // fresh token so later calls (incl. stop) don't 401 on a rotated g_ck.
+    var finish = async function(result) {
+        result.instance = base;
+        var reloadTab = (typeof tabId === 'number') ? tabId : _impInstanceTab(base);
+        if (reloadTab != null) {
+            var rl = await _impReloadTab(reloadTab);
+            result.tab_reloaded = !!rl.ok;
+            result.reloaded_tab_id = reloadTab;
+            if (!rl.ok) result.warning = 'Tab reload: ' + rl.error;
+        } else {
+            result.tab_reloaded = false;
+            result.note = 'No open tab of ' + base + ' to reload: reload its tabs to see the new user.';
+        }
+        var fresh = await _impRefreshToken(base, token);
+        result.token_refreshed = !!(fresh && fresh !== token);
+        return result;
+    };
+
+    if (_impIsStop(args.user)) {
+        var orig = getImpersonationOriginal(base);
+        if (!orig) return { success: false, instance: base, error: 'No active impersonation recorded for ' + base + ' (original user not stored).' };
+        var su = await readUsers();
+        if (su.current && su.current.sys_id === orig.sys_id) {
+            // Impersonation was already ended outside the tool: drop stale state.
+            setImpersonationOriginal(base, null);
+            return { success: true, instance: base, message: 'Already acting as the real user ' + (orig.user_name || orig.sys_id) + ' on ' + base + ' (impersonation ended outside the tool); cleared the stored state.', user_sys_id: orig.sys_id };
+        }
+        var stopRes = await req('/api/now/ui/impersonate/' + encodeURIComponent(orig.sys_id), 'POST');
+        if (!stopRes.ok) return fail('Failed to stop impersonation', stopRes);
+        setImpersonationOriginal(base, null);
+        return finish({ success: true, message: 'Impersonation ended on ' + base + '. Switched back to ' + (orig.user_name || orig.sys_id) + '.', user_sys_id: orig.sys_id });
+    }
+
+    // Record the REAL user once per instance (kept across chained impersonations).
+    var storedNow = false;
+    var prevOrig = getImpersonationOriginal(base);
+    var users = await readUsers();
+    if (users.res) return fail('Could not read the current user (needed to stop impersonation later)', users.res);
+    if (users.error) return { success: false, instance: base, error: users.error + ' (needed to stop impersonation later)' };
+    if (prevOrig && users.current.sys_id === prevOrig.sys_id) {
+        setImpersonationOriginal(base, null);   // ended outside the tool: stale
+        prevOrig = null;
+    }
+    if (!prevOrig) {
+        var realUser = users.real || users.current;
+        setImpersonationOriginal(base, { sys_id: realUser.sys_id, user_name: realUser.user_name || realUser.name || '' });
+        storedNow = true;
+    }
+
+    var userSysId = args.user;
+    var userLabel = args.user;
+    if (!/^[0-9a-f]{32}$/.test(args.user)) {
+        var lookupRes = await req('/api/now/table/sys_user?sysparm_query=' + encodeURIComponent('user_name=' + args.user + '^ORnameLIKE' + args.user) + '&sysparm_fields=sys_id,user_name,name&sysparm_limit=5');
+        if (!lookupRes.ok) {
+            if (storedNow) setImpersonationOriginal(base, null);
+            return fail('User lookup failed', lookupRes);
+        }
+        var lookupData = await _impJson(lookupRes);
+        var rows = (lookupData && lookupData.result) || [];
+        if (rows.length === 0) {
+            if (storedNow) setImpersonationOriginal(base, null);
+            return { success: false, instance: base, error: 'User not found on ' + base + ': ' + args.user };
+        }
+        var pick = rows[0];
+        for (var i = 0; i < rows.length; i++) { if (rows[i].user_name === args.user) { pick = rows[i]; break; } }
+        userSysId = pick.sys_id;
+        userLabel = pick.user_name || pick.name || args.user;
+    }
+    var impRes = await req('/api/now/ui/impersonate/' + encodeURIComponent(userSysId), 'POST');
+    if (!impRes.ok) {
+        if (storedNow) setImpersonationOriginal(base, null);
+        return fail('Impersonation failed', impRes);
+    }
+    return finish({ success: true, message: 'Now impersonating ' + userLabel + ' (sys_id: ' + userSysId + ') on ' + base + '.', user_sys_id: userSysId });
 }

@@ -60,6 +60,9 @@
   "No changes tracked yet": "Изменений пока нет",
   "Message input": "Поле ввода сообщения",
   "Continue in a new chat": "Продолжить в новом чате",
+  "Continued: ": "Продолжение: ",
+  "Sub-agent chats can't be continued in a new chat": "Чаты субагентов нельзя продолжить в новом чате",
+  "This chat was already continued in a new chat": "Этот чат уже продолжен в новом чате",
   "Summarize and start new chat": "Подвести итог и начать новый чат",
   "Pause or resume": "Приостановить или возобновить",
   "Continue": "Продолжить",
@@ -275,6 +278,7 @@
   "Read Version": "Прочитать версию",
   "Delete Document": "Удалить документ",
   "List Instances": "Список экземпляров",
+  "Connect Instance": "Подключить экземпляр",
   "Fetch URL": "Загрузить URL",
   "Web Search": "Веб-поиск",
   "Build Extension": "Собрать расширение",
@@ -1923,5 +1927,12 @@
   "No edited skills": "Нет изменённых навыков",
   "Resize sidebar": "Изменить размер боковой панели",
   "Resize split view": "Изменить размер разделённого вида",
-  "Drag to resize · double-click to reset": "Перетащите, чтобы изменить размер · двойной щелчок для сброса"
+  "Drag to resize · double-click to reset": "Перетащите, чтобы изменить размер · двойной щелчок для сброса",
+  "Chat was continued": "Чат был продолжен",
+  "Continued from": "Продолжение чата",
+  "Continued in": "Продолжено в",
+  "Go to the new chat": "Перейти в новый чат",
+  "Send here anyway": "Всё равно отправить сюда",
+  "This chat continues in \"{title}\". Workers, PRs and widgets now live there.": "Этот чат продолжается в «{title}». Воркеры, PR и виджеты теперь находятся там.",
+  "deleted chat": "удалённый чат"
 }

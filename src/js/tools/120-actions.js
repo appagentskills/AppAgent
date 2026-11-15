@@ -404,9 +404,13 @@ async function executeUpdateActionState(args, options) {
     if (['done', 'finished', 'pr_opened', 'finished_with_caveat'].indexOf(state) >= 0
         && typeof SubAgents !== 'undefined' && typeof SubAgents.listAll === 'function') {
         var _runningSubs = [];
+        // Lineage: subs of a chat this one continues still count (they are
+        // reparented by the migration, but a not-yet-migrated record must
+        // not slip past the gate).
+        var _gateLin = (typeof lineageAncestorSet === 'function') ? lineageAncestorSet(chatId) : null;
         try {
             _runningSubs = SubAgents.listAll().filter(function(r) {
-                return r && r.parent_chat_id === chatId && r.state === 'running';
+                return r && (r.parent_chat_id === chatId || !!(_gateLin && _gateLin[r.parent_chat_id])) && r.state === 'running';
             });
         } catch (e) { _runningSubs = []; }
         if (_runningSubs.length) {
@@ -901,6 +905,11 @@ async function finishActionIfDone(chatId) {
     if (!chat || !chat.isBackground || !chat.actionId) return;
     var a = activeActions[chat.actionId];
     if (!a) return;
+    // M2: "Continue in a new chat" — the summary run ending here must not
+    // finalize the action that is about to move to the new chat (ui/170
+    // copyLineagePageState). summarizeAndStartNewChat re-calls this once the
+    // request settles, when no continuation took the action.
+    if (typeof pendingSummaryRequest !== 'undefined' && pendingSummaryRequest && pendingSummaryRequest.chatId === chatId) return;
     // Only auto-finalize if the agent didn't explicitly set done/error AND the
     // action isn't paused. SWM14-F1: pausing a running background Action exits the
     // SW loop via finish-cleanup → runFinished{paused}; the page runFinished
@@ -922,6 +931,9 @@ async function finishActionIfDone(chatId) {
         a.icon = 'check';
         if (!a.label || a.label === 'Starting…') a.label = N_('Complete');
         a.updatedAt = Date.now();
+        // Auto-finalize marker: copyLineagePageState reopens an action that
+        // was only auto-completed (no later update) when it moves to a head.
+        a._autoFinalizedAt = a.updatedAt;
         await persistActionState(chat.actionId);
         notifyActionStateChanged(chat.actionId);
     }
@@ -1328,8 +1340,71 @@ function onActionHistoryToggle(chatId, isOpen) {
     actionUpdateHistoryOpen[chatId] = !!isOpen;
 }
 
+// Lineage: the executed progress updates of a continued chat's predecessors
+// (oldest first), so the card's history trail spans the whole chain instead
+// of the single carried-over entry. Union-on-read (nothing copied); evicted
+// predecessors (no messages array) are skipped. A predecessor's own
+// carried-over entry only counts when nothing older was found.
+// Called on every render (ui/120 → renderActionUpdatesSection), so the result
+// is cached per head, keyed per predecessor by _lineageMessagesSignature (count
+// + last message identity + pending-placeholder count: collectAllActionUpdates
+// also changes when a seeded `_placeholder` row is replaced in place by its
+// result, which keeps the length), and capped to the last
+// LINEAGE_PRIOR_ACTION_UPDATES_MAX entries.
+var LINEAGE_PRIOR_ACTION_UPDATES_MAX = 50;
+var _lineagePriorActionUpdatesCache = {};
+function _lineageMessagesSignature(msgs) {
+    var ph = 0;
+    for (var i = 0; i < msgs.length; i++) if (msgs[i] && msgs[i]._placeholder) ph++;
+    var last = msgs[msgs.length - 1] || {};
+    var lastId = last.tool_call_id || last.timestamp || last.role || '';
+    var lastCalls = Array.isArray(last.tool_calls) ? last.tool_calls.length : 0;
+    return msgs.length + ':' + lastId + ':' + lastCalls + ':' + ph;
+}
+function _lineagePriorActionUpdates(chat) {
+    var out = [];
+    if (!chat || !chat.continuedFrom || !chat.id || typeof getLineageChatIds !== 'function' || typeof chats === 'undefined' || !chats) return out;
+    var ids;
+    try { ids = getLineageChatIds(chat.id) || []; } catch (e) { return out; }
+    var at = ids.indexOf(chat.id);
+    var keyParts = [];
+    for (var k = 0; k < at; k++) {
+        var ck = chats[ids[k]];
+        keyParts.push(ids[k] + ':' + ((ck && !ck._deleted && Array.isArray(ck.messages)) ? _lineageMessagesSignature(ck.messages) : '-'));
+    }
+    var key = keyParts.join('|');
+    var cache = (typeof _lineagePriorActionUpdatesCache === 'object' && _lineagePriorActionUpdatesCache) || null;
+    var max = (typeof LINEAGE_PRIOR_ACTION_UPDATES_MAX === 'number') ? LINEAGE_PRIOR_ACTION_UPDATES_MAX : 50;
+    var hit = cache && cache[chat.id];
+    if (hit && hit.key === key) return hit.updates.slice();
+    for (var i = 0; i < at; i++) {
+        var c = chats[ids[i]];
+        if (!c || c._deleted || !Array.isArray(c.messages)) continue;
+        collectAllActionUpdates(c).forEach(function(u) { if (!u.carriedOver || !out.length) out.push(u); });
+    }
+    if (out.length > max) out = out.slice(out.length - max);
+    if (cache) cache[chat.id] = { key: key, updates: out };
+    return out.slice();
+}
+
+// Merge the predecessors' updates with the head's own. The head's carried-over
+// entry is dropped only when it really duplicates the last prior update (same
+// state AND label); otherwise it is kept so no distinct step is lost.
+function _mergeLineageActionUpdates(prior, own) {
+    own = own || [];
+    if (!prior || !prior.length) return own;
+    var last = prior[prior.length - 1] || {};
+    return prior.concat(own.filter(function(u) {
+        if (!u || !u.carriedOver) return true;
+        return !((u.state || '') === (last.state || '') && (u.label || '') === (last.label || ''));
+    }));
+}
+
 function renderActionUpdatesSection(chat) {
     var updates = collectAllActionUpdates(chat);
+    // The head's carried-over entry usually duplicates the predecessor's last update.
+    var _prior = _lineagePriorActionUpdates(chat);
+    if (_prior.length) updates = _mergeLineageActionUpdates(_prior, updates);
     if (!updates.length) return '';
 
     // Render the LATEST update as a single in-place card (state badge, label,
@@ -1492,12 +1567,25 @@ function _actChatMsgN(c) {
     if (Array.isArray(c.messages)) return c.messages.length;
     return (typeof chatMessageCount === 'function') ? chatMessageCount(c) : (c._msgCount || 0);
 }
+// Lineage: the carried-over card (chat.progressCarryOver) as an update entry,
+// or null. Shared by collectAllActionUpdates and the evicted-skeleton path so
+// a cold continued chat still shows the inherited card.
+function _progressCarryOverEntry(chat) {
+    var _co = chat && chat.progressCarryOver;
+    if (!_co || typeof _co !== 'object' || !(_co.state || _co.label)) return null;
+    return {
+        state: _co.state, icon: _co.icon, label: _co.label,
+        tasks: normalizeProgressTasks(_co.tasks), output: _co.output,
+        status_message: _co.status_message, carriedOver: true
+    };
+}
 function _progressLatestForSkeleton(chat) {
     var id = chat && chat.id;
     if (!id) return null;
+    var carry = _progressCarryOverEntry(chat);
     var n = (typeof chatMessageCount === 'function') ? chatMessageCount(chat) : (chat._msgCount || 0);
     var c = _progressLatestByChat[id];
-    if (c && c.len === n) return c.latest;
+    if (c && c.len === n) return c.latest || carry;
     if (_progressFillTried[id] !== n && typeof loadChatRowFromDB === 'function') {
         _progressFillTried[id] = n;
         Promise.resolve().then(function() { return loadChatRowFromDB(id); }).then(function(row) {
@@ -1505,12 +1593,12 @@ function _progressLatestForSkeleton(chat) {
             if (!live || Array.isArray(live.messages)) return; // hydrated meanwhile: the next compute stamps
             if (!row || !Array.isArray(row.messages)) return;
             var ups = collectAllActionUpdates(row);
-            _progressLatestByChat[id] = { len: n, latest: ups.length ? ups[ups.length - 1] : null };
+            _progressLatestByChat[id] = { len: n, latest: ups.length ? ups[ups.length - 1] : _progressCarryOverEntry(live) };
             if (typeof renderJobsBadge === 'function') { try { renderJobsBadge(); } catch (e) {} }
             if (typeof renderChatList === 'function') { try { renderChatList(); } catch (e) {} }
         }).catch(function() {});
     }
-    return null;
+    return carry;
 }
 
 // Walk the messages and collect the arguments of every update_action_state tool
@@ -1528,6 +1616,11 @@ function _progressLatestForSkeleton(chat) {
 function collectAllActionUpdates(chat, includeToolCallId) {
     var out = [];
     if (!chat || !Array.isArray(chat.messages)) return out;
+    // Lineage: "Continue in a new chat" seeds the new chat with the old chat's
+    // latest card (chat.progressCarryOver, set by completeSummaryAndCreateNewChat)
+    // so the card stays the same until the new chat reports its own state.
+    var _co = _progressCarryOverEntry(chat);
+    if (_co) out.push(_co);
 
     // Pre-scan: collect every tool_call_id that has produced a SUCCESSFUL result
     // row. H19a: a {success:false} result (e.g. terminal state rejected while

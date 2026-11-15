@@ -521,7 +521,7 @@ describe('sidebar workspace files › unified status + grouping', function() {
         var src = await loadFile('src/js/tools/020-tool-execution.js');
         var a = src.indexOf('var WS_PR_COUNT_MAX_CHARS'), b = src.indexOf('\n}\n', src.indexOf('function _wsPrFileLineCounts('));
         assert.ok(a > 0 && b > a, 'helper found');
-        var cnt = new Function(src.slice(a, b + 2) + '\nreturn { f: _wsPrFileLineCounts, max: WS_PR_COUNT_MAX_CHARS };')();
+        var cnt = new Function(await loadFile('src/js/core/152-line-diff.js') + '\n' + src.slice(a, b + 2) + '\nreturn { f: _wsPrFileLineCounts, max: WS_PR_COUNT_MAX_CHARS };')();
         assert.strictEqual(cnt.max, 200000);
         assert.deepStrictEqual(cnt.f('a\nb\nc\n', 'a\nB\nc\nd\n'), { adds: 2, dels: 1 }, 'small edit');
         assert.deepStrictEqual(cnt.f(null, 'x\ny\n'), { adds: 2, dels: 0 }, 'new file');

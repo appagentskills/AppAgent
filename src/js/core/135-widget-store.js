@@ -509,7 +509,25 @@ var WidgetStore = (function() {
         });
         if (broadcast && channel) channel.postMessage({ reset: true });
     }
-    return { init: init, read: read, commit: commit, view: view, project: project, remove: remove,
+    // Does widget `id` hold a version saved under `operationId` (and, when
+    // `data` is given, with identical content)? Retry probe: reads the store
+    // row only (init() + fetchRecord) — never read()'s legacy chats/dashboard
+    // scan + migrate() (an IDB write) for a missing row, since probe ids are
+    // usually derived and absent. `allowLegacy` (caller names an explicit,
+    // existing target widget) falls back to read(), which may migrate it.
+    async function hasOperation(id, operationId, data, allowLegacy) {
+        if (!id) return false;
+        await init();
+        var record = await fetchRecord(id);
+        if (!record && allowLegacy) record = await read(id);
+        if (!record || !Array.isArray(record.versions)) return false;
+        var v = record.versions.find(function(x) { return x.operationId === operationId; });
+        if (!v) return false;
+        if (!data) return true;
+        var payload = snapshot(data);
+        return sameContent(v, fingerprintOf(payload), payload);
+    }
+    return { init: init, read: read, commit: commit, view: view, project: project, remove: remove, hasOperation: hasOperation,
         isDeleted: function(id) { return isTombstoned(id); },
         resendDeletes: function() { tombstones = readTombstones(); notifyWorkerRemoved(tombstones.slice()); }, migrate: migrate, exportRecords: exportRecords, importRecords: importRecords, validateRecords: validateRecords, clearCache: clearCache,
         list: function() { return Object.values(records).map(function(r) { return { id: r.id, title: latest(r).title, latest_version: latest(r).version, versions: r.versions.length }; }); },
@@ -536,9 +554,45 @@ function consumeWidgetComposerTarget(input, message) {
     return id && message.indexOf('Edit widget ' + id + ':') === 0 ? id : null;
 }
 
-async function widgetOperationId(args, options) {
+// Lineage ROOT (oldest "Continue" ancestor) of a chat; the chat itself when it
+// was never continued.
+function _widgetOperationScopeId(chatId) {
+    var id = String(chatId || 'widget');
+    if (!chatId || typeof getLineageChatIds !== 'function') return id;
+    try {
+        var ids = getLineageChatIds(chatId);
+        return (ids && ids.length && ids[0]) ? String(ids[0]) : id;
+    } catch (e) { return id; }
+}
+// Operation keys stay scoped to the issuing chat (records written before
+// lineage existed, and a head reusing a stable operation_id for a different
+// widget, must keep working). Only for a continued head, when the own key has
+// no record yet, a lineage-PREDECESSOR key (newest first, down to the root) is
+// used if `probe` ({targetId, data}) proves it is a retry of that predecessor's
+// save: the key-derived (or target)
+// widget holds a version with that root key AND identical content. Never-
+// continued chats (root === self) get exactly the old key.
+async function widgetOperationId(args, options, probe) {
     var id = args.operation_id || options && options.toolCallId;
-    return String(options && options.chatId || currentChatId || 'widget') + ':' + (id || crypto.randomUUID());
+    var chatId = String(options && options.chatId || currentChatId || 'widget');
+    var own = chatId + ':' + (id || crypto.randomUUID());
+    var root = _widgetOperationScopeId(chatId);
+    if (!id || root === chatId || !probe || !probe.data || typeof WidgetStore === 'undefined' || typeof WidgetStore.hasOperation !== 'function') return own;
+    try {
+        var legacy = !!probe.targetId;
+        if (await WidgetStore.hasOperation(probe.targetId || await widgetIdForOperation(own), own, null, legacy)) return own;
+        // Every lineage predecessor, newest → oldest (A→B→C: a retry in C of
+        // B's save must find 'B:op', not only the root's 'A:op').
+        var ids = [];
+        try { ids = getLineageChatIds(chatId) || []; } catch (e2) { ids = []; }
+        var at = ids.indexOf(chatId);
+        var preds = (at > 0 ? ids.slice(0, at) : [root]).reverse();
+        for (var i = 0; i < preds.length; i++) {
+            var key = preds[i] + ':' + id;
+            if (await WidgetStore.hasOperation(probe.targetId || await widgetIdForOperation(key), key, probe.data, legacy)) return key;
+        }
+    } catch (e) {}
+    return own;
 }
 async function widgetIdForOperation(operationId) {
     var digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(operationId));

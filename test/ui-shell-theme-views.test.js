@@ -410,7 +410,7 @@ describe('ui views › history page', function() {
 
 // ─────────────────────────── Diff ───────────────────────────
 describe('ui views › diff engine markup', function() {
-    async function load() { return loadLenient([ESC, 'src/js/ui/090-version-history.js'], { window: winStub() }); }
+    async function load() { return loadLenient([ESC, 'src/js/core/152-line-diff.js', 'src/js/ui/090-version-history.js'], { window: winStub() }); }
     test('computeDiff line ops + numbering', async function() {
         var m = await load();
         var d = m.computeDiff('a\nb\nc', 'a\nB\nc\nd');

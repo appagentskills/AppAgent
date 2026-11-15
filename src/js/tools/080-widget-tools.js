@@ -155,7 +155,7 @@ async function executeHtmlWidget(args, messageIndex, options) {
         toolResultMsgIndex = chat ? chat.messages.length : -1;
     }
     
-    var operationId = await widgetOperationId(args, options);
+    var operationId = await widgetOperationId(args, options, { targetId: targetId, data: { title: title, html: html, height: height, width: width } });
     var widgetId = targetId || await widgetIdForOperation(operationId);
     var committed;
     // Note the slot patch BEFORE commit: commit -> project() ->
@@ -300,8 +300,19 @@ async function executePinWidget(args) {
 
 function getWidgetsForChat(chatId) {
     var seen = new Set();
-    var all = ((chats[chatId] && chats[chatId].widgets) || chatWidgets[chatId] || []).slice();
-    WidgetStore.list().forEach(function(w) { var saved = WidgetStore.view(w.id); if (chats[chatId] && saved.chatId === chatId && !all.some(function(old) { return old.id === w.id; })) all.push(saved); });
+    // Lineage: a continued chat also lists the widgets of the chats it
+    // continues (lineageAncestorIds, ui/120) — earlier chats first, each widget
+    // keeps its own chatId (no copies, no id conflicts with the dashboard).
+    var ids = (typeof lineageAncestorIds === 'function') ? lineageAncestorIds(chatId) : [chatId];
+    if (ids.indexOf(chatId) < 0) ids.push(chatId);
+    var all = [];
+    ids.forEach(function(id) {
+        ((chats[id] && chats[id].widgets) || chatWidgets[id] || []).forEach(function(w) {
+            all.push(id === chatId || !w || w.chatId ? w : Object.assign({}, w, { chatId: id }));
+        });
+    });
+    var idSet = {}; ids.forEach(function(id) { idSet[id] = true; });
+    WidgetStore.list().forEach(function(w) { var saved = WidgetStore.view(w.id); if (chats[chatId] && saved && idSet[saved.chatId] && !all.some(function(old) { return old && old.id === w.id; })) all.push(saved); });
     return all.filter(function(w) {
         if (!w || seen.has(w.id)) return false;
         seen.add(w.id); return true;

@@ -62,6 +62,7 @@ var GLOBAL_READ_KEYS = [
     'local_folder:ls',
     'local_folder:read',
     'local_folder:grep',
+    'local_folder:share',
     'local_folder:request'
 ];
 
@@ -410,6 +411,227 @@ function chatPermKey(rootChatId, permKey) {
     return String(rootChatId) + '::' + String(permKey);
 }
 
+// ── Chat lineage ("Continue in a new chat") ───────────────────────────────
+// When a chat is continued, the old chat gets `continuedTo: newId` and the new
+// chat keeps `continuedFrom: oldId`. The lineage HEAD (the newest chat in the
+// chain) is the canonical owner of carried-over state: workers, workspace
+// ownership, smart docs, approvals. Primary source: chats[id].continuedTo /
+// continuedFrom (SW keeps chat skeletons). Fallback: the in-memory link map
+// below (registered by the migration so the SW can resolve lineage even when
+// its chats map has not caught up yet). Cycle-guarded; no small hop cap.
+var _chatLineageNext = {};
+var _chatLineagePrev = {};
+
+// opts.stamp: also write the durable link fields on the live chat records
+// (chats[from].continuedTo / chats[to].continuedFrom) when present and not
+// tombstoned. This is the ONE sanctioned writer of the lineage fields in both
+// realms: the page (ui/170 completeSummaryAndCreateNewChat) and the SW
+// migration (worker/130 _swContinueChatLineage) — the SW stamps its own
+// skeleton so the link survives even when the page's 'update-chat' push was
+// dropped by the running/cleanup guard. Never overwrites a different LIVE
+// link; a dead one (tombstoned, or — with opts.missingIsDead — absent from
+// the chats map) is replaced.
+// opts.missingIsDead: the caller's chats map is authoritative (the page), so
+// a linked chat missing from it is dead too. NOT set by the SW: its chats map
+// lags the page (see _lineageIsDead), where a missing chat may still be live.
+function registerLineageLink(fromChatId, toChatId, opts) {
+    if (!fromChatId || !toChatId) return false;
+    var f = String(fromChatId), t = String(toChatId);
+    if (f === t) return false;
+    var missingIsDead = !!(opts && opts.missingIsDead);
+    // Never fork the lineage: refuse when `from` already continues into a
+    // different (live) chat, or `to` already continues a different one — both
+    // the durable fields and the in-memory map count. Re-registering the same
+    // link is idempotent (true).
+    var curNext = _lineageNextOf(f), curPrev = _lineagePrevOf(t);
+    if (curNext && missingIsDead && _lineageIsMissing(curNext)) curNext = null;
+    if (curPrev && missingIsDead && _lineageIsMissing(curPrev)) curPrev = null;
+    if ((curNext && curNext !== t) || (curPrev && curPrev !== f)) return false;
+    _chatLineageNext[f] = t;
+    _chatLineagePrev[t] = f;
+    if (opts && opts.stamp) {
+        try {
+            if (typeof chats !== 'undefined' && chats) {
+                // Past the fork guard any different existing field is dead.
+                if (chats[f] && !chats[f]._deleted && String(chats[f].continuedTo || '') !== t) chats[f].continuedTo = t;
+                if (chats[t] && !chats[t]._deleted && String(chats[t].continuedFrom || '') !== f) chats[t].continuedFrom = f;
+            }
+        } catch (e) { /* in-memory link above still resolves */ }
+    }
+    return true;
+}
+
+// Absent from a present chats map (page-side "missing counts as dead"; see
+// registerLineageLink opts.missingIsDead / ui/170 continueChatBlockReason).
+function _lineageIsMissing(id) {
+    try { return !!(typeof chats !== 'undefined' && chats && !chats[id]); }
+    catch (e) { return false; }
+}
+
+// A link to a tombstoned chat (`_deleted`) is dead: never follow it. A chat
+// merely MISSING from the map is still followed — the SW's chats map can lag
+// the page (that is what the in-memory link map is for); deleteChat repairs
+// the chain itself (unlinkLineageChat) so a deleted link does not linger.
+function _lineageIsDead(id) {
+    try { return !!(typeof chats !== 'undefined' && chats && chats[id] && chats[id]._deleted); }
+    catch (e) { return false; }
+}
+
+function _lineageNextOf(id) {
+    var next = null;
+    try {
+        if (typeof chats !== 'undefined' && chats && chats[id] && chats[id].continuedTo) next = chats[id].continuedTo;
+    } catch (e) { next = null; }
+    if (!next && Object.prototype.hasOwnProperty.call(_chatLineageNext, id)) next = _chatLineageNext[id];
+    if (next && _lineageIsDead(String(next))) next = null;
+    return next ? String(next) : null;
+}
+
+function _lineagePrevOf(id) {
+    var prev = null;
+    try {
+        if (typeof chats !== 'undefined' && chats && chats[id] && chats[id].continuedFrom) prev = chats[id].continuedFrom;
+    } catch (e) { prev = null; }
+    if (!prev && Object.prototype.hasOwnProperty.call(_chatLineagePrev, id)) prev = _chatLineagePrev[id];
+    if (prev && _lineageIsDead(String(prev))) prev = null;
+    return prev ? String(prev) : null;
+}
+
+// Chain repair on delete (both realms: worker/130 tombstone lane, ui/170
+// deleteChat). Call BEFORE the chat's record is removed/tombstoned. Joins the
+// deleted chat's neighbours (A→B→C minus B gives A→C), or clears the dangling
+// side when it was the head/root. Cleared fields are set to null (not
+// deleted) so the put merge's fill-gap carry cannot restore them. Updates the
+// in-memory link maps. Returns { prev, next, touched } — touched = chat ids
+// whose records changed and must be persisted by the caller.
+function unlinkLineageChat(chatId) {
+    var out = { prev: null, next: null, touched: [] };
+    if (!chatId) return out;
+    var id = String(chatId);
+    var prev = _lineagePrevOf(id), next = _lineageNextOf(id);
+    if (prev === id) prev = null;
+    if (next === id || next === prev) next = null;
+    out.prev = prev; out.next = next;
+    var c = null;
+    try { c = (typeof chats !== 'undefined' && chats) ? chats : null; } catch (e) { c = null; }
+    var live = function(x) { return (c && c[x] && !c[x]._deleted) ? c[x] : null; };
+    if (prev) {
+        if (next) _chatLineageNext[prev] = next; else delete _chatLineageNext[prev];
+        var pr = live(prev);
+        if (pr && pr.continuedTo && String(pr.continuedTo) === id) { pr.continuedTo = next || null; out.touched.push(prev); }
+        else if (pr && next && !pr.continuedTo) { pr.continuedTo = next; out.touched.push(prev); }
+        // Replay marker (app/045 lineageMigrationPending) aimed at the
+        // deleted chat: rewrite it to the joined successor, or clear it when
+        // prev is now the head (nothing left to migrate to). null, not
+        // delete — the put merge's fill-gap carry would restore it.
+        if (pr && pr.lineageMigrationPending && String(pr.lineageMigrationPending) === id) {
+            pr.lineageMigrationPending = next || null;
+            if (out.touched.indexOf(prev) < 0) out.touched.push(prev);
+        }
+    }
+    var self = live(id);
+    if (self && self.lineageMigrationPending) self.lineageMigrationPending = null;
+    if (next) {
+        if (prev) _chatLineagePrev[next] = prev; else delete _chatLineagePrev[next];
+        var nx = live(next);
+        if (nx && nx.continuedFrom && String(nx.continuedFrom) === id) { nx.continuedFrom = prev || null; if (out.touched.indexOf(next) < 0) out.touched.push(next); }
+        else if (nx && prev && !nx.continuedFrom) { nx.continuedFrom = prev; if (out.touched.indexOf(next) < 0) out.touched.push(next); }
+    }
+    delete _chatLineageNext[id];
+    delete _chatLineagePrev[id];
+    return out;
+}
+
+// Forward a continued chat's leftover pending injection (sub reports,
+// lifecycle notices) to its lineage head — called at run end (app/030) since
+// the SW migration (_swContinueChatLineage) skips the move while the old chat
+// is still running. Merges into an existing head entry (never clobbers).
+// Returns the head id when something moved, else null.
+// toChatId (optional): explicit target — the delete paths (ui/170 deleteChat,
+// worker/130 tombstone lane) pass the surviving head, since the deleted chat
+// is already unlinked by then.
+function forwardLineageInjection(chatId, toChatId) {
+    if (!chatId || typeof pendingInjectionsByChatId === 'undefined' || !pendingInjectionsByChatId) return null;
+    var entry = pendingInjectionsByChatId[chatId];
+    if (!entry || !(entry.text || (entry.images && entry.images.length))) return null;
+    var head = toChatId ? String(toChatId) : resolveLineageHead(chatId);
+    if (!head || head === String(chatId)) return null;
+    var ex = pendingInjectionsByChatId[head];
+    if (ex) {
+        var txt = [ex.text, entry.text].filter(function(s) { return typeof s === 'string' && s; }).join('\n\n');
+        var imgs = (ex.images || []).concat(entry.images || []);
+        pendingInjectionsByChatId[head] = Object.assign({}, ex, { text: txt, images: imgs }, (ex.hasUserText || entry.hasUserText) ? { hasUserText: true } : {});
+    } else {
+        pendingInjectionsByChatId[head] = entry;
+    }
+    delete pendingInjectionsByChatId[chatId];
+    return head;
+}
+
+// Follow continuedTo links to the newest chat. Returns the input when the
+// chat was never continued. A cycle stops at the last unseen id.
+function resolveLineageHead(chatId) {
+    if (!chatId) return null;
+    var cur = String(chatId);
+    var seen = {};
+    seen[cur] = true;
+    for (;;) {
+        var next = _lineageNextOf(cur);
+        if (!next || seen[next]) break;
+        seen[next] = true;
+        cur = next;
+    }
+    return cur;
+}
+
+// Every chat id in the lineage chain of chatId, oldest → newest (both
+// directions). Always contains chatId itself. Cycle-guarded.
+function getLineageChatIds(chatId) {
+    if (!chatId) return [];
+    var start = String(chatId);
+    var seen = {};
+    seen[start] = true;
+    var back = [];
+    var cur = start;
+    for (;;) {
+        var prev = _lineagePrevOf(cur);
+        if (!prev || seen[prev]) break;
+        seen[prev] = true;
+        back.unshift(prev);
+        cur = prev;
+    }
+    var fwd = [];
+    cur = start;
+    for (;;) {
+        var next = _lineageNextOf(cur);
+        if (!next || seen[next]) break;
+        seen[next] = true;
+        fwd.push(next);
+        cur = next;
+    }
+    return back.concat([start], fwd);
+}
+
+// Union-on-read for the capped lineage copies (ui/170 copyLineagePageState
+// keeps only the newest cachedToolResults / displays on the head): the id
+// of the chat in chatId's lineage whose chats[id][field] holds `key` —
+// chatId itself first, then its predecessors newest → oldest, then its
+// successors. null when no chat in the chain has it.
+function findLineageChatWithEntry(chatId, field, key) {
+    if (!chatId || !field || key == null || typeof chats === 'undefined' || !chats) return null;
+    function has(id) {
+        var c = chats[id];
+        return !!(c && !c._deleted && c[field] && typeof c[field] === 'object' && Object.prototype.hasOwnProperty.call(c[field], key));
+    }
+    var start = String(chatId);
+    if (has(start)) return start;
+    var ids = getLineageChatIds(start);
+    var at = ids.indexOf(start);
+    for (var b = at - 1; b >= 0; b--) if (has(ids[b])) return ids[b];
+    for (var f = at + 1; f < ids.length; f++) if (has(ids[f])) return ids[f];
+    return null;
+}
+
 // Walk a (possibly sub-agent) chat id up to its top-level root chat id.
 // Primary source: the sub-agent registry record for the chat
 // (SubAgents.getByChatId → root_chat_id / parent_chat_id, both twins load
@@ -431,7 +653,9 @@ function resolveRootChatId(chatId) {
         if (!next || next === cur || seen[next]) break;
         cur = String(next);
     }
-    return cur;
+    // A continued top-level chat resolves to its lineage head so grants,
+    // ownership and sub-agent trees follow the conversation forward.
+    return resolveLineageHead(cur);
 }
 
 // True when the chat (or its root) holds an "Allow for this chat" grant for
@@ -442,7 +666,14 @@ function hasChatPermissionGrant(permKey, chatId) {
     if (typeof sessionPermissions === 'undefined' || !sessionPermissions) return false;
     var root = resolveRootChatId(chatId);
     if (!root) return false;
-    return sessionPermissions[chatPermKey(root, permKey)] === 'allow';
+    if (sessionPermissions[chatPermKey(root, permKey)] === 'allow') return true;
+    // Approvals carry over a "Continue in a new chat": a grant made in any
+    // earlier chat of the lineage still applies.
+    var ids = getLineageChatIds(root);
+    for (var i = 0; i < ids.length; i++) {
+        if (sessionPermissions[chatPermKey(ids[i], permKey)] === 'allow') return true;
+    }
+    return false;
 }
 
 // Check if a permission key is instance-scoped

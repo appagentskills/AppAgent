@@ -6,7 +6,7 @@
 // Run: run_tests { files: ['test/sdoc-diff-hunks.test.js'] }
 var WS = args.workspace;
 var U = await runFile('test/ui-helpers.js', { workspace: WS }, WS);
-var SD_FILES = ['src/js/core/055-emoji-shortcodes.js', 'src/js/core/060-ui-constants.js', 'src/js/ui/180-search.js', 'src/js/ui/190-json-format.js',
+var SD_FILES = ['src/js/core/055-emoji-shortcodes.js', 'src/js/core/060-ui-constants.js', 'src/js/core/152-line-diff.js', 'src/js/ui/180-search.js', 'src/js/ui/190-json-format.js',
     'src/js/ui/200-ui-interactions.js', 'src/js/ui/120-ui-utils.js', 'src/js/ui/250-message-render.js', 'src/js/tools/090-display-templates.js',
     'src/js/tools/110-smart-documents.js'];
 

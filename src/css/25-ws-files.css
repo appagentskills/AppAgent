@@ -104,10 +104,18 @@
 .wsf-pr-file-path { flex: 1; min-width: 0; font-family: var(--font-mono, monospace); font-size: 12px; color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: ltr; text-align: start; }
 .wsf-pr-file-head .wsf-meta { margin-inline-start: auto; }
 .wsf-pr-file-body[hidden] { display: none; }
-.wsf-pr-file-body { padding: 0; }
+.wsf-pr-file-body { padding: 0; overflow-x: auto; }
 .wsf-pr-file-body > .wsf-empty, .wsf-pr-file-body > .wsf-file-meta { padding: var(--space-4); }
 .wsf-pr-file-body .wsf-diff-stats { display: none; }
 .wsf-pr-file-body .diff-container { border: none; border-radius: 0; margin: 0; }
+/* Long lines scroll horizontally inside each file body (.wsf-pr-file clips at its rounded border).
+   Rows grow to the widest line so add/remove backgrounds span the whole scrolled width, and the
+   line-number gutters stay pinned at the left edge while scrolling. */
+.wsf-pr-file-body .diff-lines { display: grid; grid-template-columns: minmax(max-content, 1fr); }
+.wsf-pr-file-body .diff-line { min-width: 100%; }
+.wsf-pr-file-body .diff-line-num { position: sticky; z-index: 1; }
+.wsf-pr-file-body .diff-line-num.old { left: 0; }
+.wsf-pr-file-body .diff-line-num.new { left: 50px; } /* .old is 50px wide (border-box) */
 .wsf-pr-desc { border: 1px solid var(--secondary-border); border-radius: var(--radius-md); padding: var(--space-5) var(--space-6); font-size: var(--text-body); line-height: 1.6; color: var(--text-primary); word-wrap: break-word; }
 .wsf-pr-desc > :first-child { margin-top: 0; }
 .wsf-pr-desc > :last-child { margin-bottom: 0; }

@@ -53,7 +53,7 @@ function fireInlineKey(el, key, m) {
     return ev;
 }
 var VH = null; // real 090 diff engine, shared by the diff viewer + workspace-file diffs
-async function versionEngine() { if (!VH) VH = await loadLenient(ICONS.concat([ESC, 'src/js/ui/090-version-history.js']), { window: winStub() }); return VH; }
+async function versionEngine() { if (!VH) VH = await loadLenient(ICONS.concat([ESC, 'src/js/core/152-line-diff.js', 'src/js/ui/090-version-history.js']), { window: winStub() }); return VH; }
 
 // ─────────────────────────── Chat header ───────────────────────────
 describe('ui header › chat title, badges, progress pill', function() {
@@ -868,7 +868,7 @@ describe('version history › combined XML export', function() {
     async function exportEngine(incidentOk) {
         var t = { blob: null, snack: U.recorder() };
         function resp(ok, body) { return { ok: ok, status: ok ? 200 : 404, json: async function() { return body; }, text: async function() { return String(body); } }; }
-        t.m = await loadLenient(ICONS.concat([ESC, 'src/js/core/150-record-helpers.js', 'src/js/ui/090-version-history.js']), {
+        t.m = await loadLenient(ICONS.concat([ESC, 'src/js/core/150-record-helpers.js', 'src/js/core/152-line-diff.js', 'src/js/ui/090-version-history.js']), {
             window: winStub(),
             fetch: async function(url) {
                 if (url.indexOf('/api/now/table/sys_update_version/' + VER) === 0) return resp(true, { result: { payload: '<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include"><sys_script_include action="INSERT_OR_UPDATE"><name>ZZ Include</name></sys_script_include></record_update>' } });

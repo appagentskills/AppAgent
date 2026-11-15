@@ -456,6 +456,43 @@ function _getPushedPRsLive(chat) {
     return prs;
 }
 
+// ---- Chat lineage ("Continue in a new chat") view helpers ----
+// Ids of chatId and every chat it continues (oldest → chatId). A continued
+// chat's views (PRs, workers, widgets, progress) union over these so the UI
+// looks the same after the hand-off. Newer successors are NOT included: the
+// old chat keeps showing only its own history.
+function lineageAncestorIds(chatId) {
+    if (!chatId) return [];
+    var ids = [String(chatId)];
+    try {
+        if (typeof getLineageChatIds === 'function') ids = getLineageChatIds(chatId) || ids;
+    } catch (e) { ids = [String(chatId)]; }
+    var at = ids.indexOf(String(chatId));
+    return at >= 0 ? ids.slice(0, at + 1) : [String(chatId)];
+}
+function lineageAncestorSet(chatId) {
+    var set = Object.create(null);
+    lineageAncestorIds(chatId).forEach(function(id) { set[id] = true; });
+    return set;
+}
+
+// Pushed PRs of chatId plus those of every chat it continues (dedup by URL,
+// newest entry wins its slot, chat order oldest → newest).
+function getPushedPRsForLineage(chatId) {
+    var ids = lineageAncestorIds(chatId);
+    var out = [], byUrl = {};
+    ids.forEach(function(id) {
+        var c = (typeof chats !== 'undefined' && chats) ? chats[id] : null;
+        if (!c) return;
+        (getPushedPRsForChat(c) || []).forEach(function(pr) {
+            if (byUrl[pr.url] !== undefined) { out[byUrl[pr.url]] = pr; return; }
+            byUrl[pr.url] = out.length;
+            out.push(pr);
+        });
+    });
+    return out;
+}
+
 // ---- Sub-agent chat aggregation (sidebar) ----
 // Chats of the given chat's sub-agents whose chat objects still exist in the
 // global `chats` map (any state — running/sleeping/stopped). Built on
@@ -643,6 +680,10 @@ var _sidebarPRCheckedAt = {}; // url -> last background state check (throttle)
 // url -> ISO merged_at learned live (GitHub GET /pulls/N or the merge button).
 // Read by the header dropdown PR filter (merged today only, 040-tools-settings.js).
 var _sidebarPRMergedAt = {};
+// url -> ISO last-activity time (GitHub updated_at, else created_at) learned
+// by _refreshSidebarPRStates. Read by the header dropdown PR list: PRs idle
+// for more than 7 days go under "View more" (040-tools-settings.js).
+var _sidebarPRActivityAt = {};
 
 // Parse "https://<host>/owner/repo/pull/123" (github.com and GHE) into
 // { repo: 'owner/repo', number: 123 }. Returns null on anything else.
@@ -681,6 +722,8 @@ function _refreshSidebarPRStates(prs) {
             if (res && res.ok && res.body && typeof res.body === 'object') {
                 var st = res.body.merged ? 'merged' : (res.body.state === 'closed' ? 'closed' : 'open');
                 if (st === 'merged' && !_sidebarPRMergedAt[pr.url]) _sidebarPRMergedAt[pr.url] = res.body.merged_at || new Date().toISOString();
+                var _act = res.body.updated_at || res.body.created_at;
+                if (_act) _sidebarPRActivityAt[pr.url] = String(_act);
                 if (_sidebarPRState[pr.url] !== st) { _sidebarPRState[pr.url] = st; changed = true; }
             }
         }).catch(function() {});
@@ -898,7 +941,10 @@ function renderVersionSidebar() {
     // Derived from the chat's tool calls/results, so it works retroactively
     // for existing chats with no extra persistence. Shown FIRST, followed by
     // progress (action updates), then the Workers panel.
-    var pushedPRs = getPushedPRsForChat(chats[currentChatId]);
+    // Lineage union: a continued chat also lists the PRs of the chats it
+    // continues (getPushedPRsForLineage — same as the own scan otherwise).
+    var _linSet = lineageAncestorSet(currentChatId);
+    var pushedPRs = getPushedPRsForLineage(currentChatId);
     var _prSeenUrls = {};
     pushedPRs.forEach(function(pr) { _prSeenUrls[pr.url] = true; });
     // Sub-agent aggregation: PRs pushed from this chat's sub-agent chats
@@ -952,7 +998,7 @@ function renderVersionSidebar() {
         // orphaned-sub backfill (PR URL present in THIS chat's transcript —
         // which also recovers the GC'd worker's name for the chip).
         var _orphanHit = null;
-        if (_ownerChatId !== currentChatId && !_subChatNames[_ownerChatId]) {
+        if (!_linSet[_ownerChatId] && !_subChatNames[_ownerChatId]) {
             // Sweep 753-773 (764-worker-chip-asymmetry): run the transcript scan
             // even when the durable root_chat_id stamp already vouches for the
             // entry — for stamped rows it is purely worker-NAME recovery, so a
@@ -960,7 +1006,7 @@ function renderVersionSidebar() {
             // alike. Gate semantics unchanged: stamped rows always render;
             // unstamped rows still need a transcript hit.
             _orphanHit = _orphanedSubPrBelongsHere(pr, _ownerChatId);
-            if (!_orphanHit && pr.root_chat_id !== currentChatId) return;
+            if (!_orphanHit && !_linSet[pr.root_chat_id]) return;
         }
         // Merged/closed skip — moved AFTER ownership resolution and narrowed
         // to WEAK claims (rows accepted solely via the orphan transcript
@@ -974,7 +1020,7 @@ function renderVersionSidebar() {
         // message-scan entries. Weak rows keep the skip so stale history
         // never resurfaces in merely-discussing chats (the accepted tradeoff
         // documented on _orphanedSubPrBelongsHere).
-        var _strongPrOwner = _ownerChatId === currentChatId || !!_subChatNames[_ownerChatId] || pr.root_chat_id === currentChatId;
+        var _strongPrOwner = !!_linSet[_ownerChatId] || !!_subChatNames[_ownerChatId] || !!_linSet[pr.root_chat_id];
         if ((st === 'merged' || st === 'closed') && !_strongPrOwner) return;
         _prSeenUrls[pr.url] = true;
         pushedPRs.push({

@@ -58,7 +58,7 @@ function runChatStreamingWorkerDialogueTests(sources, domDocument) {
             extractStatusMessage:function(s){var m=String(s).match(/"status_message":"([^"]*)"/);return m?m[1]:null;},
             TOOL_DISPLAY_NAMES:{},UI_ICONS:{copy:'copy'},getToolIcon:function(){return '';},escapeHtml:escape,formatJsonPretty:escape,
             scrollToBottomIfAllowed:noop,restoreChatScrollTop:noop,pinToBottom:noop,setupStickyObserver:noop};
-        var names=['_renderCompactThinking','_patchStreamingToolRow','_updateStreamingMessageNow','updateStreamingMessage'];
+        var names=['maskSecretToolArgs','_renderCompactThinking','_patchStreamingToolRow','_updateStreamingMessageNow','updateStreamingMessage'];
         var api=load(env,names.map(function(n){return declaration(render,n);}),names);
         return {env:env,api:api,nodes:nodes,msg:msg,thinking:thinking,content:content,frames:frames,paints:paints,
             counts:function(){return {rebuilds:rebuilds,replacements:replacements,copies:copies};}};
@@ -175,7 +175,9 @@ function runChatStreamingWorkerDialogueTests(sources, domDocument) {
             _findSubAgentCard:function(){return card;},_repaintParent:noop,_subAgentsPersist:noop,saveChatsToStorage:noop,_notifyListeners:noop,
             _callerOwnsTarget:function(){return true;},_drainPool:noop,_mintNewSpawnHandle:function(){return 'h';},_saturationWarning:function(){return null;},
             _escalationSuggestion:function(){return null;},_applyChatModelStamp:noop,_notifySubLifecycle:noop,_providerToTier:function(){return 'same';},console:console,
-            _subChatOpQueue:{}};
+            _subChatOpQueue:{},
+            // Chat lineage (#1327): no chat in this fixture was continued, so the lazy reparent is a no-op.
+            _subLazyReparent:function(){return false;}};
         // C2 cold-chat eviction helpers are loaded REAL (hot chats here, so _subWithChat runs sync).
         var names=['_subIsSkeleton','_subHydrateChat','_subWithChat','_subAppendRows','agentMessage','_withWakeFinalReminder','_wakeSubAgentImpl','_recordSubParentMessage','_formatInboxDrain','_subNormalizeNewlines','_subNoticeMeta','_subNoticeList','_queueNoticeInjection','_noticeRow','_inboxDrainMeta'];
         var api=load(env,names.map(function(n){return declaration(core,n);}),names);

@@ -766,7 +766,22 @@ function _swAnswerPendingPromptViaChat(chatId, text) {
 // late-connecting panels receive the pending approval in their hello /
 // chat-inlined broadcast snapshots (the page merge keeps a non-pending
 // snapshot copy over a pending page one, see _mergePagePendingRows).
+// Password-like args (connect_instance) are never persisted in approval rows nor
+// broadcast to panels; execution keeps using the in-memory args.
+function _swRedactApprovalArgs(args) {
+    if (!args || typeof args !== 'object' || Array.isArray(args)) return args;
+    var out = null;
+    Object.keys(args).forEach(function(k) {
+        if (/^(password|passwd|secret)$/i.test(k) && args[k] !== '' && args[k] != null) {
+            if (!out) out = Object.assign({}, args);
+            out[k] = '[redacted]';
+        }
+    });
+    return out || args;
+}
+
 function _swSeedApprovalRow(chatId, row, _hydrated) {
+    if (row && row.args) row = Object.assign({}, row, { args: _swRedactApprovalArgs(row.args) });
     var chat = chatId && chats[chatId];
     if (!chat || chat._deleted || !row || !row.toolCallId) return;
     if (_sw120IsMsgSkeleton(chat)) {
@@ -1730,7 +1745,7 @@ if (typeof requestProgrammaticToolApproval !== 'function') {
                 // live port) through the approval-prompt path once a panel connects
                 // (see SWM3F-2).
                 parkUIToolCall(targetChatId, approvalRequestId, '__approval_prompt__', {
-                    displayName: displayName, args: args, permissionKey: permissionKey,
+                    displayName: displayName, args: _swRedactApprovalArgs(args), permissionKey: permissionKey,
                     permissionHost: permissionHost,
                     toolCallId: toolCallId, toolName: toolName,
                     widgetName: options.widgetName || null
@@ -1750,7 +1765,7 @@ if (typeof requestProgrammaticToolApproval !== 'function') {
                 toolCallId: toolCallId,
                 approvalRequestId: approvalRequestId,
                 displayName: displayName,
-                args: args,
+                args: _swRedactApprovalArgs(args),
                 permissionKey: permissionKey,
                 permissionHost: permissionHost,
                 toolName: toolName,

@@ -68,7 +68,7 @@ describe('smart documents lazy version bodies',function(){
         if(RealBlob)FakeBlob.prototype=RealBlob.prototype;
         function FakeURL(u,b){return new RealURL(u,b);}
         FakeURL.createObjectURL=function(){return 'blob:test/'+blobs.length;};FakeURL.revokeObjectURL=function(){};
-        m=await loadModules(['src/js/core/095-handle-registry.js','src/js/core/097-sub-agent-registry.js','src/js/core/130-indexeddb.js','src/js/tools/040-file-store.js','src/js/app/035-agent-events.js','src/js/tools/110-smart-documents.js'],{globals:{
+        m=await loadModules(['src/js/core/095-handle-registry.js','src/js/core/097-sub-agent-registry.js','src/js/core/130-indexeddb.js','src/js/tools/040-file-store.js','src/js/app/035-agent-events.js','src/js/core/152-line-diff.js', 'src/js/tools/110-smart-documents.js'],{globals:{
             STORAGE_PREFIX:'test_',self:{},indexedDB:{open:function(){var r={result:database};queueMicrotask(function(){r.onsuccess();});return r;}},
             chats:{root:{displays:{}},child:{displays:{}},sibling:{displays:{}}},activeStreamingChatId:null,currentChatId:null,
             Blob:FakeBlob,URL:FakeURL,

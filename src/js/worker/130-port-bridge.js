@@ -1182,6 +1182,29 @@ function _handlePanelMessage(port, msg) {
             } catch (e) { /* port died — the page probe times out */ }
             return;
 
+        case 'registerLineageLink':
+            // Cheap, synchronous link registration posted by the page BEFORE
+            // it awaits anything in completeSummaryAndCreateNewChat, so a
+            // wake/report addressed to the old chat in that window already
+            // resolves to the head (resolveLineageHead). Port order puts it
+            // ahead of the skeleton pushes and 'continueChatLineage'.
+            if (!msg.from || !msg.to) return;
+            try { if (typeof registerLineageLink === 'function') registerLineageLink(msg.from, msg.to, { stamp: true }); } catch (e) {}
+            return;
+
+        case 'continueChatLineage':
+            // "Continue in a new chat": move the old chat's carried-over state
+            // to the new lineage head (_swContinueChatLineage). Request/reply
+            // like 'query-running'; the page awaits it via
+            // migrateChatLineageOnSW (app/045). Idempotent.
+            if (!msg.from || !msg.to) return;
+            Promise.resolve().then(function() { return _swContinueChatLineage(msg.from, msg.to); }).then(function(res) {
+                try { port.postMessage({ type: 'lineage-migrated', requestId: msg.requestId, from: msg.from, to: msg.to, result: res }); } catch (e) { /* port died — page times out */ }
+            }, function(err) {
+                try { port.postMessage({ type: 'lineage-migrated', requestId: msg.requestId, from: msg.from, to: msg.to, result: { ok: false, errors: [String((err && err.message) || err)] } }); } catch (e) {}
+            });
+            return;
+
         case 'dev-mode':
             // runtime_inspect dev-mode flag. Pushed by the page's
             // _pushDevModeToSW (tools/140-runtime-inspect.js) on bus connect
@@ -1304,6 +1327,34 @@ function _handlePanelMessage(port, msg) {
                 // BEFORE swapping in the tombstone so the stop path's parent-
                 // card finalize writes into the old (discarded) record, never
                 // into the tombstone (which must stay messages:[]).
+                // Lineage guard: a chat that was continued (continuedTo) hands
+                // its workers/grants to the head FIRST (idempotent re-run of the
+                // migration; its reparent + grant copy run synchronously before
+                // the first await), so the exact-match cascade stop below
+                // matches nothing that moved.
+                try {
+                    var _delHead = (typeof resolveLineageHead === 'function') ? resolveLineageHead(msg.chatId) : null;
+                    if (_delHead && _delHead !== msg.chatId) {
+                        Promise.resolve(_swContinueChatLineage(msg.chatId, _delHead, { skipLink: true })).catch(function(eLm) { console.warn('[port-bridge] tombstone: lineage migration failed for chat ' + msg.chatId, eLm); });
+                    }
+                } catch (eL) { console.warn('[port-bridge] tombstone: lineage migration threw for chat ' + msg.chatId, eL); }
+                // Chain repair: join the neighbours (A→B→C minus B = A→C) or
+                // clear the dangling link (head deleted), then persist them.
+                try {
+                    if (typeof unlinkLineageChat === 'function') {
+                        var _ul = unlinkLineageChat(msg.chatId);
+                        if (_ul.touched.length && typeof saveChatsToStorage === 'function') {
+                            Promise.resolve(saveChatsToStorage()).catch(function(eUs) { console.warn('[port-bridge] tombstone: lineage chain save failed', eUs); });
+                        }
+                        // m3: an injection still parked on the deleted chat
+                        // (the migration skips it while that chat runs) goes
+                        // to the surviving head — the old head, or the joined
+                        // chain's new head when the head itself was deleted.
+                        var _injTo = (_delHead && _delHead !== msg.chatId) ? _delHead
+                            : (_ul.prev && typeof resolveLineageHead === 'function' ? resolveLineageHead(_ul.prev) : null);
+                        if (_injTo && _injTo !== msg.chatId && typeof forwardLineageInjection === 'function') forwardLineageInjection(msg.chatId, _injTo);
+                    }
+                } catch (eUl) { console.warn('[port-bridge] tombstone: lineage chain repair failed for chat ' + msg.chatId, eUl); }
                 if (typeof SubAgents !== 'undefined' && SubAgents && typeof SubAgents.stopDescendantsOfChat === 'function') {
                     try { SubAgents.stopDescendantsOfChat(msg.chatId, 'parent chat deleted'); }
                     catch (eS) { console.warn('[port-bridge] tombstone: sub-agent cascade stop failed for chat ' + msg.chatId, eS); }
@@ -1777,6 +1828,165 @@ function _handlePanelMessage(port, msg) {
             } catch (e) {}
             return;
     }
+}
+
+// Copy "Allow for this chat" grants (sessionPermissions keys '<chat>::<perm>')
+// from every earlier chat of the lineage onto the head, so they survive the
+// page's _pruneChatPermissionGrants(old) on delete. Never overwrites a head
+// grant. Persist + rebroadcast like swGrantChatPermission (worker/120).
+// Returns the number of keys copied.
+function _swCopyLineageGrants(fromChatId, toChatId) {
+    if (typeof sessionPermissions === 'undefined' || !sessionPermissions || typeof sessionPermissions !== 'object') return 0;
+    var ids = [];
+    try { ids = (typeof getLineageChatIds === 'function') ? getLineageChatIds(toChatId) : []; } catch (e) { ids = []; }
+    if (ids.indexOf(fromChatId) === -1) ids.push(fromChatId);
+    var tPfx = String(toChatId) + '::';
+    var n = 0;
+    Object.keys(sessionPermissions).forEach(function(k) {
+        for (var i = 0; i < ids.length; i++) {
+            if (ids[i] === toChatId) continue;
+            var pfx = String(ids[i]) + '::';
+            if (k.indexOf(pfx) !== 0) continue;
+            var nk = tPfx + k.slice(pfx.length);
+            if (!Object.prototype.hasOwnProperty.call(sessionPermissions, nk)) { sessionPermissions[nk] = sessionPermissions[k]; n++; }
+            return;
+        }
+    });
+    if (!n) return 0;
+    if (typeof _swPermsDirty !== 'undefined' && _swPermsDirty) _swPermsDirty.sessionPermissionsAdditive = true;
+    if (typeof persistSessionPermissionsInWorker === 'function') persistSessionPermissionsInWorker();
+    if (typeof _swPanelPorts !== 'undefined' && _swPanelPorts && typeof _swPanelPorts.forEach === 'function') {
+        var _pc = { type: 'permissions-changed', sessionPermissions: sessionPermissions };
+        _swPanelPorts.forEach(function(p) { try { p.postMessage(_pc); } catch (e) { /* dead port */ } });
+    }
+    return n;
+}
+
+// "Continue in a new chat" — SW half of the lineage migration (bus
+// 'continueChatLineage', and the tombstone lane before its cascade stop).
+// Idempotent. Everything up to the first await runs SYNCHRONOUSLY (link,
+// sub-agent reparent, grant copy) so a caller that does not await (delete
+// lane) already sees the workers moved. Not handled here (page-only state,
+// phase 3): activeActions[].chatId (tools/120) and dashboardWidgets[].chatId.
+// Parked tool calls / approvals are keyed by the CALLING chat id: a sub's stay
+// under the sub's own chat id (unchanged by reparenting — nothing rejected,
+// and swGrantChatPermission's resolveRootChatId(sub) now resolves to the head);
+// the old chat's own parked calls belong to its own run and are left alone.
+// opts.skipLink: the delete lane re-runs the migration (old, resolved head)
+// — the link step is skipped there so a non-adjacent head's
+// _chatLineagePrev entry (C ← B) is not overwritten with (C ← A).
+async function _swContinueChatLineage(fromChatId, toChatId, opts) {
+    var from = fromChatId ? String(fromChatId) : null;
+    var to = toChatId ? String(toChatId) : null;
+    var out = { ok: false, from: from, to: to, linked: false, reparented: [], rerooted: [], handlesMoved: 0,
+        pendingWakeMoved: false, filesMoved: 0, filesSkipped: [], splitView: 'none', grants: 0,
+        parked: { subs: 0, oldChat: 0, rerouted: 0 }, injection: 'none', actions: 'page', errors: [] };
+    if (!from || !to || from === to) { out.errors.push('invalid from/to'); return out; }
+    // Worker chats are never continued (page gate: ui/170
+    // continueChatBlockReason). reparentChat does not retarget rec.chat_id,
+    // grants are keyed by the root and the workspace ownership transfer would
+    // orphan the sub's files — refuse here too, before any link/state moves.
+    try {
+        var fc = (typeof chats !== 'undefined' && chats) ? chats[from] : null;
+        var isSub = !!(fc && (fc.isSubAgent || fc.parentChatId));
+        if (!isSub && typeof SubAgents !== 'undefined' && SubAgents && typeof SubAgents.getByChatId === 'function') isSub = !!SubAgents.getByChatId(from);
+        if (isSub) { out.errors.push('sub-agent chat cannot be continued'); return out; }
+    } catch (e) { /* best-effort gate; page already refuses */ }
+    // stamp: the SW skeleton gets continuedTo/continuedFrom itself — the
+    // page's 'update-chat' push is dropped while the old chat is still in
+    // runningChatIds/_runCleanupGuard (summary run just finished), and the
+    // delete-lane guard below must still see the link after an SW restart.
+    if (!(opts && opts.skipLink)) {
+        try { if (typeof registerLineageLink === 'function') out.linked = !!registerLineageLink(from, to, { stamp: true }); }
+        catch (e) { out.errors.push('link: ' + ((e && e.message) || e)); }
+        // registerLineageLink refuses a fork (from already continued into a
+        // different chat, or to already continues another): migrating anyway
+        // would split workers/grants/files across two heads.
+        // A replay to the CURRENT head (app/045 retryPendingLineageMigrations,
+        // A→B→C replayed as A→C) is no fork: the chain already leads there,
+        // so the link step is skipped and the migration proceeds.
+        if (!out.linked && typeof registerLineageLink === 'function' && !out.errors.length) {
+            var _chainHead = null;
+            try { _chainHead = (typeof resolveLineageHead === 'function') ? resolveLineageHead(from) : null; } catch (e) { _chainHead = null; }
+            if (_chainHead === to) out.linked = 'chain';
+            else {
+                out.errors.push('link refused: ' + from + ' is already linked to a different chat');
+                return out;
+            }
+        }
+    }
+    var wakeP = null;
+    try {
+        if (typeof SubAgents !== 'undefined' && SubAgents && typeof SubAgents.reparentChat === 'function') {
+            var rp = SubAgents.reparentChat(from, to) || {};
+            out.reparented = rp.reparented || [];
+            out.rerooted = rp.rerooted || [];
+            out.handlesMoved = rp.handlesMoved || 0;
+            wakeP = rp.pendingWake || null;
+        }
+    } catch (e) { out.errors.push('reparent: ' + ((e && e.message) || e)); }
+    try { out.grants = _swCopyLineageGrants(from, to); }
+    catch (e) { out.errors.push('grants: ' + ((e && e.message) || e)); }
+    // M2: the SW's old skeleton must not keep the background-action identity
+    // (the page moved it in copyLineagePageState) — else a SW-side finish or
+    // a skeleton rebroadcast double-finishes / re-hides the old chat. null,
+    // not delete: the put merge's fill-gap carry would restore it.
+    try {
+        var _fa = (typeof chats !== 'undefined' && chats) ? chats[from] : null;
+        if (_fa && _fa.actionId) {
+            var _ta = chats[to];
+            ['isBackground', 'actionId', 'skillId', 'actionName', 'sourceChatId'].forEach(function(k) {
+                if (_ta && _ta[k] === undefined && _fa[k] !== undefined) _ta[k] = _fa[k];
+                _fa[k] = null;
+            });
+            out.actions = 'moved';
+        }
+    } catch (e) { out.errors.push('actions: ' + ((e && e.message) || e)); }
+    try {
+        if (typeof parkedToolCallsByChatId !== 'undefined' && parkedToolCallsByChatId) {
+            out.parked.oldChat = (parkedToolCallsByChatId[from] || []).length;
+            Object.keys(parkedToolCallsByChatId).forEach(function(cid) {
+                var arr = parkedToolCallsByChatId[cid];
+                if (!arr || !arr.length || cid === from) return;
+                var r = (typeof SubAgents !== 'undefined' && SubAgents && SubAgents.getByChatId) ? SubAgents.getByChatId(cid) : null;
+                // Lineage-aware (nit): a root still recorded as an older chat
+                // of the chain counts too.
+                var _rootHead = r ? r.root_chat_id : null;
+                try { if (_rootHead && typeof resolveLineageHead === 'function') _rootHead = resolveLineageHead(_rootHead); } catch (e) {}
+                if (r && (r.parent_chat_id === to || r.root_chat_id === to || _rootHead === to)) out.parked.subs += arr.length;
+            });
+        }
+    } catch (e) { /* counts only */ }
+    try {
+        // An un-flushed injection for a chat that is NOT running would never
+        // be consumed by the old chat — hand it to the head. When the head
+        // already has one, MERGE (text + images) — never clobber, never drop.
+        if (typeof pendingInjectionsByChatId !== 'undefined' && pendingInjectionsByChatId[from]
+            && !(typeof runningChatIds !== 'undefined' && runningChatIds[from])) {
+            var _injSrc = pendingInjectionsByChatId[from], _injEx = pendingInjectionsByChatId[to];
+            if (!_injEx) { pendingInjectionsByChatId[to] = _injSrc; out.injection = 'moved'; }
+            else {
+                var _injTxt = [_injEx.text, _injSrc.text].filter(function(s) { return typeof s === 'string' && s; }).join('\n\n');
+                var _injImgs = (_injEx.images || []).concat(_injSrc.images || []);
+                pendingInjectionsByChatId[to] = Object.assign({}, _injEx, { text: _injTxt, images: _injImgs },
+                    (_injEx.hasUserText || _injSrc.hasUserText) ? { hasUserText: true } : {});
+                out.injection = 'merged';
+            }
+            delete pendingInjectionsByChatId[from];
+        }
+    } catch (e) { out.errors.push('injection: ' + ((e && e.message) || e)); }
+    if (wakeP) { try { out.pendingWakeMoved = !!(await wakeP); } catch (e) { out.errors.push('pendingWake: ' + ((e && e.message) || e)); } }
+    try {
+        if (typeof _wsTransferOwnership === 'function') {
+            var wsOut = {};
+            out.filesMoved = await _wsTransferOwnership(from, to, wsOut, { includeForceTaken: true });
+            out.filesSkipped = wsOut.skipped_force_taken || [];
+        }
+    } catch (e) { out.errors.push('workspace: ' + ((e && e.message) || e)); }
+    try { if (typeof rekeySplitViewChat === 'function') out.splitView = await rekeySplitViewChat(from, to); }
+    catch (e) { out.errors.push('splitView: ' + ((e && e.message) || e)); }
+    out.ok = out.errors.length === 0;
+    return out;
 }
 
 // SWM-S1: extract the trailing user-input block of an incoming chat snapshot

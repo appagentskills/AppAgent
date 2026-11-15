@@ -60,6 +60,9 @@
   "No changes tracked yet": "Muutoksia ei ole vielä seurattu",
   "Message input": "Viestin syöttökenttä",
   "Continue in a new chat": "Jatka uudessa keskustelussa",
+  "Continued: ": "Jatkoa: ",
+  "Sub-agent chats can't be continued in a new chat": "Aliagenttien keskusteluja ei voi jatkaa uudessa keskustelussa",
+  "This chat was already continued in a new chat": "Tätä keskustelua on jo jatkettu uudessa keskustelussa",
   "Summarize and start new chat": "Tiivistä ja aloita uusi keskustelu",
   "Pause or resume": "Keskeytä tai jatka",
   "Continue": "Jatka",
@@ -275,6 +278,7 @@
   "Read Version": "Lue versio",
   "Delete Document": "Poista asiakirja",
   "List Instances": "Luettele instanssit",
+  "Connect Instance": "Yhdistä instanssi",
   "Fetch URL": "Nouda URL",
   "Web Search": "Verkkohaku",
   "Build Extension": "Koosta laajennus",
@@ -1923,5 +1927,12 @@
   "No edited skills": "Ei muokattuja taitoja",
   "Resize sidebar": "Muuta sivupalkin kokoa",
   "Resize split view": "Muuta jaetun näkymän kokoa",
-  "Drag to resize · double-click to reset": "Muuta kokoa vetämällä · palauta kaksoisnapsauttamalla"
+  "Drag to resize · double-click to reset": "Muuta kokoa vetämällä · palauta kaksoisnapsauttamalla",
+  "Chat was continued": "Keskustelua jatkettiin",
+  "Continued from": "Jatkoa keskustelusta",
+  "Continued in": "Jatkuu keskustelussa",
+  "Go to the new chat": "Siirry uuteen keskusteluun",
+  "Send here anyway": "Lähetä silti tänne",
+  "This chat continues in \"{title}\". Workers, PRs and widgets now live there.": "Tämä keskustelu jatkuu kohteessa \"{title}\". Workerit, PR:t ja widgetit ovat nyt siellä.",
+  "deleted chat": "poistettu keskustelu"
 }

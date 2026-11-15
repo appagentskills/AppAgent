@@ -5,7 +5,7 @@ describe('documents PR folders', function() {
     async function load(gh) {
         var WS = args.workspace;
         var U = await runFile('test/ui-helpers.js', { workspace: WS }, WS);
-        return U.loadUi(['src/js/core/060-ui-constants.js', 'src/js/ui/120-ui-utils.js', 'src/js/tools/110-smart-documents.js'], { globals: {
+        return U.loadUi(['src/js/core/060-ui-constants.js', 'src/js/ui/120-ui-utils.js', 'src/js/core/152-line-diff.js', 'src/js/tools/110-smart-documents.js'], { globals: {
             chats: {}, currentChatId: 'c1', currentView: 'documents',
             escDisplay: function(s) { return String(s); }, escapeHtml: function(s) { return String(s); },
             appStorage: { getItem: function() { return null; }, setItem: function() {} },

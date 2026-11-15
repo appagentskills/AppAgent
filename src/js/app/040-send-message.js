@@ -17,6 +17,14 @@ async function sendMessage() {
     // Allow sending if we have a message OR pending images
     if (!message && pendingImageAttachments.length === 0) return;
 
+    // Lineage: this chat was continued in a newer chat — confirm/redirect
+    // (ui/170 confirmSendInContinuedChat) before sending into the old one.
+    if (typeof confirmSendInContinuedChat === 'function' && chats[currentChatId] && chats[currentChatId].continuedTo) {
+        var _sendHere = true;
+        try { _sendHere = await confirmSendInContinuedChat(currentChatId); } catch (eLin) { _sendHere = true; }
+        if (!_sendHere) return;
+    }
+
     // During streaming: queue message and images to inject after current tool results.
     // Gate on the PER-CHAT running flag, not the global `isRunning`. The global tracks
     // foreground UI state and can be incidentally true (e.g. after revealing a background

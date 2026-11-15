@@ -181,6 +181,9 @@ const WORKER_SHARED_FILES = [
     'js/core/130-indexeddb.js',
     'js/core/140-skills-engine.js',
     'js/core/150-record-helpers.js',
+    // 152-line-diff: shared lineDiffOps (Myers) used by tools/020 _wsPrFileLineCounts
+    // and tools/110 _sdocLineDiffArr in the SW; ui/090 computeDiff on the page.
+    'js/core/152-line-diff.js',
     // tools (headless implementations the offscreen runtime can dispatch)
     'js/tools/040-file-store.js',
     'js/tools/050-file-tools.js',

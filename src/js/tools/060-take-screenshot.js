@@ -131,6 +131,67 @@ async function downscaleImageHighQuality(source, scale) {
     return { base64: out, width: newW, height: newH };
 }
 
+// FAST-MODE post-process for take_screenshot target="browser" fast:true.
+// ROOT CAUSE of the ~1s fast-mode post_process: downscaleImageHighQuality
+// encodes with (Offscreen)canvas.convertToBlob, whose encoder in Chrome
+// (CanvasAsyncBlobCreator) runs as an IDLE task and is only forced after a
+// 1000ms idle-start timeout. A fast burst leaves the target tab active, so
+// the AppAgent page is HIDDEN, renders no frames and gets no idle periods ->
+// every encode waited the full ~1s (post_process 1064-1085ms). With
+// restore_tab:true the AppAgent tab is visible again before post-processing,
+// idle periods resume, and the same work took 72ms.
+// This path never uses convertToBlob / idle-scheduled encoders:
+//   decode   createImageBitmap(blob)        (off-main-thread, not idle-gated)
+//   resize   createImageBitmap(bitmap, resizeQuality:'high') — the same
+//            Lanczos-class one-hop resample as the default path, from the
+//            already-decoded bitmap (no second PNG decode)
+//   encode   HTMLCanvasElement.toDataURL('image/jpeg', q) — SYNCHRONOUS, so
+//            it never waits for an idle period; JPEG is ~5-10x faster to
+//            encode and smaller to ship than PNG.
+// A JPEG capture that needs no resize is returned untouched (no re-encode).
+// Returns { base64, width, height, timing: {decode, resize, encode} }.
+var SS_FAST_JPEG_QUALITY = 0.7;
+async function _ssFastPostProcess(dataUrl, maxWidth) {
+    var timing = { decode: 0, resize: 0, encode: 0 };
+    var t = Date.now();
+    var full = await createImageBitmap(_b64DataUrlToBlob(dataUrl));
+    timing.decode = Date.now() - t;
+    var w = full.width, h = full.height;
+    var scale = fitScreenshotScale(w, h, maxWidth);
+    var isJpeg = /^data:image\/jpe?g/i.test(dataUrl);
+    if (scale >= 1 && isJpeg) {
+        try { full.close(); } catch (e) {}
+        return { base64: dataUrl, width: w, height: h, timing: timing };
+    }
+    var outW = w, outH = h, src = full;
+    t = Date.now();
+    if (scale < 1) {
+        outW = Math.max(1, Math.round(w * scale));
+        outH = Math.max(1, Math.round(h * scale));
+        try {
+            src = await createImageBitmap(full, { resizeWidth: outW, resizeHeight: outH, resizeQuality: 'high' });
+        } catch (e) { src = full; } // canvas scaler fallback below
+    }
+    var canvas = document.createElement('canvas');
+    canvas.width = outW; canvas.height = outH;
+    var ctx = canvas.getContext('2d');
+    if (src === full && scale < 1) {
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
+        ctx.drawImage(full, 0, 0, outW, outH);
+    } else {
+        ctx.drawImage(src, 0, 0); // 1:1 blit
+    }
+    timing.resize = Date.now() - t;
+    t = Date.now();
+    var out = canvas.toDataURL('image/jpeg', SS_FAST_JPEG_QUALITY);
+    timing.encode = Date.now() - t;
+    canvas.width = 0; canvas.height = 0;
+    try { if (src !== full) src.close(); } catch (e) {}
+    try { full.close(); } catch (e) {}
+    return { base64: out, width: outW, height: outH, timing: timing };
+}
+
 // --- split_widget: in-place capture of the live split pane -------------------
 // Shoots the visible viewport of the extension page hosting the chat
 // (chrome.tabs.captureVisibleTab on its own tab) and crops it to the widget
@@ -285,7 +346,21 @@ async function executeTakeScreenshot(args, options) {
     var _ssTabId = null;
     if (target === 'browser' || target === 'element') {
         var _ssTgt = await resolveBrowserTabTarget(args.tab_id, 'take_screenshot', { toolLabel: 'take_screenshot target "' + target + '"' });
-        if (_ssTgt.error) return { success: false, error: _ssTgt.error };
+        if (_ssTgt.error) {
+            // restore_tab:true ends a fast burst: hand the user's tab back even
+            // though the target tab is gone (background clears the remembered tab).
+            if (target === 'browser' && args.restore_tab === true) {
+                var _ssRestored;
+                try {
+                    var _ssRr = await Platform.sendBrowserAction('restore_fast_tabs', {}, null);
+                    _ssRestored = _ssRr && _ssRr.restored_tab_ids;
+                } catch (e) {}
+                var _ssTgtErr = { success: false, error: _ssTgt.error };
+                if (_ssRestored) _ssTgtErr.restored_tab_ids = _ssRestored;
+                return _ssTgtErr;
+            }
+            return { success: false, error: _ssTgt.error };
+        }
         _ssTabId = _ssTgt.tabId;
     }
 
@@ -295,9 +370,18 @@ async function executeTakeScreenshot(args, options) {
 
         if (target === 'browser') {
             // Use Chrome Debugger API via background service worker
-            var ssResult = await Platform.sendBrowserAction('take_screenshot', {}, _ssTabId);
+            // fast / restore_tab: see the take_screenshot schema (080-tools.js) and
+            // _handleScreenshotFast in background.js. Absent -> {} (default path).
+            var _ssOpts = {};
+            if (args.fast === true) _ssOpts.fast = true;
+            if (args.restore_tab === true) _ssOpts.restore_tab = true;
+            var _ssT0 = Date.now();
+            var ssResult = await Platform.sendBrowserAction('take_screenshot', _ssOpts, _ssTabId);
+            var _ssT1 = Date.now();
             if (ssResult.error) {
-                return { success: false, error: ssResult.error };
+                var _ssErr = { success: false, error: ssResult.error };
+                if (ssResult.restored_tab_ids) _ssErr.restored_tab_ids = ssResult.restored_tab_ids;
+                return _ssErr;
             }
             var ssId = newFileId();
             var ssBase64 = ssResult.base64;
@@ -308,20 +392,30 @@ async function executeTakeScreenshot(args, options) {
             // captureVisibleTab captures at device pixel ratio, so a 1440px tab on 2x display = 2880px image
             // fitScreenshotScale caps the width at maxWidth and the long edge at
             // SCREENSHOT_MAX_LONG_EDGE (3000px, the cross-provider safe cap)
-            var ssImg = new Image();
-            await new Promise(function(resolve, reject) { ssImg.onload = resolve; ssImg.onerror = reject; ssImg.src = ssBase64; });
-            var ssWidth = ssImg.naturalWidth;
-            var ssHeight = ssImg.naturalHeight;
-            var ssScale = fitScreenshotScale(ssWidth, ssHeight, maxWidth);
-            if (ssScale < 1) {
-                // High-quality one-hop downscale (Lanczos-class). Canvas
-                // drawImage bilinear smeared small text even at 'high' quality.
-                var _ssDs = await downscaleImageHighQuality(ssBase64, ssScale);
-                ssBase64 = _ssDs.base64;
-                ssWidth = _ssDs.width;
-                ssHeight = _ssDs.height;
+            var ssWidth, ssHeight;
+            var _ssPP = null; // fast-mode post-process timing split
+            if (_ssOpts.fast) {
+                var _ssFastPP = await _ssFastPostProcess(ssBase64, maxWidth);
+                ssBase64 = _ssFastPP.base64;
+                ssWidth = _ssFastPP.width;
+                ssHeight = _ssFastPP.height;
+                _ssPP = _ssFastPP.timing;
+            } else {
+                var ssImg = new Image();
+                await new Promise(function(resolve, reject) { ssImg.onload = resolve; ssImg.onerror = reject; ssImg.src = ssBase64; });
+                ssWidth = ssImg.naturalWidth;
+                ssHeight = ssImg.naturalHeight;
+                var ssScale = fitScreenshotScale(ssWidth, ssHeight, maxWidth);
+                if (ssScale < 1) {
+                    // High-quality one-hop downscale (Lanczos-class). Canvas
+                    // drawImage bilinear smeared small text even at 'high' quality.
+                    var _ssDs = await downscaleImageHighQuality(ssBase64, ssScale);
+                    ssBase64 = _ssDs.base64;
+                    ssWidth = _ssDs.width;
+                    ssHeight = _ssDs.height;
+                }
+                ssImg.src = '';
             }
-            ssImg.src = '';
 
             // If CSS viewport emulation is active (mobile resize), crop to emulated width
             var _emVp = window._emulatedViewport;
@@ -336,7 +430,7 @@ async function executeTakeScreenshot(args, options) {
                 var _emImg = new Image();
                 await new Promise(function(res, rej) { _emImg.onload = res; _emImg.onerror = rej; _emImg.src = ssBase64; });
                 _emCtx.drawImage(_emImg, _emCropX, 0, _emCropW, ssHeight, 0, 0, _emCropW, ssHeight);
-                ssBase64 = _emCanvas.toDataURL('image/png');
+                ssBase64 = _ssOpts.fast ? _emCanvas.toDataURL('image/jpeg', SS_FAST_JPEG_QUALITY) : _emCanvas.toDataURL('image/png');
                 ssWidth = _emCropW;
                 _emImg.src = '';
                 _emCanvas.width = 0;
@@ -353,11 +447,31 @@ async function executeTakeScreenshot(args, options) {
             }
             // Compress if over 5MB API limit
             ssBase64 = await compressBase64Image(ssBase64);
+            var _ssFastInfo = null;
+            if (_ssOpts.fast || _ssOpts.restore_tab) {
+                // Echo the background's fast-path markers + a timing split so a
+                // caller can confirm the fast path ran and see where time goes.
+                _ssFastInfo = {
+                    fast: ssResult.fast === true,
+                    switched: ssResult.switched,
+                    restored_tab_ids: ssResult.restored_tab_ids,
+                    format: (String(ssBase64).match(/^data:image\/(\w+)/i) || [])[1] || null,
+                    timing_ms: { background: ssResult.bg_ms, activate: ssResult.activate_ms, capture: ssResult.capture_ms, round_trip: _ssT1 - _ssT0, post_process: Date.now() - _ssT1 }
+                };
+                // Finer split of post_process (fast only): decode / resize /
+                // encode of _ssFastPostProcess. Their sum should be ~post_process.
+                if (_ssPP) {
+                    _ssFastInfo.timing_ms.pp_decode = _ssPP.decode;
+                    _ssFastInfo.timing_ms.pp_resize = _ssPP.resize;
+                    _ssFastInfo.timing_ms.pp_encode = _ssPP.encode;
+                }
+            }
             return {
                 success: true,
                 screenshot_id: ssId,
                 tab_id: _ssTabId,
                 url: ssUrl,
+                fast_mode: _ssFastInfo || undefined,
                 message: 'Screenshot captured: browser tab ' + _ssTabId + ' at ' + ssUrl,
                 dimensions: ssWidth + 'x' + ssHeight,
                 size_bytes: Math.round(ssBase64.length * 0.75),

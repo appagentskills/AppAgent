@@ -1943,10 +1943,13 @@ function _dirtyFileRow(f, meta) {
 // version-sidebar PR item markup (.pr-sidebar-*, 11-version.css). Open PRs
 // with pushed files expand to the workspace files whose pushed_pr points at them.
 var _wsPrExpanded = {}; // PR url -> true while the user keeps it expanded
-// At most _WS_PR_LIMIT rows render; a "View more (N)" button at the end of
-// the section reveals the rest ("Collapse" folds back). _wsPrShowAll survives
-// the poll re-renders and resets each time the dropdown opens.
+// At most _WS_PR_LIMIT RECENT rows render; PRs whose last activity is older
+// than _WS_PR_STALE_MS (7 days, see _wsSplitDropdownPRs) always go behind the
+// "View more (N)" button at the end of the section ("Collapse" folds back).
+// _wsPrShowAll survives the poll re-renders and resets each time the
+// dropdown opens.
 var _WS_PR_LIMIT = 7;
+var _WS_PR_STALE_MS = 7 * 24 * 3600 * 1000;
 var _wsPrShowAll = false;
 // While the dropdown is open, a light poll re-renders the PR section when a
 // PR state (_sidebarPRState: merge / background GitHub refresh), a merge
@@ -1955,7 +1958,7 @@ var _wsPrShowAll = false;
 var _wsPrPollTimer = null;
 var _wsPrPollSig = '';
 function _wsPrSectionSig() {
-    return _wsDropdownPRs().map(function(p) { return p.url + '=' + _wsPrState(p) + ':' + p.files.length; }).join('|');
+    return _wsDropdownPRs().map(function(p) { return p.url + '=' + _wsPrState(p) + ':' + p.files.length + ':' + (_wsPrActivityAt(p) || ''); }).join('|');
 }
 
 function _wsPrRepoFromUrl(url) {
@@ -1980,10 +1983,13 @@ function _wsCollectDropdownPRs(caches, extraPRs) {
             if (!cur.mergedAt && p.merged_at) cur.mergedAt = p.merged_at;
             if (!cur.base && (p.base || base)) cur.base = p.base || base;
             if (!cur.chatId && p.chatId) cur.chatId = p.chatId;
+            var act = _wsLatestTs(p.pushed_at, p.created_at);
+            if (act && (!cur.activityAt || _wsLatestTs(cur.activityAt, act) !== cur.activityAt)) cur.activityAt = act;
             return;
         }
         cur = { url: p.url, number: p.number, title: p.title || p.branch || '', branch: p.branch || '',
-            base: p.base || base || '', chatId: p.chatId || null, metaState: st, mergedAt: p.merged_at || null, files: [] };
+            base: p.base || base || '', chatId: p.chatId || null, metaState: st, mergedAt: p.merged_at || null,
+            activityAt: _wsLatestTs(p.pushed_at, p.created_at), files: [] };
         byUrl[p.url] = cur;
         out.push(cur);
     }
@@ -2012,6 +2018,50 @@ function _wsCollectDropdownPRs(caches, extraPRs) {
     });
     out.sort(function(a, b) { return (Number(b.number) || 0) - (Number(a.number) || 0) || (a.url < b.url ? -1 : a.url > b.url ? 1 : 0); });
     return out;
+}
+
+// Pure: the most recent of the given timestamps (ISO / ms / Date), returned
+// as passed in; unparseable / missing values are ignored; none → null.
+function _wsLatestTs() {
+    var best = null, bestMs = -Infinity;
+    for (var i = 0; i < arguments.length; i++) {
+        var v = arguments[i];
+        if (v == null || v === '') continue;
+        var ms = new Date(v).getTime();
+        if (!isNaN(ms) && ms > bestMs) { bestMs = ms; best = v; }
+    }
+    return best;
+}
+
+// Pure: split the (filtered, sorted) dropdown PR list into the rows shown by
+// default and the rows behind "View more". A PR is STALE when its activity
+// timestamp (activityOf) is older than staleMs before `now`; stale PRs are
+// always hidden. A PR without a timestamp counts as recent (legacy meta.prs
+// entries carry none). Recent PRs beyond `limit` are hidden too. Hidden rows
+// keep the input order (recent overflow first, then stale).
+// opts: { now, limit, staleMs, activityOf(pr) } → { shown: [], hidden: [] }
+function _wsSplitDropdownPRs(prs, opts) {
+    opts = opts || {};
+    var now = opts.now != null ? new Date(opts.now).getTime() : Date.now();
+    var limit = opts.limit != null ? opts.limit : _WS_PR_LIMIT;
+    var staleMs = opts.staleMs != null ? opts.staleMs : _WS_PR_STALE_MS;
+    var activityOf = opts.activityOf || function(p) { return p.activityAt || null; };
+    var recent = [], stale = [];
+    (prs || []).forEach(function(p) {
+        var ts = activityOf(p);
+        var ms = ts ? new Date(ts).getTime() : NaN;
+        if (!isNaN(ms) && now - ms > staleMs) stale.push(p); else recent.push(p);
+    });
+    return { shown: recent.slice(0, limit), hidden: recent.slice(limit).concat(stale) };
+}
+
+// Age reference for a dropdown PR: merged → its merge time; otherwise the
+// latest of the durable push/creation stamp and the live GitHub updated_at
+// (_sidebarPRActivityAt, 120-ui-utils.js). null when nothing is known.
+function _wsPrActivityAt(pr) {
+    if (_wsPrState(pr) === 'merged') return _wsPrMergedAt(pr);
+    var live = (typeof _sidebarPRActivityAt !== 'undefined' && _sidebarPRActivityAt) ? _sidebarPRActivityAt[pr.url] : null;
+    return _wsLatestTs(pr.activityAt, live);
 }
 
 // Pure: true when `ts` (ISO string / ms / Date) falls on the same LOCAL
@@ -2124,8 +2174,9 @@ function _reconcileWsPrSection() {
     sec.innerHTML = '<div class="menu-section-title ws-menu-title ws-pr-title"><span class="section-icon">' + icon + '</span>' + t('Pull Requests ({count})', { count: prs.length }) + '</div>';
     var list = document.createElement('div');
     list.className = 'ws-pr-list';
-    var hiddenCount = Math.max(0, prs.length - _WS_PR_LIMIT);
-    var shown = (hiddenCount > 0 && !_wsPrShowAll) ? prs.slice(0, _WS_PR_LIMIT) : prs;
+    var split = _wsSplitDropdownPRs(prs, { activityOf: _wsPrActivityAt });
+    var hiddenCount = split.hidden.length;
+    var shown = _wsPrShowAll ? split.shown.concat(split.hidden) : split.shown;
     shown.forEach(function(pr) {
         var entry = document.createElement('div');
         var expandable = _wsPrState(pr) === 'open' && pr.files.length > 0;
@@ -2392,7 +2443,9 @@ async function showWorkspaceDropdown() {
     // The refresh only re-renders the version sidebar; the dropdown section
     // picks the new state / merged_at up through the 1.5s poll above.
     if (typeof _refreshSidebarPRStates === 'function') {
-        try { _refreshSidebarPRStates(_wsDropdownPRs().filter(function(p) { return _wsPrState(p) === 'open'; })); } catch (e) { /* best effort */ }
+        // Also PRs with no known activity time (legacy entries), so the
+        // 7-day split can learn GitHub's updated_at for them.
+        try { _refreshSidebarPRStates(_wsDropdownPRs().filter(function(p) { return _wsPrState(p) === 'open' || !_wsPrActivityAt(p); })); } catch (e) { /* best effort */ }
     }
 
     setTimeout(function() {

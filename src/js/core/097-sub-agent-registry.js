@@ -27,10 +27,11 @@
 //   • Sidebar breadcrumb / Workers strip: src/js/ui/170-chat-management.js
 //
 // Pool behavior:
-//   • Pool limits are PER CONNECTION GROUP (Orchestrator §5): 2 concurrent
-//     for Anthropic-OAuth-backed subs (account-level concurrent-request cap
-//     — 4 parallel loops reliably trip 429), SUBAGENT_POOL_SIZE_RELAXED per
-//     endpoint for everything else, SUBAGENT_POOL_GLOBAL_MAX overall.
+//   • Pool limits are PER CONNECTION GROUP (Orchestrator §5) and ADAPTIVE:
+//     each group starts at its static limit (SUBAGENT_POOL_SIZE, or
+//     SUBAGENT_POOL_SIZE_RELAXED for pinned endpoints) and moves by AIMD on
+//     LLM signals (poolReportLLMOutcome); quota exhaustion pauses the group
+//     instead. SUBAGENT_POOL_GLOBAL_MAX still caps the total.
 //   • spawn_sub_agent always creates the record + chat immediately. If
 //     there is a free slot, it kicks runAgent(chatId) now; otherwise the
 //     sub stays in `running` state but its loop has not been started — it
@@ -69,6 +70,15 @@ var SUBAGENT_POOL_SIZE          = 2;
 // regardless of how many distinct groups are active.
 var SUBAGENT_POOL_SIZE_RELAXED  = 4;
 var SUBAGENT_POOL_GLOBAL_MAX    = 6;
+// Adaptive (AIMD) bounds: per-group ceiling, success streak for +1, and the
+// rate-limit-free window required before growing.
+var SUBAGENT_POOL_CEILING       = 8;
+var SUBAGENT_POOL_AIMD_STREAK   = 5;
+var SUBAGENT_POOL_AIMD_QUIET_MS = 60000;
+var SUBAGENT_POOL_AIMD_DECREASE_GAP_MS = 5000;
+// Quota pause with no known reset: re-probe after this long (one sub starts,
+// re-pauses on another quota error) so a group can never stay stuck forever.
+var SUBAGENT_POOL_QUOTA_FALLBACK_MS = 15 * 60 * 1000;
 // Worker-saturation policy (system prompt "WORKER SATURATION" rule): context
 // occupancy is measured against the SAME assumed window for EVERY sub,
 // REGARDLESS of the actual model behind its tier. Deliberate: the agent
@@ -326,6 +336,10 @@ function _connectedPanelCount() {
 // records were created but who haven't been started yet because the pool was
 // full at spawn time.
 var _subPool = { running: Object.create(null), queue: [] };
+// Adaptive per-group pool state (in-memory; see poolReportLLMOutcome).
+var _subPoolDyn = Object.create(null);
+var _subPoolDrainTimer = null;
+var _subPoolDrainAt = 0;
 
 // Listeners notified on any sub-agent state change. UI components register
 // here to re-render the Workers strip / sidebar breadcrumb.
@@ -1269,6 +1283,183 @@ function _poolGroupsSnapshot() {
     return groups;
 }
 
+// ---------- Adaptive per-group limits (AIMD) ----------
+// In-memory state keyed by _poolGroupFor(rec).key. `limit` stays null until
+// the first signal moves it (effective limit = the static start value).
+// Signals arrive from the streaming layer via poolReportLLMOutcome:
+//   rate_limited    → halve (floor 1) + hold new starts until retry-after.
+//   ok              → success streak; every SUBAGENT_POOL_AIMD_STREAK calls
+//                     with the group at its limit and no rate-limit for
+//                     SUBAGENT_POOL_AIMD_QUIET_MS → +1 (≤ ceiling). An ok also
+//                     clears a quota pause (the account works again).
+//   overloaded      → 529/5xx global overload: limit untouched.
+//   quota_exhausted → NOT a concurrency signal: limit untouched, the group is
+//                     paused until resetAt (unknown reset → re-probe after
+//                     SUBAGENT_POOL_QUOTA_FALLBACK_MS), the next ok, or a
+//                     manual SubAgents.resumePoolGroup.
+function _poolDyn(key) {
+    var s = _subPoolDyn[key];
+    if (!s) s = _subPoolDyn[key] = { limit: null, streak: 0, last_rl_at: 0, hold_until: 0, paused_until: 0, pause_reason: null, last_signal: null };
+    return s;
+}
+
+function _poolEffectiveLimit(grp) {
+    var s = _subPoolDyn[grp.key];
+    return (s && s.limit != null) ? s.limit : grp.limit;
+}
+
+// F2: a quota pause whose paused_until has passed WITHOUT an ok is over
+// (_poolGroupBlockedMs already treats it as open) — clear its stale
+// pause_reason/paused_until so agent_status.pool.group_limits stops reporting
+// a past pause. A pause with no known reset (paused_until 0) is untouched.
+function _poolClearExpiredPause(s, now) {
+    if (s && s.pause_reason && s.paused_until && s.paused_until <= now) {
+        s.pause_reason = null; s.paused_until = 0;
+    }
+}
+
+// ms until the group may start subs again (0 = open). Infinity = paused
+// with no known reset (manual resume / next ok).
+function _poolGroupBlockedMs(key, now) {
+    var s = _subPoolDyn[key];
+    if (!s) return 0;
+    now = now || Date.now();
+    _poolClearExpiredPause(s, now);
+    var until = Math.max(s.hold_until || 0, s.paused_until || 0);
+    if (s.pause_reason && !s.paused_until) return Infinity;
+    return until > now ? until - now : 0;
+}
+
+// ONE timer, armed for the EARLIEST pending unblock. A later/longer request
+// never replaces an earlier one; when the timer fires it drains and re-arms
+// for whatever group is still blocked (so a short hold on group B can never
+// cancel group A's longer quota-reset wake-up).
+function _poolScheduleDrain(ms) {
+    if (!(ms > 0) || !isFinite(ms) || typeof setTimeout !== 'function') return;
+    var at = Date.now() + ms;
+    if (_subPoolDrainTimer && _subPoolDrainAt && _subPoolDrainAt <= at) return;
+    if (_subPoolDrainTimer) clearTimeout(_subPoolDrainTimer);
+    _subPoolDrainAt = at;
+    _subPoolDrainTimer = setTimeout(function() {
+        _subPoolDrainTimer = null; _subPoolDrainAt = 0;
+        try { _drainPool(); } finally { _poolRearmDrain(); }
+    }, Math.min(ms + 50, 2147483647));
+}
+
+function _poolRearmDrain() {
+    var now = Date.now(), min = Infinity;
+    for (var k in _subPoolDyn) {
+        var b = _poolGroupBlockedMs(k, now);
+        if (b > 0 && b < min) min = b;
+    }
+    if (min !== Infinity) _poolScheduleDrain(min);
+}
+
+function _poolResolveGroup(target) {
+    if (!target) return null;
+    if (typeof target === 'object' && target.key) return target;
+    var rec = _subRecByChatId(target);
+    if (rec) return _poolGroupFor(rec);
+    if (/^(anthropic-oauth|openai-oauth|unknown|ep:)/.test(String(target))) return { key: String(target), limit: SUBAGENT_POOL_SIZE };
+    // Top-level chat: same connection group as a sub pinned to its provider.
+    var pn = (typeof resolveChatProviderName === 'function') ? resolveChatProviderName(target) : null;
+    return pn ? _poolGroupFor({ provider: pn }) : null;
+}
+
+// Drain from a signal/resume path. Guarded: a throw inside _drainPool must not
+// break the caller (the streaming layer), and re-entry while a drain is
+// already on the stack is a no-op (that drain's loop picks up the new room).
+var _poolDrainingNow = false;
+function _poolDrainSafe() {
+    if (_poolDrainingNow) return;
+    _poolDrainingNow = true;
+    try { _drainPool(); } catch (_) { /* best-effort */ } finally { _poolDrainingNow = false; }
+}
+
+function poolReportLLMOutcome(target, outcome) {
+    try {
+        var grp = _poolResolveGroup(target);
+        if (!grp || !outcome || !outcome.kind) return null;
+        var s = _poolDyn(grp.key), now = Date.now();
+        var cur = _poolEffectiveLimit(grp);
+        s.last_signal = { kind: outcome.kind, at: now };
+        if (outcome.detail) s.last_signal.detail = String(outcome.detail).slice(0, 160);
+        if (outcome.kind === 'rate_limited') {
+            // One decrease per burst: parks/retries of the same congestion
+            // event within SUBAGENT_POOL_AIMD_DECREASE_GAP_MS only extend the hold.
+            if (now - (s.last_rl_at || 0) >= SUBAGENT_POOL_AIMD_DECREASE_GAP_MS) s.limit = Math.max(1, Math.floor(cur / 2));
+            s.streak = 0; s.last_rl_at = now;
+            var hold = outcome.retryAfterMs > 0 ? outcome.retryAfterMs : 0;
+            if (!hold && outcome.resetAt > now) hold = outcome.resetAt - now;
+            if (hold > 0) { s.hold_until = Math.max(s.hold_until || 0, now + hold); _poolScheduleDrain(hold); }
+        } else if (outcome.kind === 'quota_exhausted') {
+            s.streak = 0;
+            var until = (outcome.resetAt > now) ? outcome.resetAt : now + SUBAGENT_POOL_QUOTA_FALLBACK_MS;
+            // Never shorten a still-active pause with a later, vaguer signal.
+            s.paused_until = (s.pause_reason && s.paused_until > until) ? s.paused_until : until;
+            s.pause_reason = String(outcome.detail || 'quota exhausted').slice(0, 160);
+            _poolScheduleDrain(s.paused_until - now);
+        } else if (outcome.kind === 'ok') {
+            var wasPaused = !!s.pause_reason;
+            if (wasPaused) { s.pause_reason = null; s.paused_until = 0; }
+            var raised = false;
+            s.streak++;
+            if (s.streak >= SUBAGENT_POOL_AIMD_STREAK && now - (s.last_rl_at || 0) >= SUBAGENT_POOL_AIMD_QUIET_MS) {
+                s.streak = 0;
+                // Grow only when the limit is actually binding (cwnd validation).
+                if (cur < SUBAGENT_POOL_CEILING && _poolGroupRunningCount(grp.key) >= cur) { s.limit = cur + 1; raised = true; }
+            }
+            // A raised limit or a cleared pause frees capacity NOW: start
+            // queued subs immediately instead of waiting for a running sub to
+            // finish (observed: limit 3, running 2, queued 2 until a release).
+            if ((wasPaused || raised) && _subPool.queue.length) _poolDrainSafe();
+        }
+        // 'overloaded' (529/5xx): recorded as last_signal only.
+        return { group: grp.key, limit: _poolEffectiveLimit(grp), paused_until: s.paused_until || null, pause_reason: s.pause_reason };
+    } catch (e) {
+        return null;
+    }
+}
+
+function poolResumeGroup(key) {
+    var s = _subPoolDyn[key];
+    if (!s) return false;
+    s.pause_reason = null; s.paused_until = 0; s.hold_until = 0;
+    _poolDrainSafe();
+    return true;
+}
+
+// agent_status / broadcast: per-group {running, limit, paused_until?, ...}.
+function _poolGroupLimitsSnapshot() {
+    var out = {}, counts = _poolGroupsSnapshot(), k;
+    for (k in counts) out[k] = { running: counts[k] };
+    for (k in _subPoolDyn) if (!out[k]) out[k] = { running: 0 };
+    var now = Date.now();
+    for (k in out) {
+        var s = _subPoolDyn[k];
+        out[k].limit = (s && s.limit != null) ? s.limit : null;
+        if (out[k].limit == null) {
+            // Static start value: the running subs' group limit (max), else the default.
+            var lim = null;
+            for (var aid in _subPool.running) {
+                if (_subPool.running[aid] === k && _subAgents[aid]) lim = Math.max(lim || 0, _poolGroupFor(_subAgents[aid]).limit);
+            }
+            out[k].limit = lim || SUBAGENT_POOL_SIZE;
+        }
+        if (!s) continue;
+        _poolClearExpiredPause(s, now);
+        if (s.pause_reason) {
+            out[k].paused_until = s.paused_until ? new Date(s.paused_until).toISOString() : 'manual resume';
+            out[k].pause_reason = s.pause_reason;
+        } else if (s.hold_until > now) {
+            out[k].paused_until = new Date(s.hold_until).toISOString();
+            out[k].pause_reason = 'rate-limited (retry-after)';
+        }
+        if (s.last_signal) out[k].last_signal = s.last_signal;
+    }
+    return out;
+}
+
 function _drainPool() {
     // Pull subs off the queue until either the queue is empty or no slots
     // remain. Each started sub kicks runAgent on its chat. runAgent is
@@ -1300,8 +1491,9 @@ function _drainPool() {
         // capacity is SKIPPED (keeps its queue position — fairness preserved,
         // FIFO across parents), letting later subs on OTHER groups start.
         // It is retried on the next drain (slot release / new spawn / wake).
+        // Adaptive: dynamic AIMD limit + quota pause / retry-after hold.
         var _grp = _poolGroupFor(rec);
-        if (_poolGroupRunningCount(_grp.key) >= _grp.limit) {
+        if (_poolGroupBlockedMs(_grp.key) > 0 || _poolGroupRunningCount(_grp.key) >= _poolEffectiveLimit(_grp)) {
             i++;
             continue;
         }
@@ -2773,9 +2965,165 @@ function _callerOwnsTarget(callerChatId, callerAgentId, targetRec) {
         }
         return false;
     }
-    // Top-level (non-sub) caller: must own the root chat.
-    return (targetRec.root_chat_id === callerChatId)
-        || (targetRec.parent_chat_id === callerChatId);
+    // Top-level (non-sub) caller: must own the root chat — or sit on the same
+    // "Continue in a new chat" lineage as it (core/070 resolveLineageHead), so
+    // a continuation can stop/wake/message the workers its predecessor spawned.
+    return _subSameLineage(targetRec.root_chat_id, callerChatId)
+        || _subSameLineage(targetRec.parent_chat_id, callerChatId);
+}
+
+// ---------- Chat lineage ("Continue in a new chat") ----------
+// The old chat gets continuedTo:newId; its workers move to the lineage head.
+// reparentChat is the eager migration; _subLazyReparent is the safety net
+// for a report/message/wake that arrives for a sub whose record still points
+// at a continued (old) chat. stopDescendantsOfChat/_descendantsOfChat stay
+// EXACT-match on purpose: deleting the old chat must not kill moved workers.
+function _subLineageHead(chatId) {
+    if (!chatId) return chatId;
+    try {
+        return (typeof resolveLineageHead === 'function') ? (resolveLineageHead(chatId) || chatId) : chatId;
+    } catch (e) { return chatId; }
+}
+
+function _subSameLineage(a, b) {
+    if (!a || !b) return false;
+    if (a === b) return true;
+    return _subLineageHead(a) === _subLineageHead(b);
+}
+
+// Move a parent chat's durable wake record (IDB pending_wakes, keyed by
+// parent chat id) onto the continuation, merging notices into any record the
+// target already has. Best-effort; resolves true when a record moved.
+function _movePendingWake(fromChatId, toChatId) {
+    if (!fromChatId || !toChatId || fromChatId === toChatId) return Promise.resolve(false);
+    if (typeof openDatabase !== 'function' || typeof pendingWakesStoreName === 'undefined') return Promise.resolve(false);
+    return _pendingWakesStore('readwrite').then(function(store) {
+        return new Promise(function(resolve) {
+            var getFrom = store.get(fromChatId);
+            getFrom.onsuccess = function() {
+                var src = getFrom.result;
+                if (!src) { resolve(false); return; }
+                var getTo = store.get(toChatId);
+                getTo.onsuccess = function() {
+                    var dst = getTo.result || { parentChatId: toChatId, notices: [], attempts: 0 };
+                    if (!Array.isArray(dst.notices)) dst.notices = [];
+                    var srcNotices = Array.isArray(src.notices) ? src.notices : [];
+                    for (var i = 0; i < srcNotices.length; i++) {
+                        var n = srcNotices[i];
+                        if (!n) continue;
+                        // Dedupe by agent id + text: two workers sending the
+                        // same text ("done") are distinct notices.
+                        var dup = dst.notices.some(function(d) {
+                            return d && ((d.sub_id || null) === (n.sub_id || null))
+                                && ((d.text || null) === (n.text || null));
+                        });
+                        if (!dup) dst.notices.push(n);
+                    }
+                    dst.parentChatId = toChatId;
+                    dst.lastEventAt = Date.now();
+                    var put = store.put(dst);
+                    put.onsuccess = function() { resolve(true); };
+                    put.onerror = function() { resolve(false); };
+                };
+                getTo.onerror = function() { resolve(false); };
+            };
+            getFrom.onerror = function() { resolve(false); };
+        });
+    }).then(function(moved) {
+        // Drop the old row only once the merged row landed (reuses the
+        // existing delete site — see build/write-site-ratchet.json).
+        if (!moved) return false;
+        return clearPendingWake(fromChatId).then(function() {
+            // The merged notices now live under the head: deliver them now
+            // instead of waiting for the next heartbeat drain (SW-only; the
+            // drain no-ops on the page and shares the in-flight latch).
+            if (typeof _drainPendingWakesForChat === 'function') {
+                try {
+                    Promise.resolve(_drainPendingWakesForChat(toChatId)).catch(function() {});
+                } catch (_dErr) { /* best-effort */ }
+            }
+            return true;
+        });
+    }).catch(function(e) {
+        console.warn('[sub-agents] _movePendingWake failed', fromChatId, '->', toChatId, e);
+        return false;
+    });
+}
+
+// Eager migration for "Continue in a new chat": every depth-1 sub whose
+// parent_chat_id === fromChatId moves to toChatId, every record whose
+// root_chat_id === fromChatId (all depths) gets root toChatId; the sub
+// chats' parentChatId / same_as / paused-by-parent stamps follow; records
+// are persisted; spawn handles are rekeyed (Handles.rekey) and the durable
+// pending wake is moved. Idempotent (a second call finds nothing to move).
+// Returns { reparented:[agent_id], rerooted:[agent_id], handlesMoved, pendingWake:Promise }.
+function reparentChat(fromChatId, toChatId) {
+    var out = { reparented: [], rerooted: [], handlesMoved: 0, pendingWake: Promise.resolve(false) };
+    if (!fromChatId || !toChatId || fromChatId === toChatId) return out;
+    var from = String(fromChatId), to = String(toChatId);
+    for (var aid in _subAgents) {
+        var rec = _subAgents[aid];
+        if (!rec) continue;
+        var changed = false;
+        if (rec.parent_chat_id === from && !rec.parent_agent_id) {
+            rec.parent_chat_id = to;
+            out.reparented.push(aid);
+            changed = true;
+        }
+        if (rec.root_chat_id === from) {
+            rec.root_chat_id = to;
+            if (out.reparented.indexOf(aid) === -1) out.rerooted.push(aid);
+            changed = true;
+        }
+        if (rec.paused_by_parent_chat === from) { rec.paused_by_parent_chat = to; changed = true; }
+        if (rec.chat_id && typeof _pausedByParentChat !== 'undefined' && _pausedByParentChat[rec.chat_id]
+            && _pausedByParentChat[rec.chat_id].parentChatId === from) {
+            _pausedByParentChat[rec.chat_id].parentChatId = to;
+        }
+        try {
+            var sc = (rec.chat_id && typeof chats !== 'undefined' && chats) ? chats[rec.chat_id] : null;
+            if (sc) {
+                if (sc.parentChatId === from) { sc.parentChatId = to; changed = true; }
+                if (sc.same_as === from) { sc.same_as = to; changed = true; }
+            }
+        } catch (e) { /* chats map best-effort */ }
+        if (changed) _subAgentsPersist(rec);
+    }
+    try {
+        if (typeof Handles !== 'undefined' && Handles && typeof Handles.rekey === 'function') {
+            out.handlesMoved = Handles.rekey(from, to) || 0;
+        }
+    } catch (e) { console.warn('[sub-agents] reparentChat: Handles.rekey failed', e); }
+    out.pendingWake = _movePendingWake(from, to);
+    if (out.reparented.length || out.rerooted.length) {
+        try { _notifyListeners(); } catch (e) { /* listeners best-effort */ }
+    }
+    return out;
+}
+
+// Lazy safety net: a sub whose parent (depth 1) or root chat was continued
+// after the eager migration ran (or whose migration was lost to an SW death)
+// is reparented on the next report / message / wake / handle settle.
+// SW-authoritative; the page mirror never mutates. Returns true on a move.
+function _subLazyReparent(rec) {
+    if (!rec) return false;
+    var _authoritative = (typeof Platform === 'undefined') || (Platform.isWorker === true);
+    if (!_authoritative) return false;
+    try {
+        var moved = false;
+        if (rec.parent_chat_id && !rec.parent_agent_id) {
+            var ph = _subLineageHead(rec.parent_chat_id);
+            if (ph && ph !== rec.parent_chat_id) { reparentChat(rec.parent_chat_id, ph); moved = true; }
+        }
+        if (rec.root_chat_id) {
+            var rh = _subLineageHead(rec.root_chat_id);
+            if (rh && rh !== rec.root_chat_id) { reparentChat(rec.root_chat_id, rh); moved = true; }
+        }
+        return moved;
+    } catch (e) {
+        console.warn('[sub-agents] _subLazyReparent failed for', rec && rec.agent_id, e);
+        return false;
+    }
 }
 
 function _makeDeferred() {
@@ -2811,7 +3159,7 @@ function markReportCollected(callerChatId, handleId) {
     for (var aid in _subAgents) {
         var r = _subAgents[aid];
         if (r && r.spawn_handle_id === handleId
-            && (!callerChatId || r.parent_chat_id === callerChatId)) {
+            && (!callerChatId || _subSameLineage(r.parent_chat_id, callerChatId))) {
             if (!r.report_collected) {
                 r.report_collected = true;
                 _subAgentsPersist(r);
@@ -3667,6 +4015,7 @@ function _wakeParentOnReport(rec, report, opts) {
     opts = opts || {};
     try {
         if (!rec) return false;
+        _subLazyReparent(rec); // chat lineage: route to the continuation
         // wake_parent:false opt-out (spawn-time, or a wake_sub_agent
         // override): never wake / inject into the parent MODEL — but still
         // surface the report to the USER with a passive UI-only row
@@ -3908,6 +4257,7 @@ function _wakeParentOnReport(rec, report, opts) {
 function _resolveSpawnHandle(agentId, payload) {
     var rec = _subAgents[agentId];
     if (!rec) return;
+    _subLazyReparent(rec); // chat lineage: settle into the continuation's bucket
     var hid = rec.spawn_handle_id;
     var d = _spawnDeferreds[hid];
     if (!d) return; // already resolved
@@ -4471,6 +4821,7 @@ function reportToParent(args, ctx) {
     if (!rec) {
         return { success: false, error: 'report_to_parent: sub-agent record missing.' };
     }
+    _subLazyReparent(rec); // chat lineage: the parent may have been continued
 
     var status = args.status;
     // `status` is informational only — every call settles the handle and parks
@@ -5296,6 +5647,7 @@ function agentMessage(args, ctx, _regMissRetried) {
         if (!fromIsSub) return { success: false, error: 'agent_message: only sub-agents can send to "parent".' };
         var rec = _subAgents[chats[fromChatId].subAgentId];
         if (!rec) return { success: false, error: 'agent_message: sub record missing.' };
+        _subLazyReparent(rec); // chat lineage: the parent may have been continued
         if (chats[rec.parent_chat_id]) {
             // See terminal-report path above: subChatId is persisted on the
             // row so the "open transcript" link survives registry GC.
@@ -6207,7 +6559,7 @@ function agentStatus(args, ctx) {
         || (typeof activeStreamingChatId !== 'undefined' ? activeStreamingChatId : null)
         || (typeof currentChatId !== 'undefined' ? currentChatId : null);
     if (args.parent_chat_id !== '*' && !parentChatId) {
-        return { success: true, agents: [], pool: { running: Object.keys(_subPool.running).length, queued: _subPool.queue.length, size: SUBAGENT_POOL_SIZE, global_max: SUBAGENT_POOL_GLOBAL_MAX, groups: _poolGroupsSnapshot() }, note: 'no parent chat context resolvable; pass parent_chat_id explicitly or "*" for all' };
+        return { success: true, agents: [], pool: { running: Object.keys(_subPool.running).length, queued: _subPool.queue.length, size: SUBAGENT_POOL_SIZE, global_max: SUBAGENT_POOL_GLOBAL_MAX, groups: _poolGroupsSnapshot(), group_limits: _poolGroupLimitsSnapshot() }, note: 'no parent chat context resolvable; pass parent_chat_id explicitly or "*" for all' };
     }
     var out = [];
     for (var aid in _subAgents) {
@@ -6220,7 +6572,10 @@ function agentStatus(args, ctx) {
         // the everything-on-the-instance escape hatch (unchanged).
         if (args.parent_chat_id !== '*') {
             var rRoot = r.root_chat_id || r.parent_chat_id;
-            if (rRoot !== parentChatId && r.parent_chat_id !== parentChatId) continue;
+            // Lineage: a continued chat also sees the workers of its
+            // "Continue in a new chat" predecessors (and vice versa).
+            if (rRoot !== parentChatId && r.parent_chat_id !== parentChatId &&
+                !(typeof _subSameLineage === 'function' && (_subSameLineage(rRoot, parentChatId) || _subSameLineage(r.parent_chat_id, parentChatId)))) continue;
         }
         out.push(args.verbose ? snap(r) : snapCompact(r));
     }
@@ -6232,7 +6587,7 @@ function agentStatus(args, ctx) {
         if (ra !== rb) return ra - rb;
         return b.last_activity_at - a.last_activity_at;
     });
-    var resp = { success: true, agents: out, pool: { running: Object.keys(_subPool.running).length, queued: _subPool.queue.length, size: SUBAGENT_POOL_SIZE, global_max: SUBAGENT_POOL_GLOBAL_MAX, groups: _poolGroupsSnapshot() } };
+    var resp = { success: true, agents: out, pool: { running: Object.keys(_subPool.running).length, queued: _subPool.queue.length, size: SUBAGENT_POOL_SIZE, global_max: SUBAGENT_POOL_GLOBAL_MAX, groups: _poolGroupsSnapshot(), group_limits: _poolGroupLimitsSnapshot() } };
     if (!args.verbose && out.length) resp.note = 'compact list — pass verbose:true (or agent_id for one sub) for the full per-agent detail';
     // Optional tree assembly (Phase 5). When `include_tree:true`, attach a
     // parent_agent_id-keyed map of children agent_ids so callers can render
@@ -6876,6 +7231,10 @@ var SubAgents = {
     // toggle-pause handler (worker/130-port-bridge.js).
     pauseDescendantsOfChat: pauseDescendantsOfChat,
     stopDescendantsOfChat: stopDescendantsOfChat,
+    // Chat lineage ("Continue in a new chat"): eager migration of a chat's
+    // workers/handles/pending wakes to its continuation (see reparentChat).
+    reparentChat: reparentChat,
+    lazyReparent: _subLazyReparent,
     resumeDescendantsOfChat: resumeDescendantsOfChat,
     stuckSignal: _subStuckSignal,
     drainPendingWakesForChat: _drainPendingWakesForChat,
@@ -6985,9 +7344,14 @@ var SubAgents = {
             size:    SUBAGENT_POOL_SIZE,
             // Orchestrator §5: per-connection-group pool limits.
             global_max: SUBAGENT_POOL_GLOBAL_MAX,
-            groups:  _poolGroupsSnapshot()
+            groups:  _poolGroupsSnapshot(),
+            // Adaptive per-group {running, limit, paused_until?, pause_reason?, last_signal?}.
+            group_limits: _poolGroupLimitsSnapshot()
         };
     },
+    // Adaptive pool: streaming-layer signal sink + manual resume of a paused group.
+    reportLLMOutcome:  poolReportLLMOutcome,
+    resumePoolGroup:   poolResumeGroup,
     // Pool-deadlock prevention hooks (Phase 5). Called by the await_handle
     // dispatch arm when a sub awaits one of its own descendants' spawn handles.
     parkForAwait:      parkForAwait,

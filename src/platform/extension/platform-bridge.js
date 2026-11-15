@@ -269,6 +269,29 @@
         });
     };
 
+    // Re-probe a validated token for instanceUrl, skipping staleToken (e.g. a g_ck
+    // rotated by impersonation). On success updates the cached instance token and,
+    // for the active instance, window.sessionToken. Resolves the new token or ''
+    // (nothing different and valid found — the caller keeps its current token).
+    Platform.refreshTokenForInstance = function(instanceUrl, staleToken) {
+        return new Promise(function(resolve) {
+            chrome.runtime.sendMessage({ type: 'get-token-for-instance', instanceUrl: instanceUrl, excludeToken: staleToken || '', validate: true }, function(response) {
+                if (chrome.runtime.lastError || !response || !response.token || response.token === staleToken) {
+                    resolve('');
+                    return;
+                }
+                for (var i = 0; i < Platform.instances.length; i++) {
+                    if (Platform.instances[i].url === instanceUrl) {
+                        Platform.instances[i].token = response.token;
+                        if (response.userName) Platform.instances[i].userName = response.userName;
+                    }
+                }
+                if (instanceUrl === Platform.instanceUrl) window.sessionToken = response.token;
+                resolve(response.token);
+            });
+        });
+    };
+
     // Find a tab ID for a specific instance (for iframe_tool targeting).
     // When a target URL is given, only return a tab already sitting on that page
     // (same origin + path) — returning an arbitrary tab would let the caller

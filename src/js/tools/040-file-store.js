@@ -377,12 +377,20 @@ function _chatFileIdsSync(chatId, role) {
     return out;
 }
 
-async function executeGetFile(args) {
+// _internal (3rd param, never reachable from tool args — the dispatcher in
+// tools/020-tool-execution.js calls executeGetFile(args) only): in-process
+// callers such as local_folder share pass { meta: {name, mime, size} }.
+async function executeGetFile(args, _options, _internal) {
     var id = args.id;
     if (!id) return { success: false, error: 'id is required' };
 
     // Try async first (handles workspace files); getFileAsync already falls back to getFile()
-    var file = await getFileAsync(id);
+    // Internal meta ({name, mime, size}; local_folder share via _internal): the
+    // download card needs metadata only — never read / base64 the bytes (folder
+    // files > the 25 MB read cap would throw TOO_LARGE). args._meta from a tool
+    // call is ignored (a caller must not fake name/mime/size for any file_id).
+    var _im = (_internal && _internal.meta) || null;
+    var file = (args.download && _im) ? { id: id, name: _im.name, mime: _im.mime, size: _im.size } : await getFileAsync(id);
     if (!file) {
         // Collect available file_ids for error message
         var available = [];
@@ -398,7 +406,8 @@ async function executeGetFile(args) {
     // Download-only mode: return metadata + auto-render a download card widget
     if (args.download) {
         var size = 0;
-        if (file.data && typeof file.data === 'string') {
+        if (typeof file.size === 'number' && file.size > 0) size = file.size;
+        else if (file.data && typeof file.data === 'string') {
             if (file.data.indexOf('data:') === 0) {
                 var commaIdx = file.data.indexOf(',');
                 if (commaIdx > -1) size = Math.round((file.data.length - commaIdx - 1) * 3 / 4);

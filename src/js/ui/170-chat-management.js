@@ -816,13 +816,339 @@ function buildContinuationSeed(oldChatId, summary, userMessages) {
         '- Treat the summary as your memory of earlier work. Don\'t redo completed or verified steps, and don\'t re-ask questions the user already answered there.\n' +
         '- For exact details not in the summary (full error text, raw outputs, earlier messages), use `chat_history` with chat_id ' + id + ' (search with a regex, or get messages) instead of guessing or asking the user.\n' +
         '- Live instance and repo state may have changed since then. Re-check before acting on anything stale.\n' +
-        '- User instructions, approvals and denials in the summary still apply. Approvals for destructive actions don\'t carry over automatically.\n\n' +
+        '- User instructions, approvals and denials in the summary still apply. Tool approvals granted for the previous chat ("Allow for this chat") carry over to this chat.\n' +
+        '- Workers, open PRs, workspace edits, widgets and the progress card carry over too (see the handover state below, if present): keep using the same agent_ids, widget_ids and PR branch_name instead of re-creating them.\n\n' +
         'If the summary has a concrete next step that follows directly from my latest request and needs no decision from me, continue with it without asking for more input. Otherwise, briefly confirm where we left off and wait for my next instruction.';
+}
+
+// Code-generated live-state handover appended to the continuation seed: what
+// carries over (open PRs, workers, split/other widgets, progress card). Built
+// from page mirrors only (never the model) and best-effort — every probe is
+// typeof-guarded so a missing subsystem just drops its line. Async only for
+// the workspace scan (IDB); build it BEFORE the migration re-stamps rows.
+async function buildLineageHandoverBlock(oldChatId) {
+    var lines = [];
+    var lineageIds = (typeof getLineageChatIds === 'function') ? getLineageChatIds(oldChatId) : [oldChatId];
+    var inLineage = {};
+    lineageIds.forEach(function(id) { inLineage[id] = true; });
+    try {
+        var prs = (typeof getPushedPRsForLineage === 'function') ? getPushedPRsForLineage(oldChatId) : [];
+        if (prs && prs.length) {
+            lines.push('Open PRs (append with workspace push using the same branch_name):');
+            prs.forEach(function(p) { lines.push('- #' + p.number + ' ' + (p.url || '') + (p.branch ? ' (branch `' + p.branch + '`)' : '')); });
+        }
+    } catch (e) {}
+    try {
+        var subs = (typeof subAgentsForChatTree === 'function') ? subAgentsForChatTree(oldChatId) : [];
+        var live = (subs || []).filter(function(r) { return r && !r._reconstructed && (r.state === 'running' || r.state === 'sleeping'); });
+        if (live.length) {
+            lines.push('Live workers (now owned by this chat):');
+            live.forEach(function(r) {
+                lines.push('- ' + r.agent_id + (r.name ? ' "' + r.name + '"' : '') + ' — ' + r.state +
+                    (r.spawn_handle_id ? ' (spawn handle ' + r.spawn_handle_id + ')' : ''));
+            });
+        }
+    } catch (e) {}
+    try {
+        // Raw record first: registerLineageLink already ran, so
+        // getSplitViewRecord(oldChatId) resolves to the (record-less) head.
+        var sv = (typeof _splitViews !== 'undefined' && _splitViews && _splitViews[oldChatId]) || null;
+        if (!sv && typeof getSplitViewRecord === 'function') sv = getSplitViewRecord(oldChatId);
+        var splitId = sv && !sv.closed && sv.widgetId ? sv.widgetId : null;
+        if (splitId) {
+            var ver = null;
+            // WidgetStore.view(id) (core/135) → { …, contentVersion, latestVersion }.
+            try { var w0 = (typeof WidgetStore !== 'undefined' && WidgetStore.view) ? WidgetStore.view(splitId) : null; ver = w0 && (w0.latestVersion || w0.contentVersion) || null; } catch (e) {}
+            lines.push('Split pane widget: ' + splitId + (ver ? ' (version ' + ver + ')' : '') + ' — keep editing it (html_widget read, then save with expected_version).');
+        }
+        var ws = (typeof getWidgetsForChat === 'function') ? getWidgetsForChat(oldChatId) : [];
+        var others = (ws || []).map(function(w) { return w && w.id; }).filter(function(id) { return id && id !== splitId; });
+        if (others.length) lines.push('Other widgets: ' + others.join(', '));
+    } catch (e) {}
+    try {
+        var prog = (typeof getChatProgressStateFor === 'function') ? getChatProgressStateFor(oldChatId) : null;
+        if (prog && (prog.label || prog.state)) {
+            var tasks = Array.isArray(prog.tasks) ? prog.tasks.map(function(t0) { return (t0.status || 'pending') + ': ' + (t0.label || ''); }).join('; ') : '';
+            lines.push('Progress card: "' + (prog.label || '') + '" (' + (prog.state || 'running') + ')' + (tasks ? ' — tasks: ' + tasks : '') + '. Keep updating it with update_action_state.');
+        }
+    } catch (e) {}
+    try {
+        // Chat-scoped smart docs: tools/110 smartDocuments cache, owned by any
+        // lineage chat (ownerChatId) — _sdocChatChain keeps them readable here.
+        var docs = [];
+        if (typeof smartDocuments !== 'undefined' && smartDocuments) {
+            Object.keys(smartDocuments).forEach(function(did) {
+                var d = smartDocuments[did];
+                if (d && d.scope === 'chat' && d.ownerChatId && inLineage[d.ownerChatId]) docs.push(did + (d.title ? ' "' + d.title + '"' : ''));
+            });
+        }
+        if (docs.length) lines.push('Chat-scoped smart docs (still readable here): ' + docs.join(', '));
+    } catch (e) {}
+    var wsLines = [];
+    try {
+        // Uncommitted workspace edits owned by the lineage (or one of its
+        // workers, via _wsRootChatId) — the migration re-stamps them to this chat.
+        if (typeof getAllWorkspaceFilesAllRepos === 'function') {
+            var rows = await getAllWorkspaceFilesAllRepos();
+            var byRepo = {};
+            (rows || []).forEach(function(f) {
+                var owner = f && f.dirty && f.last_modified_by_chat_id;
+                if (!owner || !f.path) return;
+                var root = null;
+                try { root = (typeof _wsRootChatId === 'function') ? _wsRootChatId(owner) : null; } catch (e) { root = null; }
+                if (!inLineage[owner] && !(root && inLineage[root])) return;
+                (byRepo[f.repo || '?'] = byRepo[f.repo || '?'] || []).push(f.path);
+            });
+            Object.keys(byRepo).sort().forEach(function(repo) {
+                var paths = byRepo[repo].sort();
+                wsLines.push('- ' + repo + ': ' + paths.slice(0, 25).join(', ') + (paths.length > 25 ? ' (+' + (paths.length - 25) + ' more)' : ''));
+            });
+        }
+    } catch (e) {}
+    if (wsLines.length) {
+        lines.push('Uncommitted workspace edits now owned by this chat (push them with an explicit files list):');
+        wsLines.forEach(function(l) { lines.push(l); });
+    }
+    if (!lines.length) return '';
+    return '<handover_state>\n' + lines.join('\n') + '\n</handover_state>';
+}
+
+// buildLineageHandoverBlock bounded by a timeout: it runs inside the
+// migration reservation window, so a hung probe (IDB scan) must not keep the
+// reservation forever. Resolves '' on timeout or error; never rejects.
+var LINEAGE_HANDOVER_TIMEOUT_MS = 5000;
+function buildLineageHandoverBlockBounded(oldChatId, timeoutMs) {
+    var ms = timeoutMs || (typeof LINEAGE_HANDOVER_TIMEOUT_MS === 'number' ? LINEAGE_HANDOVER_TIMEOUT_MS : 5000);
+    var timer = null;
+    var timeout = new Promise(function(resolve) {
+        timer = setTimeout(function() { console.warn('[continue] handover block timed out after ' + ms + 'ms'); resolve(''); }, ms);
+    });
+    var work;
+    try { work = Promise.resolve(buildLineageHandoverBlock(oldChatId)).catch(function() { return ''; }); }
+    catch (e) { work = Promise.resolve(''); }
+    return Promise.race([work, timeout]).then(function(v) { if (timer) clearTimeout(timer); return v || ''; });
+}
+
+// Page-only state copied from the old chat into its continuation — the
+// editMessage recipe (app/050) plus the rest of what the UI shows: artifacts
+// (versionHistory, chatId rewritten), cached tool results, display templates,
+// widget render refs, model, composer drafts; background-action entries and
+// pinned dashboard widgets are repointed to the new chat. Widgets themselves
+// are NOT copied (ids stay unique) — getWidgetsForChat unions the lineage.
+// O(n²) guard: each successor copies its predecessor's (already inherited)
+// maps, so an uncapped chain of n continues stores ~n²/2 entries. Keep only
+// the newest entries — the full history stays on the older chats (readable
+// via chat_history / the "Continued from" banner).
+// Caps + helper live inside the function (self-contained for the cut tests).
+// opts.since: start of THIS continue (pendingSummaryRequest.startedAt) —
+// only an auto-finalize stamped since then is undone when the action moves.
+// versionHistory uses the global VERSION_HISTORY_CAP (core/030) so the head
+// never holds more than a chat may; the other maps fall back across the
+// lineage on read (core/070 findLineageChatWithEntry).
+function copyLineagePageState(oldChatId, newChatId, opts) {
+    var LINEAGE_COPY_CAPS = { versionHistory: (typeof VERSION_HISTORY_CAP === 'number' ? VERSION_HISTORY_CAP : 200), cachedToolResults: 20, displays: 50, widgetRenders: 50 };
+    var continueSince = (opts && +opts.since) || 0;
+    // Newest `limit` entries of a map: by `tsKey` (ties: insertion order),
+    // else by insertion order (string keys keep insertion order).
+    function _capLineageMap(map, limit, tsKey) {
+        var keys = Object.keys(map || {});
+        if (keys.length <= limit) return Object.assign({}, map);
+        if (tsKey) {
+            keys = keys.map(function(k, i) { return { k: k, i: i, ts: (map[k] && +map[k][tsKey]) || 0 }; })
+                .sort(function(a, b) { return (a.ts - b.ts) || (a.i - b.i); })
+                .map(function(e) { return e.k; });
+        }
+        var out = {};
+        keys.slice(keys.length - limit).forEach(function(k) { out[k] = map[k]; });
+        return out;
+    }
+    var oldC = chats[oldChatId], newC = chats[newChatId];
+    if (!oldC || !newC) return;
+    if (oldC.cachedToolResults) newC.cachedToolResults = _capLineageMap(oldC.cachedToolResults, LINEAGE_COPY_CAPS.cachedToolResults, 'timestamp');
+    // Always an array, so the caller can mirror it into the global
+    // versionHistory without a fallback write.
+    newC.versionHistory = (Array.isArray(oldC.versionHistory) ? oldC.versionHistory : []).slice(-LINEAGE_COPY_CAPS.versionHistory).map(function(v) {
+        var c = Object.assign({}, v); c.chatId = newChatId; return c;
+    });
+    if (oldC.displays) newC.displays = _capLineageMap(oldC.displays, LINEAGE_COPY_CAPS.displays);
+    if (oldC.widgetRenders) newC.widgetRenders = _capLineageMap(oldC.widgetRenders, LINEAGE_COPY_CAPS.widgetRenders, '_toggledAt');
+    if (oldC.model && !newC.model) newC.model = oldC.model;
+    try {
+        var prog = (typeof getChatProgressStateFor === 'function') ? getChatProgressStateFor(oldChatId) : null;
+        if (prog && (prog.state || prog.label)) {
+            newC.progressCarryOver = { state: prog.state, icon: prog.icon, label: prog.label, tasks: prog.tasks, output: prog.output, status_message: prog.status_message };
+        }
+    } catch (e) {}
+    try {
+        if (typeof chatPendingTexts !== 'undefined' && chatPendingTexts && chatPendingTexts[oldChatId] && !chatPendingTexts[newChatId]) {
+            chatPendingTexts[newChatId] = chatPendingTexts[oldChatId];
+            delete chatPendingTexts[oldChatId];
+            if (typeof persistPendingTextsToStorage === 'function') persistPendingTextsToStorage();
+        }
+        if (typeof chatPendingImages !== 'undefined' && chatPendingImages && chatPendingImages[oldChatId] && !chatPendingImages[newChatId]) {
+            chatPendingImages[newChatId] = chatPendingImages[oldChatId];
+            delete chatPendingImages[oldChatId];
+            if (typeof setSetting === 'function') setSetting('chatPendingImages', Object.keys(chatPendingImages).length ? chatPendingImages : null);
+        }
+    } catch (e) {}
+    try {
+        if (typeof activeActions !== 'undefined' && activeActions) {
+            Object.keys(activeActions).forEach(function(aid) {
+                var a = activeActions[aid];
+                if (a && a.chatId === oldChatId) {
+                    a.chatId = newChatId;
+                    // M2: the summary run's end may have auto-finalized the
+                    // action (finishActionIfDone stamps _autoFinalizedAt ==
+                    // updatedAt) before it moved — the head's auto-started
+                    // run continues the work, so it is running again. Only an
+                    // auto-finalize from THIS continue (stamp >= opts.since):
+                    // an action that finished before the summary stays done.
+                    if (a.state === 'done' && a._autoFinalizedAt && a._autoFinalizedAt === a.updatedAt
+                        && continueSince && a._autoFinalizedAt >= continueSince) {
+                        a.state = 'running';
+                        a.icon = 'spinner';
+                        a.updatedAt = Date.now();
+                        delete a._autoFinalizedAt;
+                        if (typeof notifyActionStateChanged === 'function') { try { notifyActionStateChanged(aid); } catch (e) {} }
+                    }
+                    if (typeof persistActionState === 'function') { try { persistActionState(aid); } catch (e) {} }
+                }
+            });
+        }
+    } catch (e) {}
+    // Background-action identity moves with the action: executeUpdateActionState
+    // and finishActionIfDone (tools/120) key on chat.isBackground + chat.actionId,
+    // so the head must carry them — and the old chat must not (no double finish).
+    // Cleared as null, not deleted: the put merge's fill-gap carry
+    // (core/130 _mergeChatRowForPut) would restore a deleted actionId from
+    // the stored row. '_revealed' is never fill-gapped, so it is deleted.
+    // The head is revealed: the user created it in the foreground, and an
+    // unrevealed isBackground chat is hidden from history/search.
+    if (oldC.actionId) {
+        ['isBackground', 'actionId', 'skillId', 'actionName', 'sourceChatId', '_revealed'].forEach(function(k) {
+            if (Object.prototype.hasOwnProperty.call(oldC, k) && newC[k] === undefined) newC[k] = oldC[k];
+            if (k === '_revealed') delete oldC[k]; else oldC[k] = null;
+        });
+        if (newC.isBackground) newC._revealed = true;
+    }
+    try {
+        if (typeof dashboardWidgets !== 'undefined' && dashboardWidgets) {
+            var moved = false;
+            Object.keys(dashboardWidgets).forEach(function(wid) {
+                var d = dashboardWidgets[wid];
+                if (d && d.chatId === oldChatId) { d.chatId = newChatId; moved = true; }
+            });
+            if (moved && typeof saveDashboardWidget === 'function') {
+                Object.keys(dashboardWidgets).forEach(function(wid) {
+                    var d = dashboardWidgets[wid];
+                    if (d && d.chatId === newChatId) { try { saveDashboardWidget(d, true); } catch (e) {} }
+                });
+            }
+        }
+    } catch (e) {}
+}
+
+// Continuation banners: "Continued in →" at the end of an old chat and
+// "Continued from ←" at the top of its successor. Clickable (selectChat).
+function renderLineageBanner(chat, where) {
+    if (!chat) return '';
+    var target = where === 'top' ? chat.continuedFrom : chat.continuedTo;
+    if (!target) return '';
+    var tc = chats[target];
+    var title = tc ? (tc.title || t('Chat')) : t('deleted chat');
+    var label = where === 'top' ? t('Continued from') + ' \u2190 ' : t('Continued in') + ' \u2192 ';
+    var click = tc ? ' onclick="selectChat(\'' + escapeJsString(target) + '\')" role="button" tabindex="0"' : '';
+    return '<div class="chat-lineage-banner chat-lineage-banner-' + (where === 'top' ? 'from' : 'to') + (tc ? '' : ' is-missing') + '" data-lineage-target="' + escapeHtml(target) + '"' + click + '>' +
+        '<span class="chat-lineage-banner-label">' + escapeHtml(label) + '</span>' +
+        '<span class="chat-lineage-banner-title">' + escapeHtml(title) + '</span></div>';
+}
+
+// Sending in a chat that was continued: offer to jump to the lineage head.
+// Returns true when the send should proceed in this chat.
+async function confirmSendInContinuedChat(chatId) {
+    var chat = chats[chatId];
+    if (!chat || !chat.continuedTo) return true;
+    var head = (typeof resolveLineageHead === 'function') ? resolveLineageHead(chatId) : chat.continuedTo;
+    if (!head || head === chatId || !chats[head]) return true;
+    // Raw title: showModal renders the message through sanitizeModalMessage
+    // (DOM-built, text nodes), so pre-escaping would show literal entities.
+    var r = await showModal(t('Chat was continued'),
+        t('This chat continues in "{title}". Workers, PRs and widgets now live there.', { title: chats[head].title || t('Chat') }), [
+        { label: t('Send here anyway'), value: 'here', class: 'secondary' },
+        { label: t('Go to the new chat'), value: 'head', class: 'primary' }
+    ]);
+    if (r === 'head') {
+        var inp = document.getElementById('message-input');
+        var text = inp ? inp.value : '';
+        if (typeof chatPendingTexts !== 'undefined' && chatPendingTexts) {
+            // Merge into the head's own draft instead of overwriting it.
+            var prev = chatPendingTexts[head] || '';
+            if (text) chatPendingTexts[head] = (prev && prev !== text) ? (prev + '\n\n' + text) : text;
+            delete chatPendingTexts[chatId];
+            if (typeof persistPendingTextsToStorage === 'function') { try { persistPendingTextsToStorage(); } catch (_pE) {} }
+        }
+        if (inp) inp.value = '';
+        // Pending image attachments travel with the draft: the live list when
+        // this chat owns it (emptied in place so the owner identity holds),
+        // plus any stashed copy, appended to the head's stash.
+        try {
+            if (typeof chatPendingImages !== 'undefined' && chatPendingImages) {
+                var imgs = [];
+                var liveOwned = typeof pendingImageAttachments !== 'undefined' && Array.isArray(pendingImageAttachments)
+                    && (typeof getPendingImagesOwnerContext !== 'function' || getPendingImagesOwnerContext() === chatId);
+                if (liveOwned && pendingImageAttachments.length) imgs = pendingImageAttachments.splice(0);
+                else if (Array.isArray(chatPendingImages[chatId])) imgs = chatPendingImages[chatId].slice();
+                delete chatPendingImages[chatId];
+                if (imgs.length) {
+                    chatPendingImages[head] = (chatPendingImages[head] || []).concat(imgs);
+                    if (typeof setSetting === 'function') setSetting('chatPendingImages', chatPendingImages);
+                    if (typeof renderPendingImages === 'function') { try { renderPendingImages(); } catch (_rE) {} }
+                }
+            }
+        } catch (_iE) {}
+        selectChat(head);
+        return false;
+    }
+    return r === 'here';
+}
+
+// Why "Continue in a new chat" is unavailable for a chat, or null when it is
+// allowed. 'subagent': a worker chat (isSubAgent / parentChatId) — the
+// lineage migration (SubAgents.reparentChat, root-keyed grants, workspace
+// ownership transfer) is built for root chats only. 'continued': the chat
+// already has a successor; continuing it again would fork the lineage, so
+// the pill turns into "Go to the new chat" instead (updateContextIndicator).
+// The successor must be LIVE: the dead-aware _lineageNextOf (core/070) skips a
+// tombstoned link, and the page's chats map is authoritative, so a successor
+// missing from it is dead too — a dangling link never blocks Continue forever.
+// chatId: optional; defaults to chat.id, then currentChatId when it matches.
+function continueChatBlockReason(chat, chatId) {
+    if (!chat) return null;
+    if (chat.isSubAgent || chat.parentChatId) return 'subagent';
+    var id = chatId || chat.id || null;
+    if (!id && typeof currentChatId !== 'undefined' && chats[currentChatId] === chat) id = currentChatId;
+    var next = (id && typeof _lineageNextOf === 'function') ? _lineageNextOf(String(id))
+        : (chat.continuedTo ? String(chat.continuedTo) : null);
+    if (next && (!chats[next] || chats[next]._deleted)) next = null;
+    if (next) return 'continued';
+    return null;
 }
 
 // Summarize current conversation and start a new chat with the summary
 async function summarizeAndStartNewChat() {
     var chat = chats[currentChatId];
+    var block = continueChatBlockReason(chat, currentChatId);
+    if (block === 'subagent') {
+        showSnackbar(t('Sub-agent chats can\'t be continued in a new chat'), 'warning');
+        return;
+    }
+    if (block === 'continued') {
+        // Already continued: never fork the lineage — jump to its head.
+        var head = (typeof resolveLineageHead === 'function') ? resolveLineageHead(currentChatId) : chat.continuedTo;
+        if (head && head !== currentChatId && chats[head]) selectChat(head);
+        else showSnackbar(t('This chat was already continued in a new chat'), 'warning');
+        return;
+    }
     if (!chat || !chat.messages || chat.messages.length < 3) {
         showSnackbar(t('Not enough conversation to summarize'), 'warning');
         return;
@@ -846,7 +1172,8 @@ async function summarizeAndStartNewChat() {
     // Store info for after the summary is generated
     pendingSummaryRequest = {
         chatId: currentChatId,
-        chatTitle: chat.title || 'Chat'
+        chatTitle: chat.title || 'Chat',
+        startedAt: Date.now()
     };
     
     // Add summary request as a user message
@@ -884,9 +1211,17 @@ async function summarizeAndStartNewChat() {
         // Bug-sweep F5: if the user switched chats mid-run (or runAgent threw), the
         // stale request must not linger — clear it so a later summary starts clean.
         if (summaryRunOk && pendingSummaryRequest && pendingSummaryRequest.chatId === currentChatId) {
-            completeSummaryAndCreateNewChat();
+            await completeSummaryAndCreateNewChat();
         } else if (pendingSummaryRequest && pendingSummaryRequest.chatId === summaryChatId) {
             pendingSummaryRequest = null;
+        }
+        // M2: finishActionIfDone skipped this chat while its summary was
+        // pending (tools/120). The action moved with the continue — or, when
+        // no continuation happened (run failed, late block, no summary),
+        // it still sits here and gets its deferred auto-finalize now.
+        var _sc = chats[summaryChatId];
+        if (_sc && _sc.isBackground && _sc.actionId && typeof finishActionIfDone === 'function') {
+            try { await finishActionIfDone(summaryChatId); } catch (eFa) {}
         }
     }
 }
@@ -899,12 +1234,23 @@ function resetComposerPlaceholder(inputEl) {
 }
 
 // Called after agent completes a summary request to create the new chat
-function completeSummaryAndCreateNewChat() {
+async function completeSummaryAndCreateNewChat() {
     if (!pendingSummaryRequest) return;
     
     var chat = chats[pendingSummaryRequest.chatId];
     if (!chat || !chat.messages || chat.messages.length === 0) {
         pendingSummaryRequest = null;
+        return;
+    }
+    // Same gate as summarizeAndStartNewChat (continueChatBlockReason): the
+    // chat may have been continued (or turned out to be a worker) while the
+    // summary ran — never fork the lineage or migrate a sub's state.
+    var lateBlock = (typeof continueChatBlockReason === 'function') ? continueChatBlockReason(chat, pendingSummaryRequest.chatId)
+        : ((chat.isSubAgent || chat.parentChatId) ? 'subagent' : (chat.continuedTo ? 'continued' : null));
+    if (lateBlock) {
+        pendingSummaryRequest = null;
+        showSnackbar(lateBlock === 'subagent' ? t('Sub-agent chats can\'t be continued in a new chat')
+            : t('This chat was already continued in a new chat'), 'warning');
         return;
     }
     
@@ -938,41 +1284,104 @@ function completeSummaryAndCreateNewChat() {
     // SW adopts / rebroadcasts the chat object wholesale (run-agent adopt,
     // chat snapshots) — no field allowlist to extend.
     var oldChatId = pendingSummaryRequest.chatId;
+    var _continueStartedAt = pendingSummaryRequest.startedAt || 0;
+    var oldChatTitle = pendingSummaryRequest.chatTitle;
     var newChatId = generateId();
     var summaryMessage = buildContinuationSeed(oldChatId, extractHandoffSummary(summary),
         buildHandoffUserMessages(chat.messages, oldChatId));
     
+    // Everything up to the first await is synchronous: the SW must learn the
+    // link (registerLineageLinkOnSW + both skeletons) before any await, or a
+    // wake/report addressed to the old chat in that window revives it.
     chats[newChatId] = {
         id: newChatId,
-        title: 'Continued: ' + pendingSummaryRequest.chatTitle,
+        title: t('Continued: ') + oldChatTitle,
         messages: [{ role: 'user', content: summaryMessage, isContinuationSeed: true }],
         createdAt: Date.now(),
         continuedFrom: oldChatId
     };
     
     pendingSummaryRequest = null;
+    // Lineage link (core/070 resolveLineageHead / getLineageChatIds): plain
+    // top-level continuedTo field, survives the put strip like continuedFrom.
+    // Written by the sanctioned lineage writer (registerLineageLink stamp).
+    if (typeof registerLineageLink === 'function') { try { registerLineageLink(oldChatId, newChatId, { stamp: true, missingIsDead: true }); } catch (eRl) {} }
+    if (typeof registerLineageLinkOnSW === 'function') { try { registerLineageLinkOnSW(oldChatId, newChatId); } catch (eRs) {} }
+    // Page-only state (artifacts, drafts, displays, actions, pinned widgets).
+    if (typeof copyLineagePageState === 'function') { try { copyLineagePageState(oldChatId, newChatId, { since: _continueStartedAt }); } catch (eCp) {} }
     
     currentChatId = newChatId;
     appStorage.setItem('lastChatId', currentChatId);
     // B6: focused chat changed (continue-from-summary bypasses selectChat) — keep the
     // SW's focused-chat in sync so GC doesn't reclaim a transcript the user is viewing.
     if (typeof pushFocusChatToOffscreen === 'function') pushFocusChatToOffscreen(currentChatId);
+    // Push BOTH chats so the SW skeleton carries continuedTo before the
+    // migration (its delete-lane guard depends on seeing the link). The page
+    // save happens once, after the migration (it also persists a fallback's
+    // lineageMigrationPending marker).
+    // Save timing: mark the migration pending and persist BOTH chats now,
+    // before any await — a reload during the handover build / SW migration
+    // used to lose the new chat; the marker makes a reload replay the
+    // migration (app/045 retryPendingLineageMigrations). The reply clears it.
+    // Single-flight reservation BEFORE the marker: a selectChat / SW 'hello'
+    // replay during the handover await must not run the migration early or
+    // twice (app/045 retryPendingLineageMigrations skips reserved chats;
+    // migrateChatLineageOnSW below takes the reservation over).
+    if (typeof reserveLineageMigration === 'function') { try { reserveLineageMigration(oldChatId); } catch (eRv) {} }
+    if (typeof _setLineageMigrationPending === 'function') { try { _setLineageMigrationPending(oldChatId, newChatId, true); } catch (eMp) {} }
+    _pushChatSkeletonToSW(oldChatId);
+    _pushChatSkeletonToSW(newChatId);
+    try { saveChatsToStorage(); } catch (eSv) {}
+    // Handover state (PRs, workers, widgets, dirty files) — built after the
+    // link is known everywhere, before the migration moves anything.
+    // Bounded (buildLineageHandoverBlockBounded) and the reservation is
+    // released in a finally, so a hang/throw can never strand it.
+    var _mig = null;
+    try {
+        if (typeof buildLineageHandoverBlock === 'function') {
+            try {
+                var _hb = await ((typeof buildLineageHandoverBlockBounded === 'function')
+                    ? buildLineageHandoverBlockBounded(oldChatId) : buildLineageHandoverBlock(oldChatId));
+                var _seedMsg = chats[newChatId] && chats[newChatId].messages && chats[newChatId].messages[0];
+                if (_hb && _seedMsg && _seedMsg.isContinuationSeed) {
+                    _seedMsg.content += '\n\n' + _hb;
+                    _pushChatSkeletonToSW(newChatId);
+                }
+            } catch (eHb) {}
+        }
+        // SW migration: workers, handles, pending wakes, grants, workspace
+        // ownership, split pane. Never rejects (page-local fallback on timeout).
+        if (typeof migrateChatLineageOnSW === 'function') {
+            try { _mig = await migrateChatLineageOnSW(oldChatId, newChatId); } catch (eMg) { _mig = null; }
+            if (_mig && _mig.ok === false) console.warn('[continue] lineage migration fallback:', _mig.reason || _mig);
+        }
+    } finally {
+        // No-op once migrateChatLineageOnSW took it over; frees a reservation
+        // the migration never claimed so the replay paths can run.
+        if (typeof releaseLineageMigrationReservation === 'function') { try { releaseLineageMigrationReservation(oldChatId); } catch (eRr) {} }
+    }
     saveChatsToStorage();
+    // The user may have navigated during the await — only refocus if still here.
+    var _stillHere = currentChatId === newChatId;
     
-    versionHistory = [];
-    clearUpdateSet();
-    renderChatList();
-    renderMessages();
-    if (typeof renderSplitViewPane === 'function') renderSplitViewPane();
-    renderVersionSidebar();
-    updateChatTitleHeader();
-    // TA-9: this path bypasses newChat(), so it resets the composer hint itself.
-    if (typeof resetComposerPlaceholder === 'function') resetComposerPlaceholder();
-    // Reset Workers strip for the fresh chat — the new chat owns no
-    // sub-agents yet, so the strip should be empty/hidden. Without this,
-    // chips from the previous chat persist until the next selectChat.
-    if (typeof renderWorkersStrip === 'function') {
-        try { renderWorkersStrip(); } catch (e) {}
+    // Artifacts carry over: the global mirror points at the new chat's copy
+    // (never reset — the version sidebar keeps showing the same records).
+    if (_stillHere) {
+        versionHistory = chats[newChatId].versionHistory || [];
+        renderChatList();
+        renderMessages();
+        if (typeof renderSplitViewPane === 'function') renderSplitViewPane();
+        renderVersionSidebar();
+        updateChatTitleHeader();
+        // TA-9: this path bypasses newChat(), so it resets the composer hint itself.
+        if (typeof resetComposerPlaceholder === 'function') resetComposerPlaceholder();
+        if (typeof restorePendingTextForContext === 'function') { try { restorePendingTextForContext(newChatId); } catch (eRp) {} }
+        // Workers strip: the migrated (lineage-union) workers stay visible.
+        if (typeof renderWorkersStrip === 'function') {
+            try { renderWorkersStrip(); } catch (e) {}
+        }
+    } else {
+        renderChatList();
     }
     
     showSnackbar(t('New chat created with summary'), 'success');
@@ -983,13 +1392,14 @@ function completeSummaryAndCreateNewChat() {
     // freshly created chat here so the clears are no-ops in practice, but one
     // uniform recipe means every pause writer mutates pausedChats + the legacy
     // global together and repaints via the SSOT syncPauseButtonUI.
-    paused = false;
-    setChatPausedPersistent(currentChatId, false);
+    if (_stillHere) paused = false;
+    setChatPausedPersistent(newChatId, false);
     // PR-PAUSE (B2): propagate=true for uniformity (fresh chat — no subs, no-op).
-    pushPauseToggleToOffscreen(currentChatId, false, undefined, undefined, true);
-    syncPauseButtonUI(currentChatId);
-    // Bug-sweep F5: fire-and-forget, but never an unhandled rejection.
-    Promise.resolve().then(function() { return runAgent(); }).catch(function(e) {
+    pushPauseToggleToOffscreen(newChatId, false, undefined, undefined, true);
+    syncPauseButtonUI(newChatId);
+    // Bug-sweep F5: fire-and-forget, but never an unhandled rejection. Always
+    // targets the NEW chat (the user may have navigated during the migration).
+    Promise.resolve().then(function() { return runAgent(newChatId); }).catch(function(e) {
         console.warn('[summary] runAgent for continued chat failed:', e && e.message ? e.message : e);
     });
 }
@@ -1135,6 +1545,8 @@ function selectChat(chatId, options) {
         // Viewing the chat consumes its "finished while you were elsewhere"
         // header badge entry (ui/165-finished-chat-badge.js).
         if (typeof clearUnseenFinishedChat === 'function') { try { clearUnseenFinishedChat(chatId); } catch (e) {} }
+        // Lineage: replay a migration a fallback left pending (either side).
+        if (typeof retryPendingLineageMigrations === 'function') { try { retryPendingLineageMigrations(chatId); } catch (e) {} }
     }
 
     // Reset UI state for the new focused chat.
@@ -1499,6 +1911,20 @@ function updateChatTitleHeader(includeToolCallId) {
 // A dropped tombstone means the SW re-puts the row at its next save, i.e. a
 // guaranteed resurrection — so callers MUST surface a false return (deleteChat
 // does, next to the same snackbar the IDB-delete failure path uses).
+// Push a chat's current record to the SW over the agent bus ('update-chat'),
+// so lineage fields (continuedTo / continuedFrom) reach the SW skeleton
+// before the lineage migration runs. Best-effort; returns true when posted.
+function _pushChatSkeletonToSW(chatId) {
+    var c = chatId && chats[chatId];
+    if (!c) return false;
+    try {
+        if ((typeof _agentBusPort === 'undefined' || !_agentBusPort) && typeof _openAgentBus === 'function') _openAgentBus();
+        if (typeof _agentBusPort === 'undefined' || !_agentBusPort) return false;
+        _agentBusPort.postMessage({ type: 'update-chat', chatId: chatId, chat: c });
+        return true;
+    } catch (e) { return false; }
+}
+
 function _notifyWorkerChatDeleted(chatId) {
     if (!chatId) return false;
     var _payload = {
@@ -1543,20 +1969,54 @@ function _notifyWorkerChatDeleted(chatId) {
 // per-key DELETION delta (worker/130 'permissions-update' → persist +
 // rebroadcast) — never a full-map replace, which could clobber a grant made
 // concurrently from another panel. Returns the number of pruned keys.
-function _pruneChatPermissionGrants(chatId) {
+// carryToChatId (optional, lineage delete): copy each grant onto that chat
+// first (never overwriting an existing one) — same delta, set before del.
+function _pruneChatPermissionGrants(chatId, carryToChatId) {
     if (!chatId || typeof sessionPermissions === 'undefined' || !sessionPermissions || typeof sessionPermissions !== 'object') return 0;
     var _pfx = String(chatId) + '::';
     var keys = Object.keys(sessionPermissions).filter(function(k) { return k.indexOf(_pfx) === 0; });
     if (!keys.length) return 0;
+    var _set = {};
+    if (carryToChatId && String(carryToChatId) !== String(chatId)) {
+        var _tPfx = String(carryToChatId) + '::';
+        keys.forEach(function(k) {
+            var nk = _tPfx + k.slice(_pfx.length);
+            if (!Object.prototype.hasOwnProperty.call(sessionPermissions, nk)) { sessionPermissions[nk] = sessionPermissions[k]; _set[nk] = sessionPermissions[k]; }
+        });
+    }
     keys.forEach(function(k) { delete sessionPermissions[k]; });
     try {
         if ((typeof _agentBusPort === 'undefined' || !_agentBusPort) && typeof _openAgentBus === 'function') _openAgentBus();
         if (typeof _agentBusPort !== 'undefined' && _agentBusPort) {
             _agentBusPort.postMessage({ type: 'permissions-update', toolPermissions: null, instancePermissions: null, sessionPermissions: null,
-                sessionPermissionsDelta: { set: {}, del: keys } });
+                sessionPermissionsDelta: { set: _set, del: keys } });
         }
     } catch (e) { /* SW unreachable: replica already pruned; the SW copy is session-scoped */ }
     return keys.length;
+}
+
+// Re-register every chat-backed file_id of chatId (fileIndex 'chat' /
+// 'screenshots_map' pointers, tools/040) as stored content (registerFile
+// {id, data} → IDB files store), so ids keep resolving after the chat row is
+// deleted. Returns { fid: true } for the ids kept. Call while chats[chatId]
+// still exists.
+function keepLineageFilesAlive(chatId) {
+    var kept = {};
+    if (!chatId || typeof fileIndex === 'undefined' || !fileIndex || !fileIndex.forEach) return kept;
+    if (typeof resolveFilePointer !== 'function' || typeof registerFile !== 'function') return kept;
+    var todo = [];
+    fileIndex.forEach(function(ptr, fid) {
+        if (ptr && ptr.chatId === chatId && (ptr.type === 'chat' || ptr.type === 'screenshots_map')) todo.push([fid, ptr]);
+    });
+    todo.forEach(function(pair) {
+        try {
+            var f = resolveFilePointer(pair[0], pair[1]);
+            if (!f || !f.data) return;
+            registerFile({ id: pair[0], data: f.data, name: f.name || null, mime: f.mime || null });
+            kept[pair[0]] = true;
+        } catch (e) { /* that id dies with the chat */ }
+    });
+    return kept;
 }
 
 async function deleteChat(chatId, e) {
@@ -1603,7 +2063,31 @@ async function deleteChat(chatId, e) {
     // Keep the record for the targeted IDB delete at the end — it needs this
     // chat's payload ids, and the map entry is about to go.
     var _deletedRecord = chats[chatId];
+    // Lineage: a continued chat's file_ids are still cited by its successor
+    // (handover, artifacts) — copy their content into the shared file store
+    // BEFORE the record goes, so getFile keeps resolving them.
+    var _keptFids = {};
+    try { if (_deletedRecord && _deletedRecord.continuedTo) _keptFids = keepLineageFilesAlive(chatId); } catch (eKf) { _keptFids = {}; }
+    // Chain repair (core/070 unlinkLineageChat): join the neighbours
+    // (A→B→C minus B = A→C) or clear the dangling link when the head/root
+    // goes, BEFORE the record is removed. Touched neighbours are pushed to the
+    // SW and persisted by the saveChatsToStorage below.
+    var _lineageTouched = [];
+    // Surviving head of the lineage (m1/m3): the head itself when the deleted
+    // chat was older, else the joined chain's new head (prev side first).
+    var _lineageCarryTo = null;
+    try {
+        var _preHead = (typeof resolveLineageHead === 'function') ? resolveLineageHead(chatId) : null;
+        if (typeof unlinkLineageChat === 'function') {
+            var _ulRes = unlinkLineageChat(chatId) || {};
+            _lineageTouched = _ulRes.touched || [];
+            if (_preHead && _preHead !== chatId) _lineageCarryTo = _preHead;
+            else if (_ulRes.prev) _lineageCarryTo = resolveLineageHead(_ulRes.prev);
+        }
+    } catch (eUl) { _lineageTouched = _lineageTouched || []; }
+    if (_lineageCarryTo === chatId) _lineageCarryTo = null;
     delete chats[chatId];
+    _lineageTouched.forEach(function(nid) { try { _pushChatSkeletonToSW(nid); } catch (ePs) {} });
     // SWM-TOKENLEAK: prune the per-chat pause/interrupt latest-wins token maps so a
     // chat paused-and-never-resumed then deleted doesn't leak its 4 entries forever
     // (the runFinished cleanup in app/045 only prunes on a NON-paused terminal event).
@@ -1612,8 +2096,13 @@ async function deleteChat(chatId, e) {
     // A plain delete, not setChatPausedPersistent: that would dispatch a chat-meta
     // write for the tombstoned chat.
     try { if (typeof pausedChats !== 'undefined' && pausedChats) delete pausedChats[chatId]; } catch (ePc) {}
-    // Chat-scoped approval grants ("Allow for this chat") die with the chat.
-    try { _pruneChatPermissionGrants(chatId); } catch (ePg) {}
+    // Chat-scoped approval grants ("Allow for this chat") die with the chat —
+    // except in a lineage: they are copied onto the surviving head FIRST (m1;
+    // the SW tombstone lane's grant copy would run after this prune).
+    try { _pruneChatPermissionGrants(chatId, _lineageCarryTo); } catch (ePg) {}
+    // m3: a pending injection (sub report, lifecycle notice) is handed to the
+    // surviving head instead of being dropped below.
+    try { if (_lineageCarryTo && typeof forwardLineageInjection === 'function') forwardLineageInjection(chatId, _lineageCarryTo); } catch (eFi) {}
     // MEMFIX (leak prunes): drop per-chat caches that used to survive deletion.
     // chatWidgets map (tools/080-widget-tools.js) holds the chat's widget array.
     try { if (typeof chatWidgets !== 'undefined' && chatWidgets) delete chatWidgets[chatId]; } catch (eCw) {}
@@ -1624,6 +2113,8 @@ async function deleteChat(chatId, e) {
     try { if (typeof stickToBottomByChatId !== 'undefined' && stickToBottomByChatId) delete stickToBottomByChatId[chatId]; } catch (eSb) {}
     try { if (typeof pendingInjectionsByChatId !== 'undefined' && pendingInjectionsByChatId) delete pendingInjectionsByChatId[chatId]; } catch (ePi) {}
     try { if (typeof pendingWidgetRegenerationByChatId !== 'undefined' && pendingWidgetRegenerationByChatId) delete pendingWidgetRegenerationByChatId[chatId]; } catch (ePw) {}
+    // Lineage prior-action-updates render cache (tools/120-actions.js, same page bundle).
+    try { if (typeof _lineagePriorActionUpdatesCache !== 'undefined' && _lineagePriorActionUpdatesCache) delete _lineagePriorActionUpdatesCache[chatId]; } catch (eLa) {}
     // NEW-T21-1: the #messages scroll listener (ui/010-skills-ui.js) persists
     // appStorage 'scrollPos_<id>' and nothing else removes it, so drop it here.
     try { if (typeof cancelChatScrollSave === 'function') cancelChatScrollSave(chatId); } catch (eCs) {}
@@ -1642,7 +2133,7 @@ async function deleteChat(chatId, e) {
     try {
         if (typeof fileIndex !== 'undefined' && fileIndex && fileIndex.forEach) {
             var _deadFids = [];
-            fileIndex.forEach(function(ptr, fid) { if (ptr && ptr.chatId === chatId) _deadFids.push(fid); });
+            fileIndex.forEach(function(ptr, fid) { if (ptr && ptr.chatId === chatId && !_keptFids[fid]) _deadFids.push(fid); });
             _deadFids.forEach(function(fid) { fileIndex.delete(fid); });
         }
     } catch (eFi) {}

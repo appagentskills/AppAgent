@@ -60,6 +60,9 @@
   "No changes tracked yet": "記録された変更はまだありません",
   "Message input": "メッセージ入力",
   "Continue in a new chat": "新しいチャットで続ける",
+  "Continued: ": "続き: ",
+  "Sub-agent chats can't be continued in a new chat": "サブエージェントのチャットは新しいチャットで続行できません",
+  "This chat was already continued in a new chat": "このチャットはすでに新しいチャットで続行されています",
   "Summarize and start new chat": "要約して新しいチャットを開始",
   "Pause or resume": "一時停止または再開",
   "Continue": "続行",
@@ -275,6 +278,7 @@
   "Read Version": "バージョンの読み取り",
   "Delete Document": "ドキュメントの削除",
   "List Instances": "インスタンスの一覧",
+  "Connect Instance": "インスタンスに接続",
   "Fetch URL": "URL の取得",
   "Web Search": "Web 検索",
   "Build Extension": "拡張機能のビルド",
@@ -1923,5 +1927,12 @@
   "No edited skills": "編集済みのスキルはありません",
   "Resize sidebar": "サイドバーのサイズを変更",
   "Resize split view": "分割ビューのサイズを変更",
-  "Drag to resize · double-click to reset": "ドラッグでサイズ変更 · ダブルクリックでリセット"
+  "Drag to resize · double-click to reset": "ドラッグでサイズ変更 · ダブルクリックでリセット",
+  "Chat was continued": "チャットは引き継がれました",
+  "Continued from": "引き継ぎ元",
+  "Continued in": "引き継ぎ先",
+  "Go to the new chat": "新しいチャットへ移動",
+  "Send here anyway": "このまま送信",
+  "This chat continues in \"{title}\". Workers, PRs and widgets now live there.": "このチャットは「{title}」に引き継がれています。ワーカー、PR、ウィジェットは現在そちらにあります。",
+  "deleted chat": "削除されたチャット"
 }

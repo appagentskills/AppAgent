@@ -77,6 +77,27 @@ function setSplitViewState(chatId, state) {
     return _splitViewPersist();
 }
 
+// "Continue in a new chat" (lineage migration, worker/130 _swContinueChatLineage):
+// the family key moves from the old chat to the lineage head. Operates on the
+// RAW map (setSplitViewState would resolve `from` to the head and delete the
+// wrong row). The whole record moves — shown widget, version, held update and
+// progress card all live on it; slot patches are keyed by widget id and need
+// no move. An existing live record on the head wins (the new chat already
+// opened its own pane). Idempotent. Returns 'moved' | 'kept-head' | 'none'.
+function rekeySplitViewChat(fromChatId, toChatId) {
+    if (!fromChatId || !toChatId || fromChatId === toChatId) return Promise.resolve('none');
+    var f = String(fromChatId), t = String(toChatId);
+    var rec = _splitViews[f];
+    if (!rec) return Promise.resolve('none');
+    var head = _splitViews[t];
+    var next = Object.assign({}, _splitViews);
+    delete next[f];
+    var outcome = 'kept-head';
+    if (!head || (head.closed && !rec.closed)) { next[t] = rec; outcome = 'moved'; }
+    _splitViews = next;
+    return _splitViewPersist().then(function() { return outcome; });
+}
+
 // Latest saved version of a widget, best effort (WidgetStore is page-only).
 function _splitViewLatestVersion(widgetId, fallback) {
     try {

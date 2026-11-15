@@ -42,3 +42,17 @@
 .caveat-card-text .md-paragraph { margin: 0; }
 @media (max-width: 768px) { .caveat-card { margin-inline-end: 0; } }
 
+/* Continue-in-a-new-chat lineage banners (ui/170 renderLineageBanner):
+   "Continued from ←" at the top of a successor, "Continued in →" at the end
+   of the old chat. Tokens only — 01-dark-theme.css remaps them. */
+.chat-lineage-banner { display: flex; align-items: center; gap: var(--space-4); margin: var(--space-6) 0; padding: var(--space-4) var(--space-6); background: var(--primary-lighter); border: 1px solid var(--border); border-inline-start: 3px solid var(--primary); border-radius: var(--radius-md); font-size: var(--text-body-sm); color: var(--text-primary); line-height: var(--leading-normal); }
+.chat-lineage-banner[role="button"] { cursor: pointer; }
+.chat-lineage-banner[role="button"]:hover { background: var(--primary-light); }
+.chat-lineage-banner[role="button"]:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.chat-lineage-banner-from { margin-top: 0; }
+.chat-lineage-banner-to { margin-bottom: 0; }
+.chat-lineage-banner-label { flex: none; color: var(--text-secondary); font-weight: var(--font-semibold); }
+.chat-lineage-banner-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-lineage-banner.is-missing { background: var(--bg-hover); border-inline-start-color: var(--border); color: var(--text-secondary); }
+.chat-lineage-banner.is-missing .chat-lineage-banner-title { font-style: italic; }
+

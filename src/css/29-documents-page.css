@@ -324,6 +324,11 @@ a.sdoc-ws-pr:hover, a.sdoc-ws-pr:focus-visible { text-decoration: underline; }
 .sdoc-diff .sdoc-diff-line { display: block; text-decoration: none; white-space: pre-wrap; }
 .sdoc-diff ins.sdoc-diff-line { color: var(--success-hover); background: var(--success-lighter); }
 .sdoc-diff del.sdoc-diff-line { color: var(--danger-hover); background: var(--danger-lighter); }
+/* PR patch / file diff (<pre class="wsf-code sdoc-diff">): code keeps its lines and scrolls
+   horizontally; rows stretch to the widest line so the colored backgrounds span the scroll.
+   The prose diff (.sdoc-diff-body) keeps wrapping. */
+pre.sdoc-diff { display: grid; grid-template-columns: minmax(max-content, 1fr); overflow-x: auto; }
+pre.sdoc-diff .sdoc-diff-line { white-space: pre; }
 .sdoc-diff .sdoc-diff-sign { display: inline-block; width: 1.5ch; user-select: none; color: var(--text-muted); }
 
 /* Group-by menu (tools/110 _sdocGroupBySelectHtml): compact .custom-dropdown with icon trigger + icon options */

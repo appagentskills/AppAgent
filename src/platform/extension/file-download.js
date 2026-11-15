@@ -20,7 +20,52 @@
     function start() {
         applyStaticI18n();
         if (!fileId) return show(t('No file ID provided.'), true);
-        tryDatabases(dbNames, 0);
+        // Unified file store first (keyed get), then the legacy chat/workspace scans.
+        findInFileStore(fileId).then(function(file) {
+            if (!file) return tryDatabases(dbNames, 0);
+            triggerDownload(file.data, file.mime, fileName);
+            show(t('Downloaded: {name}', { name: '<span class="filename">' + esc(fileName) + '</span>' }));
+        }, function(e) {
+            log.push('File store: ' + ((e && e.message) || e));
+            tryDatabases(dbNames, 0);
+        });
+    }
+
+    // Unified file store (tools/040-file-store.js: DB 'appagent-files', store
+    // 'files'): blob records carry the bytes; 'folder' records pointing into
+    // Agent Files (folder 'virtual' = OPFS dir 'agent-files', tools/170) are
+    // read from OPFS. Pointers into user-connected folders are not resolvable here.
+    function findInFileStore(fid) {
+        return openDB('appagent-files').then(function(db) {
+            if (!db.objectStoreNames.contains('files')) { db.close(); return null; }
+            return new Promise(function(resolve) {
+                var req = db.transaction(['files'], 'readonly').objectStore('files').get(fid);
+                req.onsuccess = function() { resolve(req.result || null); };
+                req.onerror = function() { resolve(null); };
+            }).then(function(rec) {
+                db.close();
+                if (!rec) return null;
+                if (rec.kind === 'blob' && rec.blob) return { data: rec.blob, mime: rec.mime || rec.blob.type || guessMime(fileName) };
+                if (rec.kind === 'folder' && rec.folder === 'virtual' && typeof navigator !== 'undefined' && navigator.storage && navigator.storage.getDirectory) {
+                    return readOpfs(['agent-files'].concat(String(rec.path || '').split('/').filter(Boolean))).then(function(f) {
+                        return { data: f, mime: rec.mime || f.type || guessMime(fileName) };
+                    });
+                }
+                log.push('  File store record kind ' + rec.kind + ' (folder ' + rec.folder + ') is not downloadable here');
+                return null;
+            });
+        });
+    }
+
+    function readOpfs(segs) {
+        return navigator.storage.getDirectory().then(function(dir) {
+            var i = 0;
+            function step(d) {
+                if (i === segs.length - 1) return d.getFileHandle(segs[i]).then(function(h) { return h.getFile(); });
+                return d.getDirectoryHandle(segs[i++]).then(step);
+            }
+            return step(dir);
+        });
     }
 
     // Same lookup as core/025-i18n.js t(): own keys only, '' counts as missing,
@@ -246,7 +291,9 @@
 
     function triggerDownload(data, mime, name) {
         var blob;
-        if (typeof data === 'string' && data.indexOf('data:') === 0) {
+        if (typeof Blob !== 'undefined' && data instanceof Blob) {
+            blob = data;
+        } else if (typeof data === 'string' && data.indexOf('data:') === 0) {
             var b64 = data.split(',')[1];
             var bytes = atob(b64);
             var arr = new Uint8Array(bytes.length);

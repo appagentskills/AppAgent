@@ -1639,7 +1639,19 @@ function _subLastInputTokens(c) {
     }
     return 0;
 }
-function _subContextInfo(chatId) {
+// `rec` (optional): the sub's LIVE registry record. Its last_input_tokens
+// (recordSubLLMUsage, SW-authoritative, mirrored to the page via the
+// subagent-snapshot) is the exact value agent_status reports as context_pct,
+// so it wins over the transcript scan — the page copy of a sub chat can be
+// stale, evicted or not loaded at all (e.g. after "Continue in a new chat"
+// moved the worker), which showed "\u2014" or an older % than agent_status.
+// Reconstructed (GC'd) records carry no such field and keep the scan.
+function _subContextInfo(chatId, rec) {
+    var limit0 = _subContextLimit(chatId);
+    if (rec && !rec._reconstructed && typeof rec.last_input_tokens === 'number' && rec.last_input_tokens > 0) {
+        var t0 = rec.last_input_tokens;
+        return { tokens: t0, pct: (limit0 > 0) ? Math.min(100, Math.round((t0 / limit0) * 100)) : 0 };
+    }
     var tokens = 0;
     var c = (chatId && typeof chats !== 'undefined') ? chats[chatId] : null;
     if (_subUiIsSkeleton(c)) {
@@ -1653,8 +1665,7 @@ function _subContextInfo(chatId) {
             }
         }
     }
-    var limit = _subContextLimit(chatId);
-    var pct = (limit > 0) ? Math.min(100, Math.round((tokens / limit) * 100)) : 0;
+    var pct = (limit0 > 0) ? Math.min(100, Math.round((tokens / limit0) * 100)) : 0;
     return { tokens: tokens, pct: pct };
 }
 
@@ -1735,7 +1746,7 @@ function updateSidebarWorkerMetrics() {
     var cards = panel.querySelectorAll('.worker-card[data-worker-chat]');
     for (var i = 0; i < cards.length; i++) {
         var card = cards[i];
-        var ctx = _subContextInfo(card.getAttribute('data-worker-chat'));
+        var ctx = _subContextInfo(card.getAttribute('data-worker-chat'), _resolveSubRec(card.getAttribute('data-worker-toggle')));
         var fill = card.querySelector('[data-worker-ctx-fill]');
         if (fill) fill.setAttribute('stroke-dasharray', ctx.pct + ', 100');
         var pctEl = card.querySelector('[data-worker-ctx-pct]');
@@ -2196,7 +2207,7 @@ function _updateSelfCardMetrics() {
     for (var i = 0; i < all.length; i++) {
         if (all[i] && all[i].chat_id === chatId) { rec = all[i]; break; }
     }
-    var ctx = _subContextInfo(chatId);
+    var ctx = _subContextInfo(chatId, rec);
     var fill = card.querySelector('[data-worker-ctx-fill]');
     if (fill) fill.setAttribute('stroke-dasharray', ctx.pct + ', 100');
     var pctEl = card.querySelector('[data-worker-ctx-pct]');
@@ -2237,8 +2248,8 @@ var WORKER_CARD_STATES = { running: 1, queued: 1, paused: 1, sleeping: 1, stoppe
 // panel) AND the jobs-dropdown chat rows so every surface shows the same live
 // ring. `withTitle` opt-in adds a hover tooltip (worker cards keep their own
 // button-level tooltip, so they pass it falsy for identical output).
-function _contextCircleHtml(chatId, extraClass, withTitle) {
-    var ctx = _subContextInfo(chatId);
+function _contextCircleHtml(chatId, extraClass, withTitle, rec) {
+    var ctx = _subContextInfo(chatId, rec);
     var ctxClass = ctx.pct >= 90 ? ' worker-ctx-danger' : (ctx.pct >= 70 ? ' worker-ctx-warning' : '');
     var titleAttr = '';
     if (withTitle) {
@@ -2254,20 +2265,41 @@ function _contextCircleHtml(chatId, extraClass, withTitle) {
     '</span>';
 }
 
+// Every chat id of chatId's WHOLE lineage (both directions: the chats it
+// continues AND its successors), as a set. Workers are lineage-wide: "Continue
+// in a new chat" re-roots them onto the head (SubAgents.reparentChat), so an
+// ancestor-only set made the old chat drop every migrated worker that never
+// reported into its own transcript (e.g. a nested worker whose parent is
+// another sub's chat and whose root is the new chat). One set feeds the strip
+// filter, the jobs dropdown and the strip's repaint key (_chipKey).
+function _subLineageSet(chatId) {
+    var s = Object.create(null);
+    if (!chatId) return s;
+    var ids = null;
+    if (typeof getLineageChatIds === 'function') {
+        try { ids = getLineageChatIds(chatId); } catch (e) { ids = null; }
+    }
+    if (!ids || !ids.length) ids = [String(chatId)];
+    ids.forEach(function(id) { s[id] = true; });
+    return s;
+}
 // Sorted list of sub-agents in a regular chat's subtree (root match, or direct
-// parent match for legacy records with no root_chat_id). Same filter/sort
-// renderWorkersStrip uses for a non-sub chat — reused by the jobs dropdown to
-// list a chat's sub-agents inline under its progress.
+// parent match for legacy records with no root_chat_id) across its lineage.
+// Same filter/sort renderWorkersStrip uses for a non-sub chat — reused by the
+// jobs dropdown to list a chat's sub-agents inline under its progress.
 function subAgentsForChatTree(chatId) {
     if (!chatId) return [];
     var all = (typeof SubAgents !== 'undefined' && SubAgents.listAll) ? SubAgents.listAll() : [];
+    // Lineage: a continued chat also owns the subtree of the chats it continues.
+    var lin = _subLineageSet(chatId);
     var mine = all.filter(function(r) {
         var root = r.root_chat_id || r.parent_chat_id;
-        return root === chatId || r.parent_chat_id === chatId;
+        return !!lin[root] || !!lin[r.parent_chat_id];
     });
     // Include GC'd subs reconstructed from persisted sub_report messages so the
     // jobs-dropdown accordion matches the sidebar Workers panel for old chats.
-    _mergeReconstructedSubs(mine, chatId);
+    Object.keys(lin).forEach(function(id) { _mergeReconstructedSubs(mine, id); });
+    mine = _dedupeWorkersById(mine);
     var rank = { running: 0, sleeping: 1, stopped: 2, errored: 3 };
     mine.sort(function(a, b) {
         var ra = rank[a.state] != null ? rank[a.state] : 4;
@@ -2295,7 +2327,7 @@ function _workerCardHtml(r, opts) {
     var depth = (typeof r.depth === 'number' && r.depth > 0) ? r.depth : 1;
     var renderDepth = Math.min(depth, 3);
     var used = (r.tool_calls_used || 0);
-    var ctx = _subContextInfo(r.chat_id);
+    var ctx = _subContextInfo(r.chat_id, r);
     var tokTip = ctx.tokens ? t('{tokens} ctx tokens \u2014 {pct}%', { tokens: _fmtTokens(ctx.tokens), pct: ctx.pct }) : t('context not started');
     var botIcon = (typeof UI_ICONS !== 'undefined' && UI_ICONS.bot) ? UI_ICONS.bot : '';
     // ACTIVITY: live thinking/tool glyph replaces the static bot icon while
@@ -2366,7 +2398,7 @@ function _workerCardHtml(r, opts) {
                   '</span>'
                 : '') +
         '</span>' +
-        _contextCircleHtml(r.chat_id) +
+        _contextCircleHtml(r.chat_id, '', false, r) +
         (selfCard ? '' : '<span class="worker-card-caret" aria-hidden="true">\u203a</span>') +
     '</' + wkTag + '>' +
     // Progress panel node is only emitted while expanded — collapsed cards
@@ -2449,9 +2481,38 @@ function _mergeReconstructedSubs(list, chatId) {
     var liveIds = Object.create(null);
     list.forEach(function(r) { if (r && r.agent_id) liveIds[r.agent_id] = true; });
     _reconstructSubsFromMessages(chatId).forEach(function(r) {
-        if (!liveIds[r.agent_id]) { _reconstructedSubs[r.agent_id] = r; list.push(r); }
+        if (liveIds[r.agent_id]) return;
+        liveIds[r.agent_id] = true;
+        // Lineage: a sub_report mined from a continued (older) chat may belong
+        // to a worker that is still in the registry — the live record (state,
+        // tier/model, profiles, context) wins over the transcript rebuild.
+        var live = (typeof SubAgents !== 'undefined' && SubAgents.getById) ? SubAgents.getById(r.agent_id) : null;
+        if (live) { list.push(live); return; }
+        // No live record: the worker was GC'd, so it has ended whatever its
+        // last sub_report said — a 'running'/'need_input' report must not
+        // render as SLEEPING (with no model/gauge). Fall back to an ended state.
+        // Only once the registry has hydrated (core/097 SubAgents.isLoaded):
+        // before that a missing record proves nothing, so keep the report state.
+        var regLoaded = typeof SubAgents === 'undefined' || typeof SubAgents.isLoaded !== 'function' || !!SubAgents.isLoaded();
+        if (regLoaded && r.state !== 'stopped' && r.state !== 'errored') r.state = 'stopped';
+        _reconstructedSubs[r.agent_id] = r;
+        list.push(r);
     });
     return list;
+}
+
+// One card per agent_id: the first occurrence wins, except a live registry
+// record always replaces a reconstructed one. Mutates nothing; returns a new
+// array in the original order.
+function _dedupeWorkersById(list) {
+    var out = [], at = Object.create(null);
+    (list || []).forEach(function(r) {
+        if (!r || !r.agent_id) return;
+        var i = at[r.agent_id];
+        if (i === undefined) { at[r.agent_id] = out.length; out.push(r); return; }
+        if (out[i]._reconstructed && !r._reconstructed) out[i] = r;
+    });
+    return out;
 }
 
 function renderWorkersStrip() {
@@ -2471,6 +2532,9 @@ function renderWorkersStrip() {
     //     sub, so drilling into a worker shows its own immediate tree
     //     rather than the entire root subtree again.
     var mine;
+    // Lineage: every chat of the lineage (old and new) shows the same
+    // lineage-wide workers (_subLineageSet).
+    var _stripLin = _subLineageSet(currentChatId);
     if (isCurrentSub) {
         var directChildChatIds = Object.create(null);
         for (var i = 0; i < all.length; i++) {
@@ -2486,7 +2550,7 @@ function renderWorkersStrip() {
             // Legacy records (pre-Phase-5) lack root_chat_id — fall back to
             // treating parent_chat_id as the root so they're not orphaned.
             var root = r.root_chat_id || r.parent_chat_id;
-            return root === currentChatId || r.parent_chat_id === currentChatId;
+            return !!_stripLin[root] || !!_stripLin[r.parent_chat_id];
         });
     }
     // Backfill from persisted sub_report messages: once the registry GCs a
@@ -2494,7 +2558,8 @@ function renderWorkersStrip() {
     // them, so a stopped chat would show an EMPTY Workers panel even though its
     // inline sub_report cards persist. Reconstruct synthetic cards for any sub
     // not already live (a sub-agent's own chat keeps the live-subtree view).
-    if (!isCurrentSub) _mergeReconstructedSubs(mine, currentChatId);
+    if (!isCurrentSub) Object.keys(_stripLin).forEach(function(id) { _mergeReconstructedSubs(mine, id); });
+    mine = _dedupeWorkersById(mine);
     if (!mine.length) { stripEl.innerHTML = ''; stripEl.style.display = 'none'; return; }
     // Sort: running, sleeping, then terminal (most-recent first).
     var rank = { running: 0, sleeping: 1, stopped: 2, errored: 3 };
@@ -2563,6 +2628,11 @@ function renderWorkersStrip() {
         // used by renderWorkersStrip (root_chat_id or direct parent_chat_id
         // for regular chats; direct + grandchildren when current is a sub).
         var isSubChat = !!(typeof chats !== 'undefined' && chats[currentChatId] && chats[currentChatId].isSubAgent);
+        var _keyLin = null;
+        if (!isSubChat) {
+            if (typeof _subLineageSet === 'function') _keyLin = _subLineageSet(currentChatId);
+            else { _keyLin = Object.create(null); _keyLin[currentChatId] = true; }
+        }
         var directChildChatIds = Object.create(null);
         if (isSubChat) {
             var all0 = SubAgents.listAll();
@@ -2575,8 +2645,8 @@ function renderWorkersStrip() {
                 if (isSubChat) {
                     return r.parent_chat_id === currentChatId || directChildChatIds[r.parent_chat_id];
                 }
-                return r.parent_chat_id === currentChatId
-                    || (r.root_chat_id || r.parent_chat_id) === currentChatId;
+                // Same lineage-wide set as renderWorkersStrip (_subLineageSet).
+                return !!_keyLin[r.root_chat_id || r.parent_chat_id] || !!_keyLin[r.parent_chat_id];
             })
             // B1: queued flag so a dequeue (state stays 'running') repaints.
             .map(function(r) { return r.agent_id + ':' + r.state + (_subIsQueued(r) ? '~q' : '') + (_subIsPaused(r) ? '~p' : '') + ':' + (r.depth || 1); });

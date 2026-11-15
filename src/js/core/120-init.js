@@ -442,8 +442,8 @@ async function init() {
         history.back();
     });
 
-    // Restore impersonation state
-    impersonateOriginalUserSysId = appStorage.getItem('impersonateOriginalUserSysId') || null;
+    // Impersonation state is read from appStorage at call time (per instance),
+    // see getImpersonationOriginal in tools/010-iframe-tool.js.
 
     // Extension never auto-opens the browser panel — hide URL input on load
     var urlInput = document.getElementById('browser-url-input');

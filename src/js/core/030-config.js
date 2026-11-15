@@ -1318,8 +1318,8 @@ var instancePermissions = {}; // Per-instance permissions: { 'host': { tier: 'ma
 var cacheTokenLimit = 4000; // Cache limit in tokens (default ~4k tokens = ~16KB)
 var sessionPermissions = {}; // "Allow for this chat" grants keyed by rootChatId + '::' + permKey (core/070 chatPermKey); SW-owned, mirrored to chrome.storage.session
 var pendingToolApprovals = {}; // Track pending tool approval requests by chatId:approvalIndex
-var cachedUserSysId = null; // Cache user sys_id to avoid repeated API calls
-var impersonateOriginalUserSysId = null; // Store original user sys_id before impersonation
+// Impersonation state is per instance in appStorage ('impersonateOriginalUsers'),
+// read at call time by tools/010-iframe-tool.js (getImpersonationOriginal).
 var versionHistory = []; // Track all record changes with before/after versions
 var chatSearchQuery = ''; // Track chat search query
 var activeSkills = {}; // Track active skills with their XML backups: { skillId: { xmlBackups: { table_sysId: versionSysId } } }

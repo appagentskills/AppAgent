@@ -1070,6 +1070,8 @@ function _handleAgentBusMessage(msg) {
             // BEFORE arming the grace reconcile below, so the timer knows
             // whether it may need its one-shot extension.
             _swResumeScanSettledSeen = !!msg.resumeScanSettled;
+            // Lineage: replay migrations a timed-out/no-port fallback left pending.
+            try { retryPendingLineageMigrations(); } catch (eLr) {}
             // B11: a deferred never-started action sweep (tools/120-actions.js)
             // waits for exactly this signal — run it now instead of on its timer.
             if (_swResumeScanSettledSeen && typeof _onResumeScanSettledForActions === 'function') {
@@ -1346,6 +1348,11 @@ function _handleAgentBusMessage(msg) {
         case 'running-state':
             // F1: reply to a JOIN-waiter liveness probe (_queryRunningOnSW).
             _resolveRunningState(msg);
+            return;
+
+        case 'lineage-migrated':
+            // Reply to migrateChatLineageOnSW ('continueChatLineage').
+            _resolveLineageMigrated(msg);
             return;
 
         case 'debug-state':
@@ -1638,6 +1645,189 @@ function _resolveRunningState(msg) {
     delete _runQueryPending[msg.requestId];
     try { clearTimeout(p.timer); } catch (e) {}
     p.resolve(!!msg.running);
+}
+// "Continue in a new chat": ask the SW to move the old chat's carried-over
+// state (sub-agents, handles, pending wakes, workspace ownership, split view,
+// grants, un-flushed injection) to the new lineage head — worker/130
+// _swContinueChatLineage. Resolves the SW summary object; on no port / no
+// reply within timeoutMs it runs the page-local fallback (lineage link +
+// split-view rekey, both shared code) and resolves
+// {ok:false, fallback:true, reason, linked, splitView}. Never rejects.
+var _lineageMigratePending = {};
+var LINEAGE_MIGRATE_TIMEOUT_MS = 8000;
+// The fallback only covers the link + split view, so it leaves a durable
+// "migration pending" marker (chats[from].lineageMigrationPending = to) that
+// retryPendingLineageMigrations replays (the SW migration is idempotent) on
+// bus reconnect ('hello') and when either chat is selected. Plain top-level
+// field: persisted by the caller's next chat save (completeSummaryAndCreate
+// NewChat saves right after the migration); a stale persisted marker only
+// costs one extra idempotent retry.
+// Cleared to null, never deleted: the put merge's fill-gap carry
+// (core/130 _mergeChatRowForPut) would restore a deleted field from the
+// stored row. Returns true when the record changed.
+function _setLineageMigrationPending(from, to, pending) {
+    try {
+        var c = (typeof chats !== 'undefined' && chats) ? chats[from] : null;
+        if (!c || c._deleted) return false;
+        if (pending) {
+            if (c.lineageMigrationPending === to) return false;
+            c.lineageMigrationPending = to;
+            return true;
+        }
+        if (!c.lineageMigrationPending) return false;
+        c.lineageMigrationPending = null;
+        return true;
+    } catch (e) { return false; }
+}
+// Clear the marker after a definitive SW reply AND persist it (m2): an
+// in-memory-only clear came back from the stored row on the next load and
+// replayed the migration again.
+function _clearLineageMigrationPending(from) {
+    if (!_setLineageMigrationPending(from, null, false)) return false;
+    try { if (typeof _pushChatSkeletonToSW === 'function') _pushChatSkeletonToSW(from); } catch (e) {}
+    try { if (typeof saveChatsToStorage === 'function') Promise.resolve(saveChatsToStorage()).catch(function() {}); } catch (e) {}
+    return true;
+}
+// A SW migration result whose errors say it was refused for good (the link
+// would fork the lineage, or the chat is a worker) — not worth retrying.
+function _lineageMigrationRefused(r) {
+    var errs = (r && Array.isArray(r.errors)) ? r.errors.join(' ') : '';
+    return /link refused|sub-agent chat cannot be continued/.test(errs);
+}
+// Single-flight per source chat: true = reserved by the continue flow
+// (ui/170 completeSummaryAndCreateNewChat sets the marker, then awaits the
+// handover build before migrating); a Promise = a migrateChatLineageOnSW
+// call in flight. Replays (selectChat / SW 'hello') skip a reserved or
+// in-flight chat, so the migration never runs early or twice.
+var _lineageRetryInFlight = {};
+function reserveLineageMigration(from) {
+    if (!from || typeof _lineageRetryInFlight === 'undefined') return false;
+    if (!_lineageRetryInFlight[from]) _lineageRetryInFlight[from] = true;
+    return true;
+}
+// Drops a bare reservation (never an in-flight call's promise).
+function releaseLineageMigrationReservation(from) {
+    if (from && typeof _lineageRetryInFlight !== 'undefined' && _lineageRetryInFlight[from] === true) delete _lineageRetryInFlight[from];
+}
+function retryPendingLineageMigrations(onlyChatId) {
+    var out = [];
+    if (typeof chats === 'undefined' || !chats || !_agentBusPort) return out;
+    // One chat: walk its WHOLE lineage (A→B→C — selecting C must also replay
+    // A's pending migration, not just C's direct predecessor).
+    var ids = Object.keys(chats);
+    if (onlyChatId) {
+        ids = [onlyChatId, chats[onlyChatId] && chats[onlyChatId].continuedFrom];
+        try { if (typeof getLineageChatIds === 'function') ids = getLineageChatIds(onlyChatId) || ids; } catch (e) { /* keep the direct pair */ }
+    }
+    ids.forEach(function(id) {
+        var c = id ? chats[id] : null;
+        var marked = c && !c._deleted ? c.lineageMigrationPending : null;
+        if (!marked || _lineageRetryInFlight[id]) return;
+        // Replay to the CURRENT head, not the stored target: the chat may
+        // have been continued again since (A→B→C) — state must land on C.
+        var to = marked;
+        try { if (typeof resolveLineageHead === 'function') to = resolveLineageHead(id) || marked; } catch (e) { to = marked; }
+        if (to === id) {
+            // The successor was deleted/unlinked: nothing to migrate to.
+            _clearLineageMigrationPending(id);
+            return;
+        }
+        // Re-teach the SW every adjacent link of the chain (idempotent; port
+        // order puts them ahead of the migration) — the SW may never have
+        // seen them when the original migration fell back. The SW migration
+        // then accepts (from, head) as an existing chain, not a fork.
+        try {
+            var lin = (typeof getLineageChatIds === 'function') ? getLineageChatIds(id) : [id, to];
+            var at = lin.indexOf(id);
+            for (var k = at; k >= 0 && k < lin.length - 1; k++) registerLineageLinkOnSW(lin[k], lin[k + 1]);
+        } catch (e) {}
+        // migrateChatLineageOnSW owns the in-flight entry (set + cleared).
+        out.push(migrateChatLineageOnSW(id, to).then(null, function() { return null; }));
+    });
+    return out;
+}
+// Page → SW: register the link synchronously (worker/130 'registerLineageLink')
+// before any await, so wakes aimed at the old chat already resolve to the head.
+function registerLineageLinkOnSW(from, to) {
+    if (!from || !to || from === to) return false;
+    try { if (!_agentBusPort && typeof _openAgentBus === 'function') _openAgentBus(); } catch (e) {}
+    if (!_agentBusPort) return false;
+    try { _agentBusPort.postMessage({ type: 'registerLineageLink', from: from, to: to }); return true; } catch (e) { return false; }
+}
+// Fallback (no port / timeout / post failed): ONLY the link + the retry
+// marker. The split-view rekey is the SW migration's job (worker/130
+// _swContinueChatLineage) and runs when retryPendingLineageMigrations
+// replays it — rekeying here from the page split the work across realms.
+function _lineageMigrateFallback(from, to, reason) {
+    if (typeof _setLineageMigrationPending === 'function') _setLineageMigrationPending(from, to, true);
+    var res = { ok: false, fallback: true, reason: reason, from: from, to: to, linked: false, splitView: 'none' };
+    try { if (typeof registerLineageLink === 'function') res.linked = !!registerLineageLink(from, to, { missingIsDead: true }); } catch (e) {}
+    return Promise.resolve(res);
+}
+function migrateChatLineageOnSW(fromChatId, toChatId, opts) {
+    var timeoutMs = (opts && opts.timeoutMs) || LINEAGE_MIGRATE_TIMEOUT_MS;
+    if (!fromChatId || !toChatId || fromChatId === toChatId) return Promise.resolve({ ok: false, reason: 'invalid from/to' });
+    // Single-flight: join a call already in flight for the same pair; a
+    // different target waits for it (the SW migration is idempotent).
+    var inflight = (typeof _lineageRetryInFlight !== 'undefined') ? _lineageRetryInFlight : null;
+    var cur = inflight ? inflight[fromChatId] : null;
+    if (cur && typeof cur.then === 'function') {
+        if (cur._lineageTo === toChatId) return cur;
+        return cur.then(function() { return migrateChatLineageOnSW(fromChatId, toChatId, opts); });
+    }
+    var p = new Promise(function(resolveRaw) {
+        // A real SW reply that succeeded clears the pending marker — and so
+        // does a definitive refusal (forked link / sub-agent chat, worker/130
+        // _swContinueChatLineage): replaying it can never succeed, so keeping
+        // the marker would retry it on every hello / chat select forever.
+        function resolve(r) {
+            if (r && !r.fallback && _lineageMigrationSettled(r)) _clearLineageMigrationPending(fromChatId);
+            resolveRaw(r);
+        }
+        // Durable marker BEFORE the request (save timing): a reload or a
+        // timeout before the reply still leaves a replayable marker; the
+        // reply clears + persists it.
+        _setLineageMigrationPending(fromChatId, toChatId, true);
+        try { if (!_agentBusPort && typeof _openAgentBus === 'function') _openAgentBus(); } catch (e) {}
+        if (!_agentBusPort) { resolve(_lineageMigrateFallback(fromChatId, toChatId, 'no-port')); return; }
+        var rid = 'lm_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+        var timer = setTimeout(function() {
+            delete _lineageMigratePending[rid];
+            resolve(_lineageMigrateFallback(fromChatId, toChatId, 'timeout'));
+        }, timeoutMs);
+        _lineageMigratePending[rid] = { resolve: resolve, timer: timer };
+        try {
+            _agentBusPort.postMessage({ type: 'continueChatLineage', requestId: rid, from: fromChatId, to: toChatId });
+        } catch (e) {
+            try { clearTimeout(timer); } catch (e2) {}
+            delete _lineageMigratePending[rid];
+            resolve(_lineageMigrateFallback(fromChatId, toChatId, 'post-failed'));
+        }
+    });
+    if (inflight) {
+        p._lineageTo = toChatId;
+        inflight[fromChatId] = p;
+        var done = function() { if (inflight[fromChatId] === p) delete inflight[fromChatId]; };
+        p.then(done, done);
+    }
+    return p;
+}
+// A reply that ends the migration for good: success, or a definitive refusal.
+function _lineageMigrationSettled(r) {
+    return !!(r && (r.ok || (typeof _lineageMigrationRefused === 'function' && _lineageMigrationRefused(r))));
+}
+function _resolveLineageMigrated(msg) {
+    if (!msg || !msg.requestId) return;
+    var p = _lineageMigratePending[msg.requestId];
+    if (!p) {
+        // Late reply (the page already timed out and fell back): the SW DID
+        // migrate — clear the replay marker instead of ignoring the reply.
+        if (msg.from && _lineageMigrationSettled(msg.result)) _clearLineageMigrationPending(msg.from);
+        return;
+    }
+    delete _lineageMigratePending[msg.requestId];
+    try { clearTimeout(p.timer); } catch (e) {}
+    p.resolve(msg.result || { ok: false, reason: 'empty reply' });
 }
 // Keeps a JOIN entry honest while it is pending:
 //   • page flag gone (disconnect / hello reconcile cleared it) → stop; the

@@ -60,6 +60,9 @@
   "No changes tracked yet": "Aucune modification suivie pour l'instant",
   "Message input": "Saisie du message",
   "Continue in a new chat": "Continuer dans une nouvelle discussion",
+  "Continued: ": "Suite : ",
+  "Sub-agent chats can't be continued in a new chat": "Les discussions de sous-agents ne peuvent pas être poursuivies dans une nouvelle discussion",
+  "This chat was already continued in a new chat": "Cette discussion a déjà été poursuivie dans une nouvelle discussion",
   "Summarize and start new chat": "Résumer et démarrer une nouvelle discussion",
   "Pause or resume": "Mettre en pause ou reprendre",
   "Continue": "Continuer",
@@ -275,6 +278,7 @@
   "Read Version": "Lire une version",
   "Delete Document": "Supprimer un document",
   "List Instances": "Lister les instances",
+  "Connect Instance": "Connecter l'instance",
   "Fetch URL": "Récupérer une URL",
   "Web Search": "Recherche web",
   "Build Extension": "Compiler l'extension",
@@ -1923,5 +1927,12 @@
   "No edited skills": "Aucune compétence modifiée",
   "Resize sidebar": "Redimensionner la barre latérale",
   "Resize split view": "Redimensionner la vue partagée",
-  "Drag to resize · double-click to reset": "Faites glisser pour redimensionner · double-cliquez pour réinitialiser"
+  "Drag to resize · double-click to reset": "Faites glisser pour redimensionner · double-cliquez pour réinitialiser",
+  "Chat was continued": "La conversation a été poursuivie",
+  "Continued from": "Suite de",
+  "Continued in": "Suite dans",
+  "Go to the new chat": "Aller à la nouvelle conversation",
+  "Send here anyway": "Envoyer ici quand même",
+  "This chat continues in \"{title}\". Workers, PRs and widgets now live there.": "Cette conversation se poursuit dans « {title} ». Les workers, les PR et les widgets s’y trouvent désormais.",
+  "deleted chat": "conversation supprimée"
 }

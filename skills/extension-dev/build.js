@@ -594,6 +594,7 @@ async function extension_build(args) {
         'src/js/core/130-indexeddb.js',
         'src/js/core/140-skills-engine.js',
         'src/js/core/150-record-helpers.js',
+        'src/js/core/152-line-diff.js',
         'src/js/tools/040-file-store.js',
         'src/js/tools/050-file-tools.js',
         'src/js/tools/070-screenshot-by-id.js',

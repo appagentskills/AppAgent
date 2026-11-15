@@ -197,7 +197,8 @@ describe('unified file store', function() {
         var sb = await loadFile('src/js/tools/070-screenshot-by-id.js');
         assert.ok(/await getFileAsync\(id\)/.test(sb), 'screenshot_by_id resolves via the store');
         var gf = await loadFile('src/js/tools/040-file-store.js');
-        assert.ok(/var file = await getFileAsync\(id\)/.test(gf), 'get_file resolves via the store');
+        // (download + internal _meta short-circuits to metadata only: local_folder share, sweep fix 1)
+        assert.ok(/var file = [^;]*await getFileAsync\(id\);/.test(gf), 'get_file resolves via the store');
     }, { tags: ['unit'] });
 
     test('runtime_inspect screenshot registers a file_id with MIME from the bytes and survives a restart', async function() {

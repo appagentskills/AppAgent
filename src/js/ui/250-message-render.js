@@ -1332,10 +1332,10 @@ function renderMessages() {
                                     : '<span class="tool-result-badge" title="' + escapeHtml(t('Tool call succeeded')) + '">' + UI_ICONS.check + '</span>';
                             }
                             html += '</summary>';
-                            var argsCopyId = storeRawCopy(tc.function.arguments);
+                            var argsCopyId = storeRawCopy(maskSecretToolArgs(tc.function.arguments));
                             html += '<div class="tool-args-wrapper" data-copy-id="' + argsCopyId + '">';
                             html += '<button class="tool-expand-btn" onclick="toggleToolExpand(this, event)" title="' + escapeHtml(t('Expand')) + '">⤢</button>';
-                            html += '<pre class="tool-args">' + formatJsonPretty(tc.function.arguments) + '</pre>';
+                            html += '<pre class="tool-args">' + formatJsonPretty(maskSecretToolArgs(tc.function.arguments)) + '</pre>';
                             html += '<button class="tool-copy-btn" onclick="copyCodeBlock(this, event)" title="' + escapeHtml(t('Copy')) + '">' + UI_ICONS.copy + '</button></div>';
 
                             // Render tool result inline within the same panel
@@ -1539,10 +1539,10 @@ function renderMessages() {
                         html += '<span class="tool-status ' + approval.msg.status + '">' + statusLabel + '</span>';
                     }
                     html += '</summary>';
-                    var copyId = storeRawCopy(tc.function.arguments);
+                    var copyId = storeRawCopy(maskSecretToolArgs(tc.function.arguments));
                     html += '<div class="tool-args-wrapper" data-copy-id="' + copyId + '">';
                     html += '<button class="tool-expand-btn" onclick="toggleToolExpand(this, event)" title="' + escapeHtml(tcFullHeight ? t('Collapse') : t('Expand')) + '">' + (tcFullHeight ? '⤡' : '⤢') + '</button>';
-                    html += '<pre class="tool-args' + (tcFullHeight ? ' expanded' : '') + '">' + formatJsonPretty(tc.function.arguments) + '</pre>';
+                    html += '<pre class="tool-args' + (tcFullHeight ? ' expanded' : '') + '">' + formatJsonPretty(maskSecretToolArgs(tc.function.arguments)) + '</pre>';
                     html += '<button class="tool-copy-btn" onclick="copyCodeBlock(this, event)" title="' + escapeHtml(t('Copy')) + '">' + UI_ICONS.copy + '</button></div>';
                     html += '</details>';
                 });
@@ -1686,13 +1686,26 @@ function renderMessages() {
             '</button></div>';
     }
     var mappedHtml = windowNoticeHtml + mappedParts.join('');
+    // "Continue in a new chat" banners (ui/170 renderLineageBanner): "Continued
+    // from ←" on top of a continuation, "Continued in →" at the end of the
+    // chat it continues. The banners live outside mappedParts, so their state
+    // is part of the render signature (_linSig): a continuedTo/From stamped on
+    // an already-rendered chat must force the full rebuild, not the R1 patch.
+    var _linSig = '';
+    if (typeof renderLineageBanner === 'function' && typeof chats !== 'undefined' && chats[currentChatId]) {
+        try {
+            var _linChat = chats[currentChatId];
+            _linSig = (_linChat.continuedFrom || '') + '>' + (_linChat.continuedTo || '');
+            mappedHtml = renderLineageBanner(_linChat, 'top') + mappedHtml + renderLineageBanner(_linChat, 'bottom');
+        } catch (eLb) {}
+    }
 
     // R1: compute per-message signatures and try the incremental fast path
     // before falling through to the full innerHTML rebuild below.
     var newSigs = new Array(mappedParts.length);
     for (var sgi = 0; sgi < mappedParts.length; sgi++) newSigs[sgi] = _renderSig(mappedParts[sgi]);
-    if (_tryIncrementalRender(container, isRunning, mappedParts, newSigs, savedScrollTop)) {
-        _lastRenderState = { chatId: currentChatId, count: mappedParts.length, sigs: newSigs };
+    if ((_lastRenderState.linSig || '') === _linSig && _tryIncrementalRender(container, isRunning, mappedParts, newSigs, savedScrollTop)) {
+        _lastRenderState = { chatId: currentChatId, count: mappedParts.length, sigs: newSigs, linSig: _linSig };
         return;
     }
 
@@ -1889,7 +1902,7 @@ function renderMessages() {
     }
 
     // R1: record what this full render produced so the next render can diff.
-    _lastRenderState = { chatId: currentChatId, count: mappedParts.length, sigs: newSigs };
+    _lastRenderState = { chatId: currentChatId, count: mappedParts.length, sigs: newSigs, linSig: _linSig };
 
     // FIX6: the innerHTML rebuild above discarded every previous expanded
     // tool panel WITHOUT disconnecting its IntersectionObserver — disconnect
@@ -1960,11 +1973,18 @@ function updateStreamingMessage(index, msg, streamingChatId) {
     });
 }
 
+// Display/copy mask for password-like tool args (connect_instance). Works on
+// partial streaming JSON too. Mirrors _maskSecretArgString (app/030-agent-loop.js).
+function maskSecretToolArgs(s) {
+    if (typeof s !== 'string' || !/pass|secret/i.test(s)) return s;
+    return s.replace(/("(?:password|passwd|secret)"\s*:\s*)"(?:[^"\\]|\\.)*(?:"|\\?$)/gi, '$1"[redacted]"');
+}
+
 // Patch every existing parallel row without replacing details/scroll state.
 function _patchStreamingToolRow(row, tc) {
     var argsEl = row && row.querySelector('.tool-args');
     if (!argsEl) return false;
-    var argsText = tc.function.arguments || '';
+    var argsText = maskSecretToolArgs(tc.function.arguments || '');
     if (argsText) argsEl.textContent = argsText;
     else argsEl.innerHTML = '<span class="tool-args-streaming">' + t('Generating arguments...') + '</span>';
     var wrapper = row.querySelector('.tool-args-wrapper');
@@ -2099,7 +2119,7 @@ function _updateStreamingMessageNow(index, msg, streamingChatId) {
                     newTcHtml += '<summary><span class="tool-name">' + getToolIcon(tc.function.name) + ' ' + escapeHtml(TOOL_DISPLAY_NAMES[tc.function.name] ? t(TOOL_DISPLAY_NAMES[tc.function.name]) : tc.function.name) + '</span>' + statusMsgHtml + '</summary>';
                     newTcHtml += '<div class="tool-args-wrapper">';
                     newTcHtml += '<button class="tool-expand-btn" onclick="toggleToolExpand(this, event)" title="' + escapeHtml(t('Expand')) + '">⤢</button>';
-                    var argsText = tc.function.arguments || '';
+                    var argsText = maskSecretToolArgs(tc.function.arguments || '');
                     if (argsText.length === 0) {
                         newTcHtml += '<pre class="tool-args"><span class="tool-args-streaming">' + t('Generating arguments...') + '</span></pre>';
                     } else {
@@ -2188,10 +2208,10 @@ function _updateStreamingMessageNow(index, msg, streamingChatId) {
                 var toolSpinner = (msg.isStreaming && isLastToolCall) ? '<span class="tool-streaming-indicator"></span>' : '';
                 var statusMsgHtml = streamingTcStatusMsg ? '<span class="tool-status-message">' + escapeHtml(streamingTcStatusMsg) + '</span>' : '';
                 html += '<summary><span class="tool-name">' + getToolIcon(tc.function.name) + ' ' + escapeHtml(TOOL_DISPLAY_NAMES[tc.function.name] ? t(TOOL_DISPLAY_NAMES[tc.function.name]) : tc.function.name) + '</span>' + statusMsgHtml + toolSpinner + '</summary>';
-                var argsCopyId = storeRawCopy(tc.function.arguments);
+                var argsCopyId = storeRawCopy(maskSecretToolArgs(tc.function.arguments));
                 html += '<div class="tool-args-wrapper" data-copy-id="' + argsCopyId + '">';
                 html += '<button class="tool-expand-btn" onclick="toggleToolExpand(this, event)" title="' + escapeHtml(tcFullHeight ? t('Collapse') : t('Expand')) + '">' + (tcFullHeight ? '⤡' : '⤢') + '</button>';
-                var argsHtml = formatJsonPretty(tc.function.arguments);
+                var argsHtml = formatJsonPretty(maskSecretToolArgs(tc.function.arguments));
                 if (window.currentSearchHighlight) {
                     argsHtml = applySearchHighlight(argsHtml, window.currentSearchHighlight);
                 }

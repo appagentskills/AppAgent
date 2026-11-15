@@ -1256,83 +1256,17 @@ function formatXmlForDiff(xml) {
     return xml;
 }
 
-// Compute diff between two strings (line-based diff with prefix/suffix optimization)
+// Compute diff between two strings (line-based). The ops come from the shared
+// core/152 lineDiffOps (trimmed prefix/suffix + linear-space Myers, patience
+// fallback past its step budget); removes precede adds inside each change block.
 function computeDiff(oldText, newText) {
-    var oldNormalized = normalizeLineEndings(oldText || '');
-    var newNormalized = normalizeLineEndings(newText || '');
-    var oldLines = oldNormalized.split('\n');
-    var newLines = newNormalized.split('\n');
-    var m = oldLines.length, n = newLines.length;
-
-    // Trim common prefix
-    var prefix = 0;
-    while (prefix < m && prefix < n && oldLines[prefix] === newLines[prefix]) prefix++;
-
-    // Trim common suffix
-    var suffix = 0;
-    while (suffix < m - prefix && suffix < n - prefix && oldLines[m - 1 - suffix] === newLines[n - 1 - suffix]) suffix++;
-
-    // Build result: common prefix
-    var result = [];
-    for (var i = 0; i < prefix; i++)
-        result.push({ type: 'same', oldLine: i + 1, newLine: i + 1, text: oldLines[i] });
-
-    // Middle section - only this needs LCS
-    var oldMid = oldLines.slice(prefix, m - suffix);
-    var newMid = newLines.slice(prefix, n - suffix);
-    var mMid = oldMid.length, nMid = newMid.length;
-
-    if (mMid > 0 || nMid > 0) {
-        var MAX_LCS_CELLS = 4000000;
-        if (mMid * nMid <= MAX_LCS_CELLS) {
-            // LCS diff on the middle
-            var lcs = [];
-            for (var i = 0; i <= mMid; i++) {
-                lcs[i] = [];
-                for (var j = 0; j <= nMid; j++) {
-                    if (i === 0 || j === 0) lcs[i][j] = 0;
-                    else if (oldMid[i-1] === newMid[j-1]) lcs[i][j] = lcs[i-1][j-1] + 1;
-                    else lcs[i][j] = Math.max(lcs[i-1][j], lcs[i][j-1]);
-                }
-            }
-            var diff = [];
-            var ii = mMid, jj = nMid;
-            while (ii > 0 || jj > 0) {
-                if (ii > 0 && jj > 0 && oldMid[ii-1] === newMid[jj-1]) {
-                    diff.unshift({ type: 'same', oldLine: prefix + ii, newLine: prefix + jj, text: oldMid[ii-1] });
-                    ii--; jj--;
-                } else if (jj > 0 && (ii === 0 || lcs[ii][jj-1] >= lcs[ii-1][jj])) {
-                    diff.unshift({ type: 'add', oldLine: null, newLine: prefix + jj, text: newMid[jj-1] });
-                    jj--;
-                } else {
-                    diff.unshift({ type: 'remove', oldLine: prefix + ii, newLine: null, text: oldMid[ii-1] });
-                    ii--;
-                }
-            }
-            result = result.concat(diff);
-        } else {
-            // Too large for LCS - simple line-by-line comparison
-            var max = Math.max(mMid, nMid);
-            for (var i = 0; i < max; i++) {
-                if (i >= mMid) {
-                    result.push({ type: 'add', oldLine: null, newLine: prefix + i + 1, text: newMid[i] });
-                } else if (i >= nMid) {
-                    result.push({ type: 'remove', oldLine: prefix + i + 1, newLine: null, text: oldMid[i] });
-                } else if (oldMid[i] === newMid[i]) {
-                    result.push({ type: 'same', oldLine: prefix + i + 1, newLine: prefix + i + 1, text: oldMid[i] });
-                } else {
-                    result.push({ type: 'remove', oldLine: prefix + i + 1, newLine: null, text: oldMid[i] });
-                    result.push({ type: 'add', oldLine: null, newLine: prefix + i + 1, text: newMid[i] });
-                }
-            }
-        }
-    }
-
-    // Common suffix
-    for (var i = 0; i < suffix; i++)
-        result.push({ type: 'same', oldLine: m - suffix + i + 1, newLine: n - suffix + i + 1, text: oldLines[m - suffix + i] });
-
-    return result;
+    var oldLines = normalizeLineEndings(oldText || '').split('\n');
+    var newLines = normalizeLineEndings(newText || '').split('\n');
+    return lineDiffOps(oldLines, newLines).map(function(op) {
+        if (op.type === 'same') return { type: 'same', oldLine: op.oldIndex + 1, newLine: op.newIndex + 1, text: oldLines[op.oldIndex] };
+        if (op.type === 'remove') return { type: 'remove', oldLine: op.oldIndex + 1, newLine: null, text: oldLines[op.oldIndex] };
+        return { type: 'add', oldLine: null, newLine: op.newIndex + 1, text: newLines[op.newIndex] };
+    });
 }
 
 // Compute word-level diff between two lines (for highlighting changed words)
