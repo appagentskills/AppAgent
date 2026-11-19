@@ -268,7 +268,8 @@ var SUB_AGENT_PREAMBLE = [
     'Reporting (`report_to_parent` — the parent sees only this, never your transcript):',
     '- Summarize; never echo raw tool output. `summary` is concise markdown (rendered to the user in the parent chat), ≤ 4 KB by default — the parent may set another cap via spawn `summary_cap_kb` (1–16 KB); longer summaries are truncated by the registry.',
     '- `data`: unless your task declares an "Expected output schema" (which wins), use {task, findings, evidence: [...], confidence: "high"|"medium"|"low", open_questions: [...]} — task = one-line restatement of what you understood, findings = the distilled result, evidence = concrete pointers per claim (sys_ids, file paths + line numbers, URLs), open_questions = what you could not resolve.',
-    '- Put larger payloads in `artifacts` (doc_ids, file_ids), never long lists/dumps in `summary`; stage long results in a smart doc (`document`: `shared` scope lets the parent read it, `chat` keeps it private).',
+    '- Put larger payloads in `artifacts` (doc_ids, file_ids), never long lists/dumps in `summary`; only if a result is too long for `summary`/`data`, stage it in a `chat`-scoped smart doc (`document` scope:"chat" — your parent can read it) and list its doc_id in `artifacts`. Never create `shared` documents unless the user or your task explicitly asks for one.',
+    '- Handoffs: never write a handoff/handover document. If you stop early (context limit, blocked), the handover — what is done, what is left, exact next steps — goes in the report itself; the parent seeds any successor from it.',
     '- The parent is blocked on your report: stay focused and brief, and return `status:"done"` as soon as the task is genuinely complete.'
 ].join('\n');
 
@@ -2371,9 +2372,10 @@ function spawnSubAgent(args, ctx) {
     // (so a sub-agent calling spawn_sub_agent, if allowed, gets correct
     // parentage even when js_eval is the immediate caller).
     args = args || {};
-    var parentChatId = (ctx && ctx.chatId)
-        || (typeof activeStreamingChatId !== 'undefined' ? activeStreamingChatId : null)
-        || (typeof currentChatId !== 'undefined' ? currentChatId : null);
+    var parentChatId = ((ctx && ctx.chatId)
+        || ((ctx && ctx.noFallback) ? null   // nested caller: never the foreground chat
+            : ((typeof activeStreamingChatId !== 'undefined' ? activeStreamingChatId : null)
+                || (typeof currentChatId !== 'undefined' ? currentChatId : null))));
     if (!parentChatId) {
         return { success: false, error: 'spawn_sub_agent: no parent chat context' };
     }
@@ -4811,9 +4813,10 @@ function _queuePrLinksToParent(rec, text) {
 
 function reportToParent(args, ctx) {
     args = args || {};
-    var subChatId = (ctx && ctx.chatId)
-        || (typeof activeStreamingChatId !== 'undefined' ? activeStreamingChatId : null)
-        || (typeof currentChatId !== 'undefined' ? currentChatId : null);
+    var subChatId = ((ctx && ctx.chatId)
+        || ((ctx && ctx.noFallback) ? null   // nested caller: never the foreground chat
+            : ((typeof activeStreamingChatId !== 'undefined' ? activeStreamingChatId : null)
+                || (typeof currentChatId !== 'undefined' ? currentChatId : null))));
     if (!subChatId || typeof chats === 'undefined' || !chats[subChatId] || !chats[subChatId].isSubAgent) {
         return { success: false, error: 'report_to_parent can only be called from inside a sub-agent chat.' };
     }
@@ -5037,9 +5040,10 @@ function _parkSubAgent(rec) {
 
 function sleepSelf(args, ctx) {
     args = args || {};
-    var subChatId = (ctx && ctx.chatId)
-        || (typeof activeStreamingChatId !== 'undefined' ? activeStreamingChatId : null)
-        || (typeof currentChatId !== 'undefined' ? currentChatId : null);
+    var subChatId = ((ctx && ctx.chatId)
+        || ((ctx && ctx.noFallback) ? null   // nested caller: never the foreground chat
+            : ((typeof activeStreamingChatId !== 'undefined' ? activeStreamingChatId : null)
+                || (typeof currentChatId !== 'undefined' ? currentChatId : null))));
     if (!subChatId || typeof chats === 'undefined' || !chats[subChatId] || !chats[subChatId].isSubAgent) {
         return { success: false, error: 'sleep_self can only be called from inside a sub-agent chat.' };
     }
@@ -5169,9 +5173,10 @@ function _wakeSubAgentImpl(args, ctx, isInternalCascade) {
         // fallback — a call with an unresolved chat-id bypassed the subtree
         // ownership check entirely (fail open). _callerOwnsTarget(null,…)
         // returns false, so an unresolvable caller is now correctly denied.
-        var _wakeCallerChatId = (ctx && ctx.chatId)
-            || (typeof activeStreamingChatId !== 'undefined' ? activeStreamingChatId : null)
-            || (typeof currentChatId !== 'undefined' ? currentChatId : null);
+        var _wakeCallerChatId = ((ctx && ctx.chatId)
+        || ((ctx && ctx.noFallback) ? null   // nested caller: never the foreground chat
+            : ((typeof activeStreamingChatId !== 'undefined' ? activeStreamingChatId : null)
+                || (typeof currentChatId !== 'undefined' ? currentChatId : null))));
         var _wakeCallerAgentId = (_wakeCallerChatId && typeof chats !== 'undefined'
             && chats[_wakeCallerChatId] && chats[_wakeCallerChatId].isSubAgent)
             ? chats[_wakeCallerChatId].subAgentId : null;
@@ -5190,9 +5195,10 @@ function _wakeSubAgentImpl(args, ctx, isInternalCascade) {
         // tier:'same' inherits the WAKING agent's own current model, so resolve
         // the caller chat id (same fallback chain as the ACL gate) and pass it
         // to _resolveSpawnProvider.
-        var _wkCallerChatId = (ctx && ctx.chatId)
-            || (typeof activeStreamingChatId !== 'undefined' ? activeStreamingChatId : null)
-            || (typeof currentChatId !== 'undefined' ? currentChatId : null);
+        var _wkCallerChatId = ((ctx && ctx.chatId)
+        || ((ctx && ctx.noFallback) ? null   // nested caller: never the foreground chat
+            : ((typeof activeStreamingChatId !== 'undefined' ? activeStreamingChatId : null)
+                || (typeof currentChatId !== 'undefined' ? currentChatId : null))));
         var _wkResolved = _resolveSpawnProvider(args, 'wake_sub_agent', _wkCallerChatId);
         if (!_wkResolved.ok) return { success: false, error: _wkResolved.error };
         // 'same' escalation carries provider:null (dynamic follow) but must
@@ -5635,9 +5641,10 @@ function agentMessage(args, ctx, _regMissRetried) {
     if (!to || !content) {
         return { success: false, error: 'agent_message: `to` and `content` are required.' };
     }
-    var fromChatId = (ctx && ctx.chatId)
-        || (typeof activeStreamingChatId !== 'undefined' ? activeStreamingChatId : null)
-        || (typeof currentChatId !== 'undefined' ? currentChatId : null);
+    var fromChatId = ((ctx && ctx.chatId)
+        || ((ctx && ctx.noFallback) ? null   // nested caller: never the foreground chat
+            : ((typeof activeStreamingChatId !== 'undefined' ? activeStreamingChatId : null)
+                || (typeof currentChatId !== 'undefined' ? currentChatId : null))));
     var fromIsSub = !!(typeof chats !== 'undefined' && chats[fromChatId] && chats[fromChatId].isSubAgent);
 
     // Resolve recipient. 'parent' from a sub means push to that sub's parent chat
@@ -6048,9 +6055,10 @@ function _stopSubAgentImpl(args, ctx, isInternalCascade) {
         // F1: fail closed (see wake_sub_agent). Resolve caller chat-id via the
         // standard fallback chain and enforce the ACL unconditionally — an
         // unresolved caller no longer bypasses the subtree-ownership check.
-        var _callerChatId = (ctx && ctx.chatId)
-            || (typeof activeStreamingChatId !== 'undefined' ? activeStreamingChatId : null)
-            || (typeof currentChatId !== 'undefined' ? currentChatId : null);
+        var _callerChatId = ((ctx && ctx.chatId)
+        || ((ctx && ctx.noFallback) ? null   // nested caller: never the foreground chat
+            : ((typeof activeStreamingChatId !== 'undefined' ? activeStreamingChatId : null)
+                || (typeof currentChatId !== 'undefined' ? currentChatId : null))));
         var _callerAgentId = (_callerChatId && typeof chats !== 'undefined'
             && chats[_callerChatId] && chats[_callerChatId].isSubAgent)
             ? chats[_callerChatId].subAgentId : null;
@@ -6382,7 +6390,7 @@ function _saturationWarning(rec) {
     if (!s.saturated) return null;
     return 'Recipient sub is at ~' + s.context_pct + '% of the assumed 200k context window ('
         + Math.round(s.context_tokens / 1000) + 'k tokens) — per the WORKER SATURATION rule,'
-        + ' spawn a fresh sub seeded with a handover instead of piling on.';
+        + ' spawn a fresh sub seeded (in its spawn instructions) with a handover instead of piling on.';
 }
 
 // ---------- agent_status ----------
@@ -6555,9 +6563,10 @@ function agentStatus(args, ctx) {
     // contexts (where activeStreamingChatId may diverge from the caller's
     // actual chat) get correctly scoped. Fall back to streaming / current.
     var parentChatId = args.parent_chat_id
-        || (ctx && ctx.chatId)
-        || (typeof activeStreamingChatId !== 'undefined' ? activeStreamingChatId : null)
-        || (typeof currentChatId !== 'undefined' ? currentChatId : null);
+        || ((ctx && ctx.chatId)
+        || ((ctx && ctx.noFallback) ? null   // nested caller: never the foreground chat
+            : ((typeof activeStreamingChatId !== 'undefined' ? activeStreamingChatId : null)
+                || (typeof currentChatId !== 'undefined' ? currentChatId : null))));
     if (args.parent_chat_id !== '*' && !parentChatId) {
         return { success: true, agents: [], pool: { running: Object.keys(_subPool.running).length, queued: _subPool.queue.length, size: SUBAGENT_POOL_SIZE, global_max: SUBAGENT_POOL_GLOBAL_MAX, groups: _poolGroupsSnapshot(), group_limits: _poolGroupLimitsSnapshot() }, note: 'no parent chat context resolvable; pass parent_chat_id explicitly or "*" for all' };
     }

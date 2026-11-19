@@ -1850,7 +1850,8 @@ function renderMessages() {
         wi.addEventListener('click', function(e) {
             if (e.target.closest('.widget-controls')) return;
             var wid = wi.getAttribute('data-widget-id');
-            if (wid) openWidgetFullscreen(wid);
+            // Opened from this chat view: its tool calls stay with this chat.
+            if (wid) openWidgetFullscreen(wid, null, (typeof currentChatId !== 'undefined' && currentChatId) || null);
         });
     });
 

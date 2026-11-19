@@ -41,7 +41,7 @@ var TOOLS = [
                     attachment_table_name: { type: 'string', description: 'Attachment upload: table of the target record, e.g. "incident".' },
                     attachment_table_sys_id: { type: 'string', description: 'Attachment upload: sys_id of the target record.' },
                     attachment_content_type: { type: 'string', description: 'Attachment upload: MIME type, e.g. "image/png". Auto-detected from the file name if omitted.' },
-                    timeout_ms: { type: 'number', description: 'Hard request timeout in ms (default 30000) → {success:false, timed_out:true}. Still running after 5s: returns {pending:true, handle}; the request continues and you are notified on completion — await_handle({handle}) to wait, await_handle({handle, cancel:true}) to abort.' },
+                    timeout_ms: { type: 'number', description: 'Hard request timeout in ms (default 30000) → {success:false, timed_out:true}; includes instance token lookup (whole call capped at timeout_ms + 5s). Still running after 5s: returns {pending:true, handle}; the request continues and you are notified on completion — await_handle({handle}) to wait, await_handle({handle, cancel:true}) to abort.' },
                     instance: { type: 'string', description: 'Required. Target ServiceNow instance by short name (e.g. "dev12345") or URL. See list_instances.' },
                     confirm: { type: 'boolean', description: 'Set true to have the user approve before execution (destructive, bulk, or significant changes). Omit for reads and routine operations.' },
                     status_message: { type: 'string', description: 'Short human-friendly description of this call, shown in the UI header.' }
@@ -597,7 +597,7 @@ var TOOLS = [
         type: 'function',
         function: {
             name: 'prompt_user',
-            description: 'Show an inline form to collect structured input from the user. Blocking — the agent waits until the user submits or cancels. Preferred when you need structured input (specific parameters before proceeding, e.g. export format, which specs, date range) or plan confirmation; not for casual one-line offers in chat. Build the form from context — options should come from the instance or conversation, not be hardcoded.\n\nField types: text, textarea, select, multi-select, date, boolean, number. Modes: empty (you need info), prefilled (confirming "here\'s what I understood"), partially filled (you know some, need the rest).\n\nPLAN CONFIRMATION: before a long or risky sequence of write operations (building apps/dashboards, bulk or multi-record changes), present the plan here and get approval — do not execute it silently. Read-only or exploratory work needs no plan confirmation.',
+            description: 'Show an inline form to collect structured input from the user. Blocking — the agent waits until the user submits or cancels. Preferred when you need structured input (specific parameters before proceeding, e.g. export format, which specs, date range) or plan confirmation; not for casual one-line offers in chat. Build the form from context — options should come from the instance or conversation, not be hardcoded.\n\nField types: text, textarea, select, multi-select, date, boolean, number. Modes: empty (you need info), prefilled (confirming "here\'s what I understood"), partially filled (you know some, need the rest).\n\nPLAN CONFIRMATION: before a long or risky sequence of write operations (building apps/dashboards, bulk or multi-record changes), present the plan here and get approval — do not execute it silently. Read-only or exploratory work needs no plan confirmation.\n\nFROM A WIDGET (executeTool inside html_widget): the form opens in the widget\'s own chat, so the call returns {success:false, code:\'CHAT_NOT_VISIBLE\'} unless that chat is the one open on screen in chat view (or is a background Action chat, which raises its needs-input bell). Widgets must handle this code (e.g. tell the user to open the widget\'s chat).',
             parameters: {
                 type: 'object',
                 properties: {
@@ -827,7 +827,7 @@ var TOOLS = [
         type: 'function',
         function: {
             name: 'document',
-            description: 'Create and manage Smart Documents: persistent, versioned markdown that renders inline in chat (every reference shows the latest version), with embedded display templates and non-blocking user prompts. The user can edit documents inline — read to see their changes.\n\nVisibility (fixed at creation): scope \'shared\' (default, global) or \'chat\' (private). A \'chat\' doc is your scratchpad and is also shared between a sub-agent and its parent without crowding the shared list.\n\nActions: create (title, content, scope?, prompts?); update (doc_id, content?, title?, prompts? — new version); edit (doc_id, edits [{find, replace}], each find unique — new version); read (current version + prompt responses); list; list_versions (doc_id); read_version (doc_id, version); delete (doc_id).\nEmbed a template: call display first and include its placeholder in content. Prompts use the prompt_user field schema.',
+            description: 'Create and manage Smart Documents: persistent, versioned markdown that renders inline in chat (every reference shows the latest version), with embedded display templates and non-blocking user prompts. The user can edit documents inline — read to see their changes.\n\nVisibility (fixed at creation): scope \'shared\' (default, global) or \'chat\' (private). A \'chat\' doc is your scratchpad and is also shared between a sub-agent and its parent without crowding the shared list.\n\nCreate documents only when the user asks or the task needs a persistent artifact — never on your own for handoffs/handovers/progress notes (those go in report_to_parent or spawn instructions); when you must stage internal notes, use scope \'chat\'.\n\nActions: create (title, content, scope?, prompts?); update (doc_id, content?, title?, prompts? — new version); edit (doc_id, edits [{find, replace}], each find unique — new version); read (current version + prompt responses); list; list_versions (doc_id); read_version (doc_id, version); delete (doc_id).\nEmbed a template: call display first and include its placeholder in content. Prompts use the prompt_user field schema.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -892,7 +892,7 @@ var TOOLS = [
                 type: 'object',
                 properties: {
                     handle: { type: 'string', description: 'Handle id from a previous async call (e.g. "h_xxx").' },
-                    timeout_ms: { type: 'number', description: 'Max ms to wait. 0 / omitted = wait indefinitely.' },
+                    timeout_ms: { type: 'number', description: 'Max ms to wait (default 120000 = 2 min; 0 / omitted = the default, never infinite). Pass a larger value explicitly for long sub-agent work. Still pending after it → {status:"pending"}; await again.' },
                     cancel: { type: 'boolean', description: 'Abort a pending background request handle (slow HTTP tool call) instead of waiting. Not for sub-agents (use stop_sub_agent).' },
                     status_message: { type: 'string', description: 'Short human-friendly description of this call, shown in the UI header.' }
                 },
@@ -909,7 +909,7 @@ var TOOLS = [
                 type: 'object',
                 properties: {
                     handles: { type: 'array', items: { type: 'string' }, description: 'Handle ids to race.' },
-                    timeout_ms: { type: 'number', description: 'Max ms to wait. 0 / omitted = wait indefinitely.' },
+                    timeout_ms: { type: 'number', description: 'Max ms to wait (default 120000 = 2 min; 0 / omitted = the default, never infinite). Pass a larger value explicitly for long work.' },
                     status_message: { type: 'string', description: 'Short human-friendly description of this call, shown in the UI header.' }
                 },
                 required: ['handles']
@@ -925,7 +925,7 @@ var TOOLS = [
                 type: 'object',
                 properties: {
                     handles: { type: 'array', items: { type: 'string' }, description: 'Handle ids to wait on.' },
-                    timeout_ms: { type: 'number', description: 'Max ms to wait. 0 / omitted = wait indefinitely.' },
+                    timeout_ms: { type: 'number', description: 'Max ms to wait (default 120000 = 2 min; 0 / omitted = the default, never infinite). Pass a larger value explicitly for long work.' },
                     status_message: { type: 'string', description: 'Short human-friendly description of this call, shown in the UI header.' }
                 },
                 required: ['handles']

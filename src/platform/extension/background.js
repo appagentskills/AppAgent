@@ -25,30 +25,72 @@ let loginTabId = null;
 
 // --- ServiceNow detection ---
 
-// Probe a tab for ServiceNow by checking window.g_ck in the page's JS context
-async function probeTab(tabId) {
+// Probe a tab for ServiceNow by checking window.g_ck in the page's JS context.
+// Returns the full snLoginProbeState (token, userName, origin, path, login/MFA/
+// password-change flags) so callers can tell a signed-in page from a login /
+// SSO / MFA page that also exposes a (guest) g_ck.
+// ms (optional) caps this probe below snTimeoutMs('tab') (the early-probe deadline).
+// injectImmediately: do not wait for document_idle — on a cold first visit the
+// page is still loading for 5-30s and a default injection only times out.
+async function probeTab(tabId, ms) {
     try {
         var results = await snWithTimeout(chrome.scripting.executeScript({
             target: { tabId: tabId },
             world: 'MAIN',
-            func: function() {
-                return {
-                    token: window.g_ck || '',
-                    userName: (window.NOW && window.NOW.user_name) || '',
-                    origin: window.location.origin
-                };
-            }
-        }), snTimeoutMs('tab'), null);
+            injectImmediately: true,
+            func: snLoginProbeState
+        }), ms || snTimeoutMs('tab'), null);
         return results && results[0] && results[0].result || null;
     } catch(e) {
         return null; // Can't inject (chrome://, edge cases)
     }
 }
 
-// Called when a tab finishes loading — detect SN and inject content script
-async function onTabReady(tabId) {
-    var info = await probeTab(tabId);
+// Like probeTab but tells a TIMED-OUT probe (tab still loading, renderer busy,
+// instance waking) apart from a probe that answered / could not inject:
+// { st, timedOut }. getSnTabList must not negatively cache a timeout.
+async function snProbeTabState(tabId, ms) {
+    try {
+        var results = await snInjectBounded(chrome.scripting.executeScript({
+            target: { tabId: tabId },
+            world: 'MAIN',
+            injectImmediately: true,   // see probeTab: a loading tab answers too
+            func: snLoginProbeState
+        }), ms || snTimeoutMs('tab'));
+        return { st: (results && results[0] && results[0].result) || null, timedOut: false };
+    } catch (e) {
+        return { st: null, timedOut: !!(e && e.message === 'timeout') };
+    }
+}
+
+// Called when a tab finishes loading — detect SN and inject content script.
+// opts.early (snEarlyTabProbe, page still loading): opts.info is the probe that
+// already passed snEarlyLooksAdoptable(info, opts.url); the token must pass the
+// STRICT check within opts.checkMs (a timeout rejects). If it does not, nothing
+// is written / tracked / injected and false is returned so the 'complete' path
+// decides. Resolves true when the tab's token was adopted.
+async function onTabReady(tabId, opts) {
+    opts = opts || {};
+    var early = !!opts.early;
+    var info = early ? opts.info : await probeTab(tabId);
     var isSn = info && info.token;
+    // A login / SSO / MFA / password-change page exposes a GUEST g_ck: the tab is
+    // still a ServiceNow tab (tracked + injected) but its token is never adopted
+    // as the session, and it never auto-closes the login tab. Adopting it used to
+    // loop: login tab closed -> guest token used -> 401 -> tab reloaded -> repeat.
+    // A signed-in-looking page's token is also checked against the instance
+    // (only an explicit 401 rejects it) before any storage write.
+    var adopt;
+    if (early) {
+        adopt = !!(isSn && snEarlyLooksAdoptable(info, opts.url) &&
+            await snTokenAccepted(info.origin, info.token, { strict: true, timeoutMs: opts.checkMs }));
+        if (!adopt) return false;
+    } else {
+        adopt = !!(isSn && snLoginLooksSignedIn(info) && await snTokenAccepted(info.origin, info.token));
+    }
+    // A tab that now holds an accepted session must not stay hidden from
+    // list_instances by an earlier negative probe of this tab / origin.
+    if (adopt) snProbeNegForget(tabId, info.origin);
 
     if (isSn) {
         // It's a ServiceNow page — track it
@@ -62,7 +104,7 @@ async function onTabReady(tabId) {
         // the tab's session when nothing is stored yet or the tab belongs to the
         // currently active instance. (The per-origin instanceTokens cache below
         // is always updated regardless.)
-        chrome.storage.local.get('instanceUrl', function(cur) {
+        if (adopt) chrome.storage.local.get('instanceUrl', function(cur) {
             var stored = cur && cur.instanceUrl;
             if (stored && info.origin && stored !== info.origin) return;
             var data = { sessionToken: info.token };
@@ -73,10 +115,17 @@ async function onTabReady(tabId) {
 
         // Maintain a per-origin token cache so the heartbeat works even when
         // tabs are discarded by Chrome's Memory Saver (no JS context to probe).
-        if (info.origin && info.token) {
+        // Panels are notified only when this origin is new or its token changed —
+        // not on every page load of an instance that is already connected.
+        if (adopt && info.origin && info.token) {
+            var _tokChanged = false;
             snUpdateInstanceTokens(function(map) {
-                map[info.origin] = { token: info.token, userName: info.userName || '', updated: Date.now() };
-            });
+                var prev = map[info.origin];
+                _tokChanged = !prev || prev.token !== info.token;
+                var name = info.userName || (prev && prev.userName) || '';
+                if (!_tokChanged && prev.userName === name) return false;
+                map[info.origin] = { token: info.token, userName: name, updated: Date.now() };
+            }).then(function() { if (_tokChanged) snNotifyInstancesChanged(info.origin); });
         }
 
         // Add domain to header rules
@@ -93,29 +142,52 @@ async function onTabReady(tabId) {
 
     // Inject content script + MAIN world interceptors for SN tabs
     // (non-SN pages the agent navigates to are handled by injectAgentScripts after navigate)
-    if (isSn) {
+    // The early path does not wait for injection (bounded, fire-and-forget) so
+    // its whole run stays inside the 5s early-probe budget.
+    if (isSn && early) {
+        snInjectTabScripts(tabId);
+    } else if (isSn) {
         try {
-            await chrome.scripting.executeScript({
+            await snInjectBounded(chrome.scripting.executeScript({
                 target: { tabId: tabId },
                 files: ['content-script.js']
-            });
+            }), snTimeoutMs('tab'));
         } catch(e) {}
         // Inject console/network interceptors in MAIN world (bypasses page CSP)
         await injectInterceptors(tabId);
     }
 
-    // Auto-close login tab once we got a token from it
-    if (isSn && loginTabId && tabId === loginTabId) {
+    // Auto-close the login tab only once it holds a session the instance
+    // ACCEPTS (2xx/403 identity read) — never on the login page's guest g_ck.
+    // (The early path already required the strict check.)
+    if (adopt && loginTabId && tabId === loginTabId && (early || await snTokenAccepted(info.origin, info.token, { strict: true })) && tabId === loginTabId) {
         chrome.tabs.remove(loginTabId).catch(function() {});
         loginTabId = null;
     }
+    return adopt;
+}
+
+// Tell open panels a tab just signed in to `origin`, so the header pill and the
+// instance registry refresh now instead of on the 2-minute poll (a NON-active
+// instance's adoption writes only instanceTokens, which the panel ignored).
+function snNotifyInstancesChanged(origin, fromRegistry) {
+    // A change from outside the registry (sign-in, adoption) invalidates the
+    // late-resolve result the registry would otherwise serve for up to 30s.
+    if (!fromRegistry && origin) {
+        try {
+            var _rs = (typeof snGetInstancesDetailed === 'function') && snGetInstancesDetailed._st;
+            var _rl = _rs && _rs.last[String(origin).replace(/\/+$/, '')];
+            if (_rl) _rl.lateResolved = false;
+        } catch (e) {}
+    }
+    try { chrome.runtime.sendMessage({ type: 'sn-instances-changed', origin: origin || '' }).catch(function() {}); } catch (e) {}
 }
 
 // Inject console/network interceptors into page context via MAIN world execution
 // This bypasses CSP restrictions that block the content script's inline <script> approach
 async function injectInterceptors(tabId) {
     try {
-        await chrome.scripting.executeScript({
+        await snInjectBounded(chrome.scripting.executeScript({
             target: { tabId: tabId },
             world: 'MAIN',
             func: function() {
@@ -230,7 +302,7 @@ async function injectInterceptors(tabId) {
                 window.XMLHttpRequest.prototype = OrigXHR.prototype;
                 try { Object.keys(OrigXHR).forEach(function(k) { window.XMLHttpRequest[k] = OrigXHR[k]; }); } catch(e) {}
             }
-        });
+        }), snTimeoutMs('tab'));
     } catch(e) {}
 }
 
@@ -1218,36 +1290,162 @@ async function getActiveTabId() {
 
 // Get ServiceNow tabs. Uses tracked tabs, falls back to probing all tabs for g_ck
 // (fallback needed after service worker restart when snTabs map is lost)
+// A non-empty snTabs map is NOT proof that every SN tab is tracked: after a
+// SW restart the waking onUpdated event can register ONE tab, a tab opened while
+// the SW slept never fires onTabReady, and a tab that loaded on login.do (empty
+// g_ck) and then signed in via an SPA/SSO hop may never re-fire 'complete'. The
+// old `snTabs.size > 0` short-circuit hid all such tabs, so a freshly opened /
+// re-logged-in instance stayed "not connected". Now: tracked tabs + a probe of
+// every UNTRACKED tab that is either on a known SN origin (instanceTokens cache,
+// snDomains, active instanceUrl, *.service-now.com / *.servicenow.com) or — when
+// nothing is tracked yet — any http(s) tab (the original full-scan fallback).
+// ServiceNow corporate / marketing / docs / SSO hosts that are never instances
+// (no g_ck): probing them on every getSnTabList call was pure overhead.
+// Customer instances live on <name>.service-now.com, so that domain only drops
+// the bare/www/SSO hosts; servicenow.com is corporate and gets the wider list.
+// An origin already known (instanceTokens / active instanceUrl) is never excluded.
+var SN_NON_INSTANCE_HOST_RE = /^(?:(?:www|docs|community|developer|developers|support|signon|sso|login|account|store|learning|nowlearning|university|partnerportal|careers|investors|news|blogs|events|knowledge|status|trust|downloads|install|marketplace|academy|go|info|static|cdn|assets|images?)\.)?servicenow\.com$|^(?:(?:www|signon|sso|login)\.)?service-now\.com$/i;
+function snIsNonInstanceHost(hostname) {
+    return SN_NON_INSTANCE_HOST_RE.test(String(hostname || ''));
+}
+function snLooksLikeSnUrl(url, knownOrigins) {
+    try {
+        var u = new URL(url);
+        if (!/^https?:$/.test(u.protocol)) return false;
+        if (knownOrigins && knownOrigins[u.origin]) return true;
+        if (snIsNonInstanceHost(u.hostname)) return false;
+        if (snDomains && snDomains.has && snDomains.has(u.hostname)) return true;
+        return /(^|\.)(service-now\.com|servicenow\.com|servicenowservices\.com)$/i.test(u.hostname);
+    } catch (e) { return false; }
+}
+// Negative cache: tabId -> { url, until } for untracked tabs whose probe found no
+// g_ck, so repeated getSnTabList calls (list_instances, token lookups, heartbeat)
+// don't re-inject into the same login/non-SN page. Keyed by URL too, so a tab
+// that navigates (e.g. login.do -> nav_to.do after sign-in) is re-probed at once.
+var SN_PROBE_NEG_TTL_MS = 20000;
+var SN_PROBE_CONCURRENCY = 4;
+var _snProbeNegCache = new Map();
+function _snProbeNegHit(tab, now) {
+    var e = _snProbeNegCache.get(tab.id);
+    if (!e) return false;
+    if (e.url !== tab.url || e.until <= now) { _snProbeNegCache.delete(tab.id); return false; }
+    return true;
+}
+// Drop negative entries for a tab and for every tab of `origin` (onTabReady
+// just adopted a session there, so those tabs must be re-probed at once).
+function snProbeNegForget(tabId, origin) {
+    _snProbeNegCache.delete(tabId);
+    if (!origin) return;
+    _snProbeNegCache.forEach(function(v, id) {
+        try { if (new URL(v.url).origin === origin) _snProbeNegCache.delete(id); } catch (e) {}
+    });
+}
 async function getSnTabList() {
-    if (snTabs.size > 0) {
-        var list = [];
-        snTabs.forEach(function(info, tabId) {
-            list.push({ id: tabId, url: info.url, title: info.title, origin: info.origin });
-        });
-        return list;
-    }
-    // Fallback: probe all tabs for g_ck (e.g. after service worker restart)
-    var tabs = await chrome.tabs.query({});
     var list = [];
+    snTabs.forEach(function(info, tabId) {
+        list.push({ id: tabId, url: info.url, title: info.title, origin: info.origin });
+    });
+    var fullScan = snTabs.size === 0;
+    var known = {};
+    try {
+        var _st = (await snWithTimeout(new Promise(function(r) { chrome.storage.local.get(['instanceTokens', 'instanceUrl'], function(d) { r(d || {}); }); }), snTimeoutMs('tab'), null)) || {};
+        Object.keys(_st.instanceTokens || {}).forEach(function(o) { known[o] = true; });
+        if (_st.instanceUrl) known[_st.instanceUrl] = true;
+    } catch (e) {}
+    // Bounded: a wedged tabs.query used to hang every getSnTabList caller.
+    // On timeout fall back to the tracked tabs only.
+    var tabs = await snWithTimeout(Promise.resolve().then(function() { return chrome.tabs.query({}); }), snTimeoutMs('tab'), null);
+    if (!tabs) return list;
+    var now = Date.now();
+    var openIds = {};
+    var candidates = [];
     for (var i = 0; i < tabs.length; i++) {
-        var info = await probeTab(tabs[i].id);
-        if (info && info.token) {
-            var origin = info.origin || new URL(tabs[i].url).origin;
-            var entry = { url: tabs[i].url, title: tabs[i].title, origin: origin };
-            snTabs.set(tabs[i].id, entry);
-            list.push({ id: tabs[i].id, url: tabs[i].url, title: tabs[i].title, origin: origin });
-            // Also inject content script since we just rediscovered this tab
-            try {
-                await chrome.scripting.executeScript({
-                    target: { tabId: tabs[i].id },
-                    files: ['content-script.js']
-                });
-                // + MAIN-world console/network interceptors (non-fatal)
-                try { await injectInterceptors(tabs[i].id); } catch (e2) { console.warn('[SW] injectInterceptors failed', e2); }
-            } catch(e) {}
+        openIds[tabs[i].id] = true;
+        if (snTabs.has(tabs[i].id)) continue;
+        if (!tabs[i].url) continue;
+        var isCand;
+        if (fullScan) {
+            isCand = /^https?:/i.test(tabs[i].url);
+            if (isCand) { try { var _fu = new URL(tabs[i].url); if (!known[_fu.origin] && snIsNonInstanceHost(_fu.hostname)) isCand = false; } catch (e) { isCand = false; } }
+        } else {
+            isCand = snLooksLikeSnUrl(tabs[i].url, known);
+        }
+        if (!isCand || _snProbeNegHit(tabs[i], now)) continue;
+        candidates.push(tabs[i]);
+    }
+    // Forget negative entries for closed tabs.
+    _snProbeNegCache.forEach(function(v, id) { if (!openIds[id]) _snProbeNegCache.delete(id); });
+    // Probe in parallel with bounded concurrency; results kept in tab order.
+    var probed = new Array(candidates.length);
+    var next = 0;
+    async function _worker() {
+        while (next < candidates.length) {
+            var idx = next++;
+            try { probed[idx] = await snProbeTabState(candidates[idx].id); } catch (e) { probed[idx] = { st: null, timedOut: false }; }
         }
     }
+    var workers = [];
+    for (var w = 0; w < Math.min(SN_PROBE_CONCURRENCY, candidates.length); w++) workers.push(_worker());
+    await Promise.all(workers);
+    for (var c = 0; c < candidates.length; c++) {
+        var tab = candidates[c];
+        var pr = probed[c] || { st: null, timedOut: false };
+        var info = pr.st;
+        if (!(info && info.token)) {
+            // A probe that TIMED OUT (tab still loading, instance waking) says
+            // nothing about the page: caching it hid a just-opened instance
+            // tab from list_instances for 20s. Only a probe that answered with
+            // no g_ck (or could not inject at all) is cached.
+            if (!pr.timedOut) _snProbeNegCache.set(tab.id, { url: tab.url, until: Date.now() + SN_PROBE_NEG_TTL_MS });
+            continue;
+        }
+        _snProbeNegCache.delete(tab.id);
+        var origin = info.origin || new URL(tab.url).origin;
+        var entry = { url: tab.url, title: tab.title, origin: origin };
+        snTabs.set(tab.id, entry);
+        list.push({ id: tab.id, url: tab.url, title: tab.title, origin: origin });
+        // Also inject content script since we just rediscovered this tab.
+        snInjectTabScripts(tab.id);
+    }
     return list;
+}
+
+// Inject the content script + MAIN-world interceptors into a rediscovered SN
+// tab. Fire-and-forget + bounded: an unbounded executeScript into a tab stuck
+// on a login/SSO page or a dialog never settles — at v1.1.43 that hung
+// getSnTabList and every caller (token probes, the 401 single-flight refresh,
+// list_instances) until a browser restart.
+function snInjectTabScripts(tid) {
+    try {
+        return snWithTimeout(chrome.scripting.executeScript({
+            target: { tabId: tid },
+            files: ['content-script.js']
+        }).then(function() {
+            return injectInterceptors(tid);
+        }), snTimeoutMs('tab') * 2, null).catch(function() {});
+    } catch (e) { return Promise.resolve(null); }
+}
+
+// Open tabs of ONE instance origin only (tracked or not), by live tab URL.
+// Token lookups and the 401 login flow use this instead of getSnTabList so they
+// never probe, inject into or reload tabs of OTHER instances / unrelated sites
+// (v1.1.43: a token lookup for an expired instance scanned every tab, 2.5s
+// each, and reloaded tabs[0] even when it belonged to another instance).
+// Discarded tabs are skipped (no JS context — a probe only burns its timeout).
+async function snTabsForOrigin(instanceUrl) {
+    var tabs = await snWithTimeout(Promise.resolve().then(function() { return chrome.tabs.query({}); }), snTimeoutMs('tab'), null);
+    var out = [];
+    if (!tabs) {
+        snTabs.forEach(function(info, id) { if (info.origin === instanceUrl) out.push({ id: id, url: info.url, title: info.title, origin: info.origin, tracked: true }); });
+        return out;
+    }
+    for (var i = 0; i < tabs.length; i++) {
+        var t = tabs[i], o = '';
+        try { o = new URL(t.url || '').origin; } catch (e) { continue; }
+        if (o !== instanceUrl || t.discarded) continue;
+        out.push({ id: t.id, url: t.url, title: t.title, origin: o, tracked: snTabs.has(t.id) });
+    }
+    return out;
 }
 
 // --- Multi-instance SN helpers ---
@@ -1264,7 +1462,7 @@ async function getSnTabList() {
 // self.__snTimeouts {tab, fetch} overrides the defaults (tests).
 function snTimeoutMs(kind) {
     var o = (typeof self !== 'undefined' && self && self.__snTimeouts) || {};
-    return o[kind] || ({ tab: 2500, fetch: 6000 })[kind] || 5000;
+    return o[kind] || ({ tab: 2500, fetch: 5000 })[kind] || 5000;
 }
 function snWithTimeout(p, ms, fallback) {
     return new Promise(function(resolve) {
@@ -1274,27 +1472,57 @@ function snWithTimeout(p, ms, fallback) {
             function() { if (!done) { done = true; clearTimeout(t); resolve(fallback); } });
     });
 }
+// Bound a chrome.scripting / chrome.* API await that may never settle (a tab
+// stuck on a login/SSO page, a dialog, a frozen renderer). Unlike snWithTimeout
+// it keeps the outcome: resolves p's value, rethrows p's error, and rejects
+// with Error('timeout') after ms — so existing try/catch paths still run.
+function snInjectBounded(p, ms) {
+    var TO = {};
+    var wrapped = Promise.resolve(p).then(function(v) { return { v: v }; }, function(e) { return { e: e || new Error('failed') }; });
+    return snWithTimeout(wrapped, ms || snTimeoutMs('tab'), TO).then(function(r) {
+        if (r === TO) throw new Error('timeout');
+        if (r.e) throw r.e;
+        return r.v;
+    });
+}
 // fetch with a hard deadline: aborts the request and rejects with a timeout error.
-function snFetchWithTimeout(url, opts) {
+// ms (optional) overrides snTimeoutMs('fetch') (a caller's remaining budget).
+function snFetchWithTimeout(url, opts, ms) {
     var ac = (typeof AbortController === 'function') ? new AbortController() : null;
     var TO = {};
     var o = Object.assign({}, opts || {});
     if (ac) o.signal = ac.signal;
-    return snWithTimeout(fetch(url, o), snTimeoutMs('fetch'), TO).then(function(r) {
+    return snWithTimeout(fetch(url, o), ms || snTimeoutMs('fetch'), TO).then(function(r) {
         if (r === TO) { try { if (ac) ac.abort(); } catch (e) {} throw new Error('timeout'); }
         return r;
     });
 }
 
 // Probe one tab for { token, userName } from its MAIN world. Returns null on failure.
+// The token of a login / SSO / MFA / password-change page (a guest g_ck) is
+// blanked: the tab still counts as open (sawOpenTab) but never yields a session.
+// injectImmediately: a tab that is still loading (cold first visit) answers at
+// once instead of timing out. Its login form may not be parsed yet, so its
+// g_ck counts only once the instance STRICTLY accepts it (snTokenAccepted,
+// 2xx/403; usually a cache hit from the early adoption, else one request
+// bounded by snTimeoutMs('tab')). Otherwise (guest 401, timeout) the probe
+// yields null, exactly like the old timed-out probe of a loading tab: it is not
+// a session and not proof of a logout (the cached token may still apply).
 async function snProbeTabTokenUser(tabId) {
     try {
         var results = await snWithTimeout(chrome.scripting.executeScript({
             target: { tabId: tabId },
             world: 'MAIN',
-            func: function() { return { token: window.g_ck || '', userName: (window.NOW && window.NOW.user_name) || '' }; }
+            injectImmediately: true,
+            func: snLoginProbeState
         }), snTimeoutMs('tab'), null);
-        return (results && results[0] && results[0].result) || null;
+        var st = (results && results[0] && results[0].result) || null;
+        if (st && st.token && !snLoginLooksSignedIn(st)) st = Object.assign({}, st, { token: '', guest: true });
+        if (st && st.token && st.readyState === 'loading') {
+            var _ok = await snWithTimeout(snTokenAccepted(st.origin, st.token, { strict: true, timeoutMs: snTimeoutMs('tab') }), snTimeoutMs('tab'), false);
+            if (!_ok) return null;
+        }
+        return st;
     } catch (e) {
         return null;
     }
@@ -1305,7 +1533,11 @@ async function snProbeTabTokenUser(tabId) {
 // HTTP response (including 401/403), false on a network/CORS error; status is the HTTP
 // status code (0 on network error) — so the caller can tell an explicit auth rejection
 // (401) from an empty-but-OK answer (ACL-filtered 200) or an unreachable instance.
-async function snFetchUserName(instanceUrl, token) {
+// ms (optional): total budget for the request AND the body read (default
+// snTimeoutMs('fetch')); a body that has not arrived in time yields name ''.
+async function snFetchUserName(instanceUrl, token, ms) {
+    var _budget = ms || snTimeoutMs('fetch');
+    var _t0 = Date.now();
     try {
         // credentials:'include' — see snFetchUserRoles: keeps the cross-origin GET
         // authenticated for tab-less instances via the still-valid session cookie
@@ -1314,20 +1546,83 @@ async function snFetchUserName(instanceUrl, token) {
             method: 'GET',
             credentials: 'include',
             headers: { 'X-UserToken': token, 'Accept': 'application/json' }
-        });
-        if (!apiRes.ok) return { name: '', responded: true, status: apiRes.status };
-        var apiData = await apiRes.json();
+        }, _budget);
+        if (!apiRes.ok) return { name: '', userName: '', rows: -1, responded: true, status: apiRes.status };
+        var apiData = await snWithTimeout(apiRes.json(), Math.max(1, _budget - (Date.now() - _t0)), null);
         var row = apiData && apiData.result && apiData.result[0];
-        return { name: (row && (row.user_name || row.name)) || '', responded: true, status: apiRes.status };
+        // userName: the row's raw user_name only (the strict token check needs it).
+        // rows: result row count (0 = ACL-filtered ESS user or maint), -1 = body unread.
+        var rows = (apiData && Array.isArray(apiData.result)) ? apiData.result.length : -1;
+        return { name: (row && (row.user_name || row.name)) || '', userName: (row && row.user_name) || '', rows: rows, responded: true, status: apiRes.status };
     } catch (e) {
-        return { name: '', responded: false, status: 0 };
+        return { name: '', userName: '', rows: -1, responded: false, status: 0 };
     }
+}
+
+// Cheap token check (one bounded sys_user identity read, cached 30s per token):
+// is `token` a session the instance accepts? An explicit 401 always rejects —
+// that is what a login/SSO page's guest g_ck gets. Default (lenient): anything
+// else (2xx, 403, 5xx, network error) is accepted as indeterminate. opts.strict:
+// see snStrictTokenOk (opts.isMaint, or a cached maint detection, also accepts).
+var _snTokenCheckCache = new Map();
+var SN_TOKEN_CHECK_TTL_MS = 30000;
+// Strict session proof from one identity read (status, user_name, row count):
+// - a 2xx naming a real (non-guest) user: signed in;
+// - a 2xx with ZERO rows: an ESS user (sys_user read ACL-filtered) or maint
+//   (not a sys_user) — both are real sessions;
+// - isMaint: a maint session detected on this token.
+// Rejected: 401, timeout/network (status 0), 403, 5xx, and a 2xx whose row is
+// 'guest' or has an empty user_name (anonymous REST on a login page's guest
+// g_ck), or whose body could not be read (rows -1).
+function snStrictTokenOk(status, user, rows, isMaint) {
+    if (status === 401) return false;
+    if (isMaint) return true;
+    if (!(status >= 200 && status < 300)) return false;
+    if (rows === 0) return true;
+    var u = String(user || '').trim().toLowerCase();
+    return !!u && u !== 'guest';
+}
+async function snTokenAccepted(origin, token, opts) {
+    if (!origin || !token) return false;
+    var key = origin + '|' + token;
+    var now = Date.now();
+    var c = _snTokenCheckCache.get(key);
+    var status, user, rows;
+    if (c && now - c.at < SN_TOKEN_CHECK_TTL_MS) {
+        status = c.status; user = c.user; rows = c.rows;
+    } else {
+        // opts.timeoutMs: the caller's remaining budget (early tab probe).
+        var chk = await snFetchUserName(origin, token, opts && opts.timeoutMs);
+        status = chk.responded ? chk.status : 0;
+        user = chk.userName || '';
+        rows = chk.rows;
+        if (chk.responded) {
+            if (_snTokenCheckCache.size > 50) _snTokenCheckCache.clear();
+            _snTokenCheckCache.set(key, { status: status, user: user, rows: rows, at: now });
+        }
+    }
+    if (status === 401) {
+        // The registry must not keep serving (or adopting) this token.
+        if (typeof snForgetRegistryOrigin === 'function') snForgetRegistryOrigin(origin, token);
+        return false;
+    }
+    // Strict: see snStrictTokenOk (ESS empty 2xx and maint accepted; guest rows,
+    // 403 and timeouts rejected).
+    if (opts && opts.strict) {
+        var _maint = !!opts.isMaint || (typeof snMaintCached === 'function' && snMaintCached(origin, token) === true);
+        return snStrictTokenOk(status, user, rows, _maint);
+    }
+    return true;
 }
 
 // Fetch the current user's direct (non-inherited) roles, used for privilege badges
 // and the list_instances agent tool. Returns { roles, responded, status } (see snFetchUserName).
-async function snFetchUserRoles(instanceUrl, token) {
+// ms (optional): total budget for the request AND the body read (default
+// snTimeoutMs('fetch')); a body that has not arrived in time yields no roles.
+async function snFetchUserRoles(instanceUrl, token, ms) {
     var roles = [];
+    var _budget = ms || snTimeoutMs('fetch');
+    var _t0 = Date.now();
     try {
         // credentials:'include' sends the instance session cookie so the fetch
         // still authenticates for tab-less instances whose cached g_ck (X-UserToken)
@@ -1337,9 +1632,9 @@ async function snFetchUserRoles(instanceUrl, token) {
             method: 'GET',
             credentials: 'include',
             headers: { 'X-UserToken': token, 'Accept': 'application/json' }
-        });
+        }, _budget);
         if (!rolesRes.ok) return { roles: roles, responded: true, status: rolesRes.status };
-        var rolesData = await rolesRes.json();
+        var rolesData = await snWithTimeout(rolesRes.json(), Math.max(1, _budget - (Date.now() - _t0)), null);
         var rows = (rolesData && rolesData.result) || [];
         for (var ri = 0; ri < rows.length; ri++) {
             var rname = rows[ri] && rows[ri]['role.name'];
@@ -1360,8 +1655,16 @@ async function snFetchUserRoles(instanceUrl, token) {
 async function snCollectTabTokens(matchTabs, excludeToken) {
     var candidates = [];
     var sawOpenTab = false;
+    // Probe in PARALLEL (each bounded by snTimeoutMs('tab')): one frozen tab no
+    // longer adds 2.5s per tab to the lookup. Results are kept in tab order.
+    var probed = await Promise.all(matchTabs.map(function(t) {
+        return snProbeTabTokenUser(t.id).catch(function() { return null; });
+    }));
     for (var i = 0; i < matchTabs.length; i++) {
-        var data = await snProbeTabTokenUser(matchTabs[i].id);
+        var data = probed[i];
+        // A tab that navigated to another origin since it was listed never
+        // hands its token to this instance.
+        if (data && data.origin && matchTabs[i].origin && data.origin !== matchTabs[i].origin) continue;
         if (data) sawOpenTab = true;   // page responded (even if g_ck was empty = logged out)
         if (!data || !data.token || data.token === excludeToken) continue;
         var dup = false;
@@ -1379,15 +1682,27 @@ async function snCollectTabTokens(matchTabs, excludeToken) {
 // one NOT explicitly rejected (HTTP 401) wins; 403 / network errors are
 // indeterminate and accepted, matching snGetInstancesDetailed.
 // Returns { pick: { token, userName, tabId } | null, sawOpenTab, rejected: [tokens] }.
+// The whole pick (tab probes + candidate checks) is bounded by
+// SN_PICK_TOKEN_MS (5s; opts.pickMs may only lower it): the candidates are
+// checked in PARALLEL with the budget left after the tab probes, and a check
+// that did not answer in time is indeterminate (accepted, tab order kept).
 async function snPickTabToken(matchTabs, instanceUrl, opts) {
+    var SN_PICK_TOKEN_MS = 5000;
     opts = opts || {};
+    var _t0 = Date.now();
+    var _budget = Math.min(SN_PICK_TOKEN_MS, opts.pickMs || SN_PICK_TOKEN_MS);
     var col = await snCollectTabTokens(matchTabs, opts.excludeToken);
     var cands = col.candidates;
     if (cands.length === 0) return { pick: null, sawOpenTab: col.sawOpenTab, rejected: [] };
     if (cands.length === 1 && !opts.validate) return { pick: cands[0], sawOpenTab: col.sawOpenTab, rejected: [] };
+    var _left = Math.max(1, _budget - (Date.now() - _t0));
+    var _none = { name: '', status: 0 };
+    var checks = await Promise.all(cands.map(function(cd) {
+        return snWithTimeout(snFetchUserName(instanceUrl, cd.token, _left), _left, _none).catch(function() { return _none; });
+    }));
     var rejected = [];
     for (var c = 0; c < cands.length; c++) {
-        var chk = await snFetchUserName(instanceUrl, cands[c].token);
+        var chk = checks[c] || _none;
         if (chk.status === 401) { rejected.push(cands[c].token); continue; }
         if (!cands[c].userName && chk.name) cands[c].userName = chk.name;
         return { pick: cands[c], sawOpenTab: col.sawOpenTab, rejected: rejected };
@@ -1403,16 +1718,19 @@ async function snResolveInstanceSession(instanceUrl, token, userName) {
     // session (HTTP 401) — that is the only response that proves the token is dead.
     var authRejected = false;
     var _nameOk = false;   // identity probe answered 2xx
-    if (token && !userName) {
-        var _nm = await snFetchUserName(instanceUrl, token);
+    // Identity and roles reads run in PARALLEL (each bounded by snTimeoutMs('fetch')).
+    var _pName = (token && !userName) ? snFetchUserName(instanceUrl, token) : null;
+    var _pRoles = token ? snFetchUserRoles(instanceUrl, token) : null;
+    if (_pName) {
+        var _nm = await _pName;
         userName = _nm.name;
         if (_nm.status === 401) authRejected = true;
         if (_nm.status >= 200 && _nm.status < 300) _nameOk = true;
     }
     var roles = [];
     var _rr = null;
-    if (token) {
-        _rr = await snFetchUserRoles(instanceUrl, token);
+    if (_pRoles) {
+        _rr = await _pRoles;
         roles = _rr.roles;
         if (_rr.status === 401) authRejected = true;
     }
@@ -1441,7 +1759,9 @@ async function snResolveInstanceSession(instanceUrl, token, userName) {
     var isMaint = false;
     var _rolesOk = !!(_rr && _rr.responded && _rr.status >= 200 && _rr.status < 300);
     if (token && !authRejected && typeof snMaintEligible === 'function' && snMaintEligible(roles, _rolesOk, userName)) {
-        isMaint = await snDetectMaint(instanceUrl, token);
+        // Bounded (<= 5s for the request AND the body): a hung probe must not
+        // hold the registry's per-origin resolve open.
+        isMaint = await snWithTimeout(snDetectMaint(instanceUrl, token, undefined, Math.min(5000, snTimeoutMs('fetch'))), 5000, false);
         if (isMaint) { roles = ['maint', 'admin']; if (!userName) userName = 'maint'; }
     }
     // sessionOk: the instance ACCEPTED this token — it was NOT rejected with 401 and
@@ -1491,11 +1811,62 @@ function snUpdateInstanceTokens(mutate) {
 // Build the detailed instance list: probe every SN tab for tokens, group by origin,
 // fill in user/roles per instance. Used by the panel via list-sn-instances-detailed
 // and by the SW Platform stub's refreshInstances.
+// Whole call is capped (SN_REGISTRY_DEADLINE_MS, self.__snRegistryMs in tests):
+// origins resolve in PARALLEL and single-flight per origin; an origin that misses
+// the deadline is returned as a PARTIAL entry (partial:true) built from what is
+// already known (first candidate not known-401, sessionOk from the token-check
+// cache, roles from the last resolve). When its late resolve finishes, open
+// panels are told via snNotifyInstancesChanged(url) so they refresh.
+// Helpers/state stay nested on the function: several tests evaluate this
+// function from an explicit list or a fixed range of background.js.
 async function snGetInstancesDetailed() {
-    var tabs = await getSnTabList();
+    var _deadlineMs = (typeof self !== 'undefined' && self && self.__snRegistryMs) || 4500;
+    var _t0 = Date.now();
+    function _left() { return Math.max(1, _deadlineMs - (Date.now() - _t0)); }
+    var _st = snGetInstancesDetailed._st || (snGetInstancesDetailed._st = { inflight: {}, last: {}, notifiedAt: {}, notifyTimer: {} });
+    if (!_st.notifiedAt) _st.notifiedAt = {};
+    if (!_st.notifyTimer) _st.notifyTimer = {};
+    // A `last` entry this young is trusted as-is (sessionOk fallback, and the
+    // late-resolve result served without re-resolving: breaks the
+    // notify -> panel refresh -> late resolve -> notify loop).
+    var _FRESH_MS = 30000;
+    // Late-resolve notifies per origin: at most one per 10s (trailing one kept).
+    var _NOTIFY_GAP_MS = (typeof self !== 'undefined' && self && self.__snRegistryNotifyGapMs) || 10000;
+    // An in-flight resolve pins the origin while it RUNS (a caller joins it
+    // instead of stacking a duplicate resolve against a slow instance). Only
+    // one older than this is treated as hung and abandoned (each request inside
+    // is itself <= 5s, so a live run never gets near it).
+    var _PIN_MS = (typeof self !== 'undefined' && self && self.__snRegistryPinMs) || 30000;
+    // A partial entry keeps the last resolve's sessionOk for the SAME token (not
+    // rejected since) this long, so an always-slow origin does not flip to
+    // sessionOk:false every 30s.
+    var _LAST_OK_MS = 300000;
+    var _TO = {};
+    function _trackedTabs() {
+        var l = [];
+        try {
+            if (typeof snTabs !== 'undefined' && snTabs) snTabs.forEach(function(info, tabId) {
+                l.push({ id: tabId, url: info.url, title: info.title, origin: info.origin });
+            });
+        } catch (e) {}
+        return l;
+    }
+    // Tab listing and the instanceTokens read run in parallel, each capped so
+    // the per-origin work keeps most of the budget. A timed-out tab listing
+    // falls back to the tabs already tracked in snTabs.
+    var _listCap = Math.max(1, Math.round(_deadlineMs * 0.45));
+    var _r = await Promise.all([
+        snWithTimeout(Promise.resolve().then(function() { return getSnTabList(); }), _listCap, _TO),
+        snWithTimeout(new Promise(function(r) {
+            chrome.storage.local.get('instanceTokens', function(d) { r((d && d.instanceTokens) || {}); });
+        }), _listCap, _TO)
+    ]);
+    var tabs = (_r[0] === _TO || !Array.isArray(_r[0])) ? _trackedTabs() : _r[0];
+    var instanceTokenCache = (_r[1] === _TO || !_r[1]) ? {} : _r[1];
     var byOrigin = {};
     tabs.forEach(function(tab) {
         var origin = tab.origin;
+        if (!origin) return;
         if (!byOrigin[origin]) byOrigin[origin] = { url: origin, tabs: [] };
         byOrigin[origin].tabs.push({ id: tab.id, title: tab.title, url: tab.url });
     });
@@ -1506,52 +1877,192 @@ async function snGetInstancesDetailed() {
     // for good). So any origin still present in this cache is one ServiceNow that
     // still considers us connected — fold it in even with zero open tabs, since
     // the user may have closed the tab without paying attention.
-    var instanceTokenCache = await new Promise(function(r) {
-        chrome.storage.local.get('instanceTokens', function(d) { r((d && d.instanceTokens) || {}); });
-    });
     Object.keys(instanceTokenCache).forEach(function(origin) {
         if (!byOrigin[origin]) byOrigin[origin] = { url: origin, tabs: [] };
     });
 
+    // Full per-origin resolution (tab token collection + session resolve), run
+    // single-flight per origin: a concurrent caller joins the in-flight run.
+    function _sameTabs(a, b) {
+        var ia = (a || []).map(function(t) { return t.id; }).sort().join(',');
+        var ib = (b || []).map(function(t) { return t.id; }).sort().join(',');
+        return ia === ib;
+    }
+    function _resolveOrigin(inst) {
+        var rec = _st.inflight[inst.url];
+        if (rec && !rec.done && !rec.stale && Date.now() - rec.startedAt < _PIN_MS) return rec;
+        if (rec) delete _st.inflight[inst.url];
+        // A late resolve's result, still fresh, for the same tabs: serve it as
+        // final instead of re-resolving (see _FRESH_MS).
+        var _l = _st.last[inst.url];
+        if (_l && _l.lateResolved && Date.now() - (_l.at || 0) < _FRESH_MS && _sameTabs(_l.tabs, inst.tabs)) {
+            return { fromLast: true, promise: Promise.resolve(_l) };
+        }
+        rec = { col: null, cacheTok: instanceTokenCache[inst.url] || null, late: false, served: null, entry: null, startedAt: Date.now(), done: false, stale: false, deadTokens: [] };
+        rec.promise = (async function() {
+            // Probe EVERY tab of this origin, not just the first one with a g_ck: a
+            // session-timed-out tab still exposes its dead token and used to win just by
+            // being first in snTabs, flipping the whole instance to signed-out even though
+            // another tab is logged in.
+            var col = await snCollectTabTokens(inst.tabs);
+            rec.col = col;
+            var candidates = col.candidates.slice();
+            // Fall back to the cached heartbeat token ONLY when there is no live tab we could
+            // read (all tabs closed, or discarded by Chrome Memory Saver — no JS context), so a
+            // tab-less instance still resolves as connected (tabCount:0) for list_instances.
+            // If an open tab DID respond with an empty g_ck the user is LOGGED OUT — never
+            // resurrect a stale token, or the selector would wrongly show it connected.
+            var fromCache = false;
+            if (!candidates.length && !col.sawOpenTab && rec.cacheTok && rec.cacheTok.token) {
+                candidates.push({ token: rec.cacheTok.token, userName: rec.cacheTok.userName || '' });
+                fromCache = true;
+            }
+            // Connected if ANY candidate yields a session the instance does not reject:
+            // take the first non-401 one; when every candidate is rejected keep the first
+            // one's result (its token is cleared by snResolveInstanceSession's 401 rule).
+            var session = null;
+            var rejectedTokens = [];   // candidates the instance rejected with 401 (never adoptable)
+            for (var c = 0; c < candidates.length; c++) {
+                var s = await snResolveInstanceSession(inst.url, candidates[c].token, candidates[c].userName);
+                if (!session) session = s;
+                if (s.authRejected) { rejectedTokens.push(candidates[c].token); continue; }
+                session = s; break;
+            }
+            if (!session) session = { token: '', userName: '', roles: [], isMaint: false, authRejected: false };
+            // A live tab's token that just proved usable while a sibling tab's was rejected:
+            // refresh the per-origin cache so the heartbeat stops pinging the dead one.
+            if (session.token && !session.authRejected && !fromCache && candidates.length > 1) {
+                snRememberInstanceToken(inst.url, session.token, session.userName);
+            }
+            var entry = { url: inst.url, tabs: inst.tabs, token: session.token, userName: session.userName, roles: session.roles, isMaint: session.isMaint, sessionOk: !!session.sessionOk, rejectedTokens: rejectedTokens, sawOpenTab: !!col.sawOpenTab };
+            // Never let a run that lost its pin overwrite a newer run's result, nor
+            // a run made stale by snForgetRegistryOrigin (origin removed, or the
+            // token it resolved to was 401'd meanwhile) write anything.
+            var _prev = _st.last[inst.url];
+            var _dead = rec.stale || (entry.token && rec.deadTokens.indexOf(entry.token) !== -1);
+            if (!_dead && (!_prev || !_prev.startedAt || _prev.startedAt <= rec.startedAt)) {
+                Object.defineProperty(entry, 'at', { value: Date.now(), enumerable: false, writable: true });
+                Object.defineProperty(entry, 'startedAt', { value: rec.startedAt, enumerable: false });
+                Object.defineProperty(entry, 'lateResolved', { value: !!rec.late, enumerable: false, writable: true });
+                _st.last[inst.url] = entry;
+            }
+            return entry;
+        })();
+        rec.promise.then(function() {}, function() {}).then(function() {
+            rec.done = true;
+            if (_st.inflight[inst.url] === rec) delete _st.inflight[inst.url];
+            if (rec.stale) return;
+            var _e = _st.last[inst.url];
+            if (rec.late && _e && _e.startedAt === rec.startedAt) _e.lateResolved = true;
+            // A caller returned a partial entry for this origin: tell open panels
+            // the real one is ready now — only if it differs from what was served.
+            if (rec.late && rec.served && _e && _e.startedAt === rec.startedAt && _changed(rec.served, _e)) _notify(inst.url);
+        });
+        // Hard unpin of a hung resolve: checked on lookup (age >= _PIN_MS), no timer.
+        _st.inflight[inst.url] = rec;
+        return rec;
+    }
+
+    function _rolesKey(r) { return (r || []).slice().sort().join(','); }
+    function _changed(a, b) {
+        return (a.token || '') !== (b.token || '') || !!a.sessionOk !== !!b.sessionOk || _rolesKey(a.roles) !== _rolesKey(b.roles) ||
+            (a.userName || '') !== (b.userName || '') || !!a.isMaint !== !!b.isMaint;
+    }
+    function _notify(url) {
+        if (typeof snNotifyInstancesChanged !== 'function') return;
+        var wait = (_st.notifiedAt[url] || 0) + _NOTIFY_GAP_MS - Date.now();
+        if (wait <= 0) { _st.notifiedAt[url] = Date.now(); snNotifyInstancesChanged(url, true); return; }
+        if (_st.notifyTimer[url]) return;   // a trailing notify is already queued
+        _st.notifyTimer[url] = setTimeout(function() {
+            delete _st.notifyTimer[url];
+            _st.notifiedAt[url] = Date.now();
+            snNotifyInstancesChanged(url, true);
+        }, wait);
+    }
+
+    // Best entry from what is already known, for an origin that missed the deadline.
+    // Candidate order: live tab tokens, then the heartbeat cache token, then the
+    // last resolve's token — the last two only when no open tab answered (an
+    // open tab with an empty g_ck means signed out: nothing stale is resurrected).
+    function _partial(inst, rec) {
+        var last = _st.last[inst.url] || null;
+        var noTab = !(rec.col && rec.col.sawOpenTab);
+        var cands = [];
+        if (rec.col) cands = rec.col.candidates.slice();
+        if (!cands.length && noTab && rec.cacheTok && rec.cacheTok.token) {
+            cands.push({ token: rec.cacheTok.token, userName: rec.cacheTok.userName || '' });
+        }
+        if (!cands.length && noTab && last && last.token) cands.push({ token: last.token, userName: last.userName || '' });
+        var cache = (typeof _snTokenCheckCache !== 'undefined' && _snTokenCheckCache) ? _snTokenCheckCache : null;
+        var ttl = (typeof SN_TOKEN_CHECK_TTL_MS !== 'undefined') ? SN_TOKEN_CHECK_TTL_MS : 30000;
+        function _check(tok) {
+            var e = cache && cache.get(inst.url + '|' + tok);
+            return (e && Date.now() - e.at < ttl) ? e : null;
+        }
+        function _status(tok) { var e = _check(tok); return e ? e.status : 0; }
+        var lastRejected = (last && last.rejectedTokens) || [];
+        var rejected = [];
+        var pick = null;
+        for (var i = 0; i < cands.length; i++) {
+            if (_status(cands[i].token) === 401 || lastRejected.indexOf(cands[i].token) !== -1) { rejected.push(cands[i].token); continue; }
+            pick = cands[i]; break;
+        }
+        // Same strict rule as snTokenAccepted(strict): a cached 403 or guest row
+        // proves nothing; else the last resolve's verdict for the same token.
+        var ck = pick ? _check(pick.token) : null;
+        var _maint = !!(pick && last && last.isMaint && last.token === pick.token);
+        var _lastOk = !!(pick && last && last.sessionOk && last.token === pick.token && Date.now() - (last.at || 0) < _LAST_OK_MS);
+        var sessionOk = !!pick && (!!(ck && typeof snStrictTokenOk === 'function' && snStrictTokenOk(ck.status, ck.user, ck.rows, _maint)) || _lastOk);
+        return { url: inst.url, tabs: inst.tabs, token: pick ? pick.token : '', userName: (pick && pick.userName) || (last && last.userName) || '',
+            roles: (last && last.roles) || [], isMaint: !!(last && last.isMaint), sessionOk: sessionOk, rejectedTokens: rejected,
+            sawOpenTab: !!(rec.col && rec.col.sawOpenTab), partial: true };
+    }
+
+    var urls = Object.keys(byOrigin);
+    var recs = urls.map(function(u) { return _resolveOrigin(byOrigin[u]); });
+    var settled = await Promise.all(recs.map(function(rec) {
+        return snWithTimeout(rec.promise, _left(), _TO);
+    }));
     var result = [];
-    for (var url in byOrigin) {
-        var inst = byOrigin[url];
-        // Probe EVERY tab of this origin, not just the first one with a g_ck: a
-        // session-timed-out tab still exposes its dead token and used to win just by
-        // being first in snTabs, flipping the whole instance to signed-out even though
-        // another tab is logged in.
-        var col = await snCollectTabTokens(inst.tabs);
-        var candidates = col.candidates;
-        // Fall back to the cached heartbeat token ONLY when there is no live tab we could
-        // read (all tabs closed, or discarded by Chrome Memory Saver — no JS context), so a
-        // tab-less instance still resolves as connected (tabCount:0) for list_instances.
-        // If an open tab DID respond with an empty g_ck the user is LOGGED OUT — never
-        // resurrect a stale token, or the selector would wrongly show it connected.
-        var fromCache = false;
-        if (!candidates.length && !col.sawOpenTab && instanceTokenCache[inst.url] && instanceTokenCache[inst.url].token) {
-            candidates.push({ token: instanceTokenCache[inst.url].token, userName: instanceTokenCache[inst.url].userName || '' });
-            fromCache = true;
+    for (var i = 0; i < urls.length; i++) {
+        var inst = byOrigin[urls[i]];
+        if (settled[i] && settled[i] !== _TO) {
+            // A joined in-flight run may predate this call's tab list.
+            var e = settled[i];
+            result.push(e.tabs === inst.tabs ? e : Object.assign({}, e, { tabs: inst.tabs }));
+        } else {
+            var _p = _partial(inst, recs[i]);
+            if (!recs[i].fromLast) { recs[i].late = true; recs[i].served = _p; }
+            result.push(_p);
         }
-        // Connected if ANY candidate yields a session the instance does not reject:
-        // take the first non-401 one; when every candidate is rejected keep the first
-        // one's result (its token is cleared by snResolveInstanceSession's 401 rule).
-        var session = null;
-        var rejectedTokens = [];   // candidates the instance rejected with 401 (never adoptable)
-        for (var c = 0; c < candidates.length; c++) {
-            var s = await snResolveInstanceSession(inst.url, candidates[c].token, candidates[c].userName);
-            if (!session) session = s;
-            if (s.authRejected) { rejectedTokens.push(candidates[c].token); continue; }
-            session = s; break;
-        }
-        if (!session) session = { token: '', userName: '', roles: [], isMaint: false, authRejected: false };
-        // A live tab's token that just proved usable while a sibling tab's was rejected:
-        // refresh the per-origin cache so the heartbeat stops pinging the dead one.
-        if (session.token && !session.authRejected && !fromCache && candidates.length > 1) {
-            snRememberInstanceToken(inst.url, session.token, session.userName);
-        }
-        result.push({ url: inst.url, tabs: inst.tabs, token: session.token, userName: session.userName, roles: session.roles, isMaint: session.isMaint, sessionOk: !!session.sessionOk, rejectedTokens: rejectedTokens });
     }
     return result;
+}
+
+// Forget the registry's per-origin state (last result + in-flight resolve).
+// token (optional): only when the remembered last entry holds that token (a
+// 401 for one tab's token must not wipe a sibling's good result, and must not
+// break the single-flight of the very resolve that is probing candidates).
+function snForgetRegistryOrigin(origin, token) {
+    var st = (typeof snGetInstancesDetailed === 'function') && snGetInstancesDetailed._st;
+    if (!st || !origin) return;
+    var o = String(origin).replace(/\/+$/, '');
+    function _dropNotify() {
+        if (st.notifyTimer && st.notifyTimer[o]) { clearTimeout(st.notifyTimer[o]); delete st.notifyTimer[o]; }
+        if (st.notifiedAt) delete st.notifiedAt[o];
+    }
+    var rec = st.inflight[o];
+    if (token) {
+        // The in-flight run keeps its single-flight, but may not publish an
+        // entry holding this token.
+        if (rec && rec.deadTokens) rec.deadTokens.push(token);
+        if (st.last[o] && st.last[o].token === token) { delete st.last[o]; _dropNotify(); }
+        return;
+    }
+    if (rec) rec.stale = true;   // a late run neither writes `last` nor notifies
+    delete st.last[o];
+    delete st.inflight[o];
+    _dropNotify();
 }
 
 // Probe a fresh g_ck for a specific instance URL by scanning ALL its open tabs.
@@ -1560,12 +2071,31 @@ async function snGetInstancesDetailed() {
 // validate checks even a single candidate (and the cached fallback) against the
 // instance. Several distinct tab tokens are always checked (snPickTabToken).
 // Returns { token, userName, tabId } or { token: '', error } if nothing available.
+// Whole-lookup cap (tab listing + parallel tab probes + validation): an API
+// call must not wait longer than this for a token. opts.deadlineMs /
+// self.__snTokenLookupMs override (tests).
+var SN_TOKEN_LOOKUP_DEADLINE_MS = 5000;
+function snNotConnectedError(instanceUrl) {
+    return 'Not connected or session expired for ' + instanceUrl + ' — log in to ' + instanceUrl + ' in a browser tab, then retry.';
+}
 async function snGetTokenForInstance(instanceUrl, opts) {
     opts = opts || {};
-    var tabs = await getSnTabList();
-    var matchTabs = tabs.filter(function(t) { return t.origin === instanceUrl; });
+    var ms = opts.deadlineMs || (typeof self !== 'undefined' && self && self.__snTokenLookupMs) || SN_TOKEN_LOOKUP_DEADLINE_MS;
+    var TO = {};
+    var r = await snWithTimeout(snGetTokenForInstanceUnbounded(instanceUrl, opts), ms, TO);
+    if (r === TO) return { token: '', error: snNotConnectedError(instanceUrl), timedOut: true };
+    return r || { token: '', error: snNotConnectedError(instanceUrl) };
+}
+async function snGetTokenForInstanceUnbounded(instanceUrl, opts) {
+    // Only this instance's tabs: never probe/inject into other instances' tabs.
+    var matchTabs = await snTabsForOrigin(instanceUrl);
     var picked = await snPickTabToken(matchTabs, instanceUrl, opts);
     if (picked.pick) {
+        // Rediscovered (untracked) tab of THIS instance: track it + inject.
+        if (!snTabs.has(picked.pick.tabId)) {
+            var _mt = matchTabs.filter(function(t) { return t.id === picked.pick.tabId; })[0];
+            if (_mt) { snTabs.set(_mt.id, { url: _mt.url, title: _mt.title, origin: instanceUrl }); snInjectTabScripts(_mt.id); }
+        }
         if (picked.rejected.length) snRememberInstanceToken(instanceUrl, picked.pick.token, picked.pick.userName);
         return { token: picked.pick.token, userName: picked.pick.userName, tabId: picked.pick.tabId };
     }
@@ -1583,9 +2113,9 @@ async function snGetTokenForInstance(instanceUrl, opts) {
             return { token: cached.token, userName: cached.userName || '' };
         }
     }
-    return { token: '', error: matchTabs.length
-        ? 'Could not get token from tabs for ' + instanceUrl
-        : 'No open tab for ' + instanceUrl };
+    return { token: '', error: snNotConnectedError(instanceUrl) + (matchTabs.length
+        ? ' (no usable token in its open tabs)'
+        : ' (no open tab for it)') };
 }
 
 // --- connect_instance: log in with credentials the user/skill supplied ---
@@ -1664,7 +2194,10 @@ function snLoginProbeState() {
     return {
         token: window.g_ck || '',
         userName: (window.NOW && window.NOW.user_name) || '',
+        origin: location.origin,
         path: location.pathname,
+        // 'loading' = the body (and so a login form) may not be parsed yet.
+        readyState: document.readyState,
         hasLoginForm: !!document.getElementById('user_password'),
         mfa: /multifactor|mfa/i.test(location.pathname) || !!document.querySelector('#txtResponse, input[name="txtResponse"], input[name="mfa_code"], #validate_multifactor_auth_code'),
         pwChange: /change_?password|password_?change|pwd_?(reset|change)|password_?reset|expired/i.test(location.pathname) ||
@@ -1679,7 +2212,40 @@ function snLoginProbeState() {
 // login form, an MFA step or a password-change step.
 function snLoginLooksSignedIn(st) {
     if (!st || !st.token || st.hasLoginForm || st.mfa || st.pwChange) return false;
-    return !/(^|\/)(login|login_redirect|logout|welcome)\.do$|multifactor|mfa|password|pwd_/i.test(st.path || '');
+    return !/(^|\/)(login\w*|logout\w*|external_logout\w*|welcome|saml\w*|sso\w*)\.do$|multifactor|mfa|password|pwd_/i.test(st.path || '');
+}
+
+// Pre-filter for adopting a token while the tab is still loading
+// (snEarlyTabProbe): no visible login / MFA / password-change marker and the
+// probed document belongs to the tab URL's origin (not the previous,
+// not-yet-replaced document). readyState may be 'loading': a login form that
+// is not parsed yet proves nothing either way (ServiceNow serves it at
+// /navpage.do, /nav_to.do, / and portal URLs too), so the real gate is the
+// STRICT token check in onTabReady (2xx/403 only; a guest g_ck gets a 401, a
+// timeout rejects).
+function snEarlyLooksAdoptable(st, url) {
+    if (!snLoginLooksSignedIn(st)) return false;
+    var o = '';
+    try { o = new URL(url).origin; } catch (e) { return false; }
+    return !!st.origin && st.origin === o;
+}
+
+// Whole-run cap for one auto-login: its own poll timeout plus room for the
+// pre-check, tab open and form fill. opts.hardCapMs overrides (tests).
+function snAutoLoginHardCapMs(opts) {
+    opts = opts || {};
+    if (opts.hardCapMs > 0) return opts.hardCapMs;
+    return (opts.timeoutMs || 30000) + 60000;
+}
+// Settle with onTimeout() after ms unless p settles first. Unlike snWithTimeout
+// a rejection of p still propagates.
+function snSettleWithin(p, ms, onTimeout) {
+    return new Promise(function(resolve, reject) {
+        var done = false;
+        var t = setTimeout(function() { if (!done) { done = true; resolve(onTimeout()); } }, ms);
+        Promise.resolve(p).then(function(v) { if (!done) { done = true; clearTimeout(t); resolve(v); } },
+            function(e) { if (!done) { done = true; clearTimeout(t); reject(e); } });
+    });
 }
 
 function snAutoLoginSleep(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
@@ -1711,8 +2277,18 @@ async function snAutoLogin(origin, creds, opts) {
     }
     // Single-flight per origin+username; a different user on the same origin
     // waits for the running login, then runs.
+    // Both the wait for the previous run and this run are hard-capped: an
+    // unbounded await inside a run (tab probe / executeScript into a tab stuck
+    // on a login/SSO page or a native dialog) used to pin _snAutoLoginInflight
+    // and _snAutoLoginOriginTail forever, so every later connect_instance for
+    // that origin joined the dead promise until a browser restart.
+    var hardMs = snAutoLoginHardCapMs(opts);
     var prev = _snAutoLoginOriginTail[origin] || Promise.resolve();
-    var p = prev.catch(function() {}).then(function() { return snAutoLoginRun(origin, username, password, id, opts); });
+    var p = snSettleWithin(prev.catch(function() {}), hardMs, function() { return null; }).then(function() {
+        return snSettleWithin(snAutoLoginRun(origin, username, password, id, opts), hardMs, function() {
+            return { success: false, reason: 'timeout', error: 'Login to ' + origin + ' did not finish within ' + Math.round(hardMs / 1000) + 's (a tab probe or the login page never answered). Ask the user to log in manually in a browser tab, then retry.' };
+        });
+    });
     _snAutoLoginInflight[id] = p;
     _snAutoLoginOriginTail[origin] = p;
     try { return await p; } finally {
@@ -1778,7 +2354,7 @@ async function snAutoLoginRun(origin, username, password, id, opts) {
         if (tab.status !== 'complete') continue;
         var st = null;
         try {
-            var r = await chrome.scripting.executeScript({ target: { tabId: tabId }, world: 'MAIN', func: snLoginProbeState });
+            var r = await snInjectBounded(chrome.scripting.executeScript({ target: { tabId: tabId }, world: 'MAIN', func: snLoginProbeState }), snTimeoutMs('tab'));
             st = r && r[0] && r[0].result;
         } catch (e) { continue; }
         if (!st) continue;
@@ -1799,7 +2375,7 @@ async function snAutoLoginRun(origin, username, password, id, opts) {
         if (!submitted && st.hasLoginForm) {
             try {
                 var submitTs = Date.now();
-                var s = await chrome.scripting.executeScript({ target: { tabId: tabId }, func: snLoginFillAndSubmit, args: [username, password] });
+                var s = await snInjectBounded(chrome.scripting.executeScript({ target: { tabId: tabId }, func: snLoginFillAndSubmit, args: [username, password] }), snTimeoutMs('tab'));
                 var sr = s && s[0] && s[0].result;
                 if (sr && sr.submitted) { submitted = true; submitAt = submitTs; }
             } catch (e) {}
@@ -2358,12 +2934,9 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
             });
         };
         if (!message.tabId) { _cachedTokenSwitch(); return true; }
-        chrome.scripting.executeScript({
-            target: { tabId: message.tabId },
-            world: 'MAIN',
-            func: function() { return { token: window.g_ck || '', userName: (window.NOW && window.NOW.user_name) || '' }; }
-        }).then(function(results) {
-            var data = results && results[0] && results[0].result || {};
+        // Bounded probe; a login/SSO page's guest g_ck comes back blank (= logged out).
+        snProbeTabTokenUser(message.tabId).then(function(data) {
+            if (!data) { _cachedTokenSwitch(); return; }
             // A readable tab returning an empty g_ck = logged out; don't resurrect a cached
             // token (mirrors snGetInstancesDetailed). A discarded/closed tab throws → catch.
             _finishSwitch(data.token || '', data.userName || '');
@@ -2384,6 +2957,7 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
             Object.keys(map).forEach(function(k) {
                 if (String(k).replace(/\/+$/, '') === _rmUrl) { delete map[k]; removed = true; }
             });
+            if (typeof snForgetRegistryOrigin === 'function') snForgetRegistryOrigin(_rmUrl);
             chrome.storage.local.set({ instanceTokens: map }, function() {
                 sendResponse({ success: true, removed: removed });
             });
@@ -2393,11 +2967,11 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
 
     // Get token from a specific ServiceNow tab
     if (message.type === 'get-instance-token') {
-        chrome.scripting.executeScript({
+        snInjectBounded(chrome.scripting.executeScript({
             target: { tabId: message.tabId },
             world: 'MAIN',
             func: function() { return window.g_ck || ''; }
-        }).then(function(results) {
+        }), snTimeoutMs('tab')).then(function(results) {
             sendResponse({ token: (results && results[0] && results[0].result) || '' });
         }).catch(function() {
             sendResponse({ token: '' });
@@ -2487,10 +3061,10 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
     if (message.type === 'ensure-content-script') {
         (async function() {
             try {
-                await chrome.scripting.executeScript({
+                await snInjectBounded(chrome.scripting.executeScript({
                     target: { tabId: message.tabId },
                     files: ['content-script.js']
-                });
+                }), snTimeoutMs('tab'));
                 // + MAIN-world console/network interceptors; non-fatal, never
                 // changes the { ok: true } response of a successful inject.
                 try { await injectInterceptors(message.tabId); } catch (e2) { console.warn('[SW] injectInterceptors failed', e2); }
@@ -2769,10 +3343,10 @@ async function handleNavigate(args, targetTabId, sendResponse) {
 // Inject content script + MAIN world interceptors into a tab
 async function injectAgentScripts(tabId) {
     try {
-        await chrome.scripting.executeScript({
+        await snInjectBounded(chrome.scripting.executeScript({
             target: { tabId: tabId },
             files: ['content-script.js']
-        });
+        }), snTimeoutMs('tab'));
     } catch(e) {}
     await injectInterceptors(tabId);
 }
@@ -3110,15 +3684,10 @@ async function handleOpenSnForLogin(sendResponse) {
             sendResponse({ error: 'No instance URL stored.' });
             return;
         }
-        var tabs = await getSnTabList();
+        // Only a tab of THIS instance — never reload another instance's tab.
+        var tabs = await snTabsForOrigin(storage.instanceUrl);
         if (tabs.length > 0) {
             var targetTab = tabs[0];
-            for (var i = 0; i < tabs.length; i++) {
-                if (tabs[i].origin === storage.instanceUrl) {
-                    targetTab = tabs[i];
-                    break;
-                }
-            }
             chrome.tabs.update(targetTab.id, { active: true });
             chrome.tabs.reload(targetTab.id);
             chrome.windows.update((await chrome.tabs.get(targetTab.id)).windowId, { focused: true });
@@ -3144,12 +3713,13 @@ self.snOpenForLoginAndWait = async function snOpenForLoginAndWait(oldToken) {
         var storage = await chrome.storage.local.get('instanceUrl');
         if (!storage.instanceUrl) return null;
         instanceUrl = storage.instanceUrl;
-        var tabs = await getSnTabList();
-        if (tabs.length > 0) {
-            var targetTab = tabs[0];
-            for (var i = 0; i < tabs.length; i++) {
-                if (tabs[i].origin === instanceUrl) { targetTab = tabs[i]; break; }
-            }
+        // Bounded: a hung tab scan must not keep the caller (the SW fetch shim's
+        // shared login wait) open past its own deadline.
+        // Only a tab of THIS instance is reloaded — never another instance's tab,
+        // and no scan/injection of other tabs (snTabsForOrigin is bounded).
+        var tabs = (await snTabsForOrigin(instanceUrl)) || [];
+        var targetTab = tabs[0] || null;
+        if (targetTab) {
             try { await chrome.tabs.update(targetTab.id, { active: true }); } catch (e) {}
             try { await chrome.tabs.reload(targetTab.id); } catch (e) {}
             try { var t = await chrome.tabs.get(targetTab.id); chrome.windows.update(t.windowId, { focused: true }); } catch (e) {}
@@ -3162,11 +3732,15 @@ self.snOpenForLoginAndWait = async function snOpenForLoginAndWait(oldToken) {
         return null;
     }
     // Poll for a fresh token. 120 attempts × 2s = 4 min, same as page version.
+    var pollMs = (typeof self !== 'undefined' && self && self.__snLoginPollMs) || 2000;
     for (var attempt = 0; attempt < 120; attempt++) {
-        await new Promise(function(r) { setTimeout(r, 2000); });
+        await new Promise(function(r) { setTimeout(r, pollMs); });
         try {
-            var token = await snGetTokenForInstance(instanceUrl, { excludeToken: oldToken });
-            if (token && token.token && token.token !== oldToken) {
+            var token = await snWithTimeout(snGetTokenForInstance(instanceUrl, { excludeToken: oldToken, validate: true }), snTimeoutMs('fetch') * 2, null);
+            // Only a token the instance ACCEPTS ends the wait: a login/SSO page's
+            // guest g_ck (401) must not be handed back as the "fresh" session.
+            if (token && token.token && token.token !== oldToken &&
+                await snWithTimeout(snTokenAccepted(instanceUrl, token.token, { strict: true }), snTimeoutMs('fetch') * 2, false)) {
                 return token.token;
             }
         } catch (e) {}
@@ -3176,8 +3750,10 @@ self.snOpenForLoginAndWait = async function snOpenForLoginAndWait(oldToken) {
 
 async function handleRefreshToken(sendResponse, excludeToken) {
     try {
-        var storage = await chrome.storage.local.get('instanceUrl');
-        var tabs = await getSnTabList();
+        // Bounded: the panel waits on this response; a wedged storage read or tab
+        // scan must surface as an error, not an endless wait.
+        var storage = (await snWithTimeout(chrome.storage.local.get('instanceUrl'), snTimeoutMs('tab'), null)) || {};
+        var tabs = (await snWithTimeout(getSnTabList(), snTimeoutMs('fetch'), null)) || [];
         if (tabs.length === 0) {
             sendResponse({ error: 'No ServiceNow tab open. Open a ServiceNow page to authenticate.' });
             return;
@@ -3188,7 +3764,7 @@ async function handleRefreshToken(sendResponse, excludeToken) {
         // which may be a session-timed-out tab holding a dead g_ck.
         var matchTabs = storage.instanceUrl ? tabs.filter(function(t) { return t.origin === storage.instanceUrl; }) : [];
         if (matchTabs.length) {
-            var picked = await snPickTabToken(matchTabs, storage.instanceUrl, { excludeToken: excludeToken });
+            var picked = await snPickTabToken(matchTabs, storage.instanceUrl, { excludeToken: excludeToken, validate: true });
             if (picked.pick) {
                 chrome.storage.local.set({ sessionToken: picked.pick.token });
                 sendResponse({ token: picked.pick.token });
@@ -3208,13 +3784,12 @@ async function handleRefreshToken(sendResponse, excludeToken) {
             }
         }
 
-        var results = await chrome.scripting.executeScript({
-            target: { tabId: targetTab.id },
-            world: 'MAIN',
-            func: function() { return window.g_ck || ''; }
-        });
-
-        var token = results && results[0] && results[0].result;
+        // Bounded probe (blanks a login/SSO page's guest g_ck) + an explicit
+        // instance check: never persist or return a token the instance rejects.
+        var st = await snProbeTabTokenUser(targetTab.id);
+        var token = st && st.token;
+        if (token && token === excludeToken) token = '';
+        if (token && !(await snTokenAccepted(targetTab.origin || (st && st.origin), token))) token = '';
         if (token) {
             chrome.storage.local.set({ sessionToken: token });
             sendResponse({ token: token });
@@ -3228,10 +3803,96 @@ async function handleRefreshToken(sendResponse, excludeToken) {
 
 // --- Tab event listeners ---
 
-// Probe tabs on load complete — detect SN and inject content script
-chrome.tabs.onUpdated.addListener(function(tabId, changeInfo, tab) {
+// Early SN detection while a tab is still loading. status 'complete' waits for
+// EVERY subresource and subframe (a fresh Next Experience / UI16 load or a
+// waking dev instance takes 5-30s+), while g_ck is set by the first inline
+// script. Poll the tab's MAIN world every SN_EARLY_PROBE_INTERVAL_MS from
+// 'loading' and run onTabReady as soon as a signed-in g_ck shows up, so the
+// pill and the agent see the instance without waiting for 'complete'. Only for
+// URLs that look like an instance (snLooksLikeSnUrl), one loop per tab+url.
+// The loop backs off from SN_EARLY_PROBE_INTERVAL_MS to SN_EARLY_PROBE_INTERVAL_MAX_MS
+// and runs until adoption, 'complete' (snOnTabComplete), a navigation away or
+// tab close (both clear _snEarlyProbes), or the SN_EARLY_PROBE_MAX_MS safety
+// cap. Each probe is bounded by snTimeoutMs('tab') and each strict token check
+// by SN_EARLY_CHECK_MS (+ a small margin for the rest of onTabReady): never
+// more than 5s per call, and never starved by the overall cap.
+var SN_EARLY_PROBE_INTERVAL_MS = 400;
+var SN_EARLY_PROBE_INTERVAL_MAX_MS = 1000;
+var SN_EARLY_PROBE_MAX_MS = 60000;
+var SN_EARLY_CHECK_MS = 4500;
+var _snEarlyProbes = new Map(); // tabId -> url being polled
+// tabId -> { url, p, done } the onTabReady run of the tab's current navigation
+// (early or 'complete'), so onTabReady runs once per navigation.
+var _snTabReadyRuns = new Map();
+function snEarlyTabProbe(tabId, url) {
+    if (!url || _snEarlyProbes.get(tabId) === url) return Promise.resolve(false);
+    var known = {};
+    snTabs.forEach(function(info) { if (info && info.origin) known[info.origin] = true; });
+    if (!snLooksLikeSnUrl(url, known)) return Promise.resolve(false);
+    _snEarlyProbes.set(tabId, url);
+    var o = (typeof self !== 'undefined' && self) || {};
+    // Safety cap only: no new probe starts after it (a probe still in flight
+    // keeps its own bound). The token check's budget does not depend on it.
+    var deadline = Date.now() + (o.__snEarlyProbeMaxMs || SN_EARLY_PROBE_MAX_MS);
+    var interval = o.__snEarlyProbeMs || SN_EARLY_PROBE_INTERVAL_MS;
+    var maxInterval = Math.max(interval, o.__snEarlyProbeMaxIntervalMs || SN_EARLY_PROBE_INTERVAL_MAX_MS);
+    var checkMs = Math.min(SN_EARLY_CHECK_MS, snTimeoutMs('fetch'));
+    return (async function() {
+        try {
+            while (_snEarlyProbes.get(tabId) === url) {
+                var left = deadline - Date.now();
+                if (left <= 0) return false;
+                var st = await probeTab(tabId, Math.min(snTimeoutMs('tab'), Math.max(50, left)));
+                if (_snEarlyProbes.get(tabId) !== url) return false;
+                if (snEarlyLooksAdoptable(st, url)) {
+                    var run = onTabReady(tabId, { early: true, info: st, url: url, checkMs: checkMs });
+                    _snTabReadyRuns.set(tabId, { url: url, p: run });
+                    if (await snWithTimeout(run, checkMs + Math.min(500, snTimeoutMs('tab')), false)) return true;
+                    // Not adopted (strict check rejected / timed out): keep
+                    // polling — a 401 is cached (snTokenAccepted) so a guest
+                    // g_ck costs no further request; 'complete' still runs
+                    // onTabReady as usual (it awaits this settled run).
+                    if (_snEarlyProbes.get(tabId) !== url) return false;
+                }
+                await new Promise(function(r) { setTimeout(r, Math.min(interval, Math.max(0, deadline - Date.now()))); });
+                interval = Math.min(maxInterval, Math.round(interval * 1.5));
+            }
+            return false;
+        } finally {
+            if (_snEarlyProbes.get(tabId) === url) _snEarlyProbes.delete(tabId);
+        }
+    })();
+}
+
+// status 'complete': run onTabReady unless this navigation's early run already
+// adopted (awaits a still-running early run, capped at snTimeoutMs('tab')).
+function snOnTabComplete(tabId, url) {
+    _snEarlyProbes.delete(tabId);
+    var run = _snTabReadyRuns.get(tabId);
+    function full() {
+        var p = Promise.resolve().then(function() { return onTabReady(tabId); });
+        _snTabReadyRuns.set(tabId, { url: url, p: p, done: true });
+        return p;
+    }
+    if (!run || run.url !== url) return full();
+    if (run.done) return run.p; // a repeated 'complete' of the same navigation
+    return snWithTimeout(run.p, snTimeoutMs('tab'), false).then(function(adopted) {
+        if (_snTabReadyRuns.get(tabId) !== run) return false;
+        if (adopted) { run.done = true; return true; }
+        return full();
+    });
+}
+
+// Tab lifecycle: 'loading' starts the early probe (a new navigation forgets the
+// previous one's onTabReady run), 'complete' runs onTabReady once.
+function snOnTabUpdated(tabId, changeInfo, tab) {
+    if (changeInfo.status === 'loading' && tab && tab.url) {
+        var prev = _snTabReadyRuns.get(tabId);
+        if (prev && (prev.done || prev.url !== tab.url)) _snTabReadyRuns.delete(tabId);
+        snEarlyTabProbe(tabId, tab.url).catch(function() {});
+    }
     if (changeInfo.status === 'complete') {
-        onTabReady(tabId);
+        snOnTabComplete(tabId, tab && tab.url).catch(function() {});
     }
     // Broadcast active tab URL changes to side panel
     if (tab.active && (changeInfo.url || changeInfo.title)) {
@@ -3242,7 +3903,9 @@ chrome.tabs.onUpdated.addListener(function(tabId, changeInfo, tab) {
             title: tab.title
         }).catch(function() {});
     }
-});
+}
+// Probe tabs on load complete — detect SN and inject content script
+chrome.tabs.onUpdated.addListener(snOnTabUpdated);
 
 chrome.tabs.onActivated.addListener(function(activeInfo) {
     chrome.tabs.get(activeInfo.tabId, function(tab) {
@@ -3258,6 +3921,8 @@ chrome.tabs.onActivated.addListener(function(activeInfo) {
 
 // Clean up when tabs are closed
 chrome.tabs.onRemoved.addListener(function(tabId) {
+    _snEarlyProbes.delete(tabId);
+    _snTabReadyRuns.delete(tabId);
     snTabs.delete(tabId);
     if (tabId === loginTabId) loginTabId = null;
 });
@@ -7581,11 +8246,11 @@ async function heartbeatAllInstances() {
 
     async function readTokenFromTab(tab) {
         try {
-            var probe = await chrome.scripting.executeScript({
+            var probe = await snInjectBounded(chrome.scripting.executeScript({
                 target: { tabId: tab.id },
                 world: 'MAIN',
                 func: function() { return window.g_ck || ''; }
-            });
+            }), snTimeoutMs('tab'));
             return probe && probe[0] && probe[0].result || '';
         } catch (e) { return ''; }
     }
@@ -7692,7 +8357,7 @@ async function heartbeatAllInstances() {
                 var op = cacheOps[o];
                 if (op.set) { map[o] = op.set; changed = true; }
                 // A concurrent writer may have stored a NEWER token meanwhile — keep it.
-                else if (op.del && map[o] && op.del.indexOf(map[o].token) !== -1) { delete map[o]; changed = true; }
+                else if (op.del && map[o] && op.del.indexOf(map[o].token) !== -1) { delete map[o]; changed = true; if (typeof snForgetRegistryOrigin === 'function') snForgetRegistryOrigin(o); }
             });
             return changed;
         });

@@ -131,14 +131,26 @@ Platform.callOffscreenHelper = function(type, payload, timeoutMs, signal) {
 // =============================================================
 Platform.instances = [];
 
-// Adopt a token as the worker's active-instance session: in-memory + persisted
-// sessionToken (the page bridge follows via storage.onChanged). The SINGLE
-// sessionToken persist site of this file — the 401-retry, open-for-login and
-// probe-adoption paths all share it (RB-01 write-site ratchet).
+// Set the worker's active-instance session: in-memory + persisted sessionToken
+// (the page bridge follows via storage.onChanged). The SINGLE sessionToken
+// persist site of this file — adoption (401-retry, open-for-login, probe) and
+// drop (proven-dead token) both go through it (RB-01 write-site ratchet).
+function _persistWorkerToken(token) {
+    _workerSessionToken = token || '';
+    try { chrome.storage.local.set({ sessionToken: _workerSessionToken }); } catch (e) {}
+}
 function _adoptWorkerToken(token) {
     if (!token || token === _workerSessionToken) return false;
-    _workerSessionToken = token;
-    chrome.storage.local.set({ sessionToken: token });
+    _persistWorkerToken(token);
+    return true;
+}
+// Forget a token the instance proved dead (401 with no replacement, shim login
+// wait timed out, probe saw the tab signed out). Only drops the token we still
+// hold, so a newer adoption is never clobbered. Persisted, so the page bridge
+// and the next SW boot stop reporting a dead session as connected.
+function _dropWorkerToken(token) {
+    if (!token || token !== _workerSessionToken) return false;
+    _persistWorkerToken('');
     return true;
 }
 
@@ -171,12 +183,13 @@ Platform.refreshInstances = async function() {
     // + its admin gate, list_instances roles, diff/attachment) kept the dead token.
     // Adopt when the instance accepted the probed token (sessionOk), OR when the held
     // worker token was itself 401-rejected by the probe while this one was not. A
-    // 401-rejected token is never adopted.
+    // 401-rejected token is never adopted. A partial entry (the origin missed the
+    // registry deadline; built from cached guesses) is never adopted either.
     if (Platform.instanceUrl) {
         var _probedActive = Platform.instances.filter(function(i) { return i.url === Platform.instanceUrl; })[0];
         var _rawActive = raw.filter(function(i) { return i && i.url === Platform.instanceUrl; })[0];
         var _rejected = (_rawActive && _rawActive.rejectedTokens) || [];
-        if (_probedActive && _probedActive.token && _rejected.indexOf(_probedActive.token) === -1 &&
+        if (_probedActive && _probedActive.token && !(_rawActive && _rawActive.partial) && _rejected.indexOf(_probedActive.token) === -1 &&
             (_probedActive.sessionOk || (_workerSessionToken && _rejected.indexOf(_workerSessionToken) !== -1))) {
             _adoptWorkerToken(_probedActive.token);
         }
@@ -191,23 +204,40 @@ Platform.refreshInstances = async function() {
     // active instance. This matches getTokenForInstance(), which already trusts
     // _workerSessionToken for the active instance unconditionally.
     if (Platform.instanceUrl && _workerSessionToken) {
+        var _heldTok = _workerSessionToken;
         var _prevActive = prev.filter(function(p) { return p && p.url === Platform.instanceUrl; })[0];
         var _activeEntry = Platform.instances.filter(function(i) { return i.url === Platform.instanceUrl; })[0];
+        // ...but only when the probe could NOT see the session. If an open tab
+        // answered with an empty g_ck (user signed out / session expired) or the
+        // instance 401'd the very token we hold, the session is gone: resurrecting
+        // it made list_instances report connected:true for a dead session, so the
+        // agent never tried to reconnect (open a tab / connect_instance).
+        var _rawAct = raw.filter(function(i) { return i && i.url === Platform.instanceUrl; })[0];
+        var _heldRejected = !!(_rawAct && (_rawAct.rejectedTokens || []).indexOf(_heldTok) !== -1);
+        var _provenDead = _heldRejected || !!(_rawAct && _rawAct.sawOpenTab);
         if (_activeEntry) {
-            if (!_activeEntry.token) {
-                _activeEntry.token = _workerSessionToken;
+            // Restore ONLY when an open tab exists but could not be read (Memory
+            // Saver discard, blocked injection). No open tab = nothing vouches for
+            // the held token (the session may have expired with the tab closed):
+            // report it disconnected so the agent reconnects instead of waiting.
+            var _hasTabs = !!(_activeEntry.tabs && _activeEntry.tabs.length);
+            if (!_activeEntry.token && !_provenDead && _hasTabs) {
+                _activeEntry.token = _heldTok;
                 if (!_activeEntry.userName && _prevActive) _activeEntry.userName = _prevActive.userName || '';
                 if ((!_activeEntry.roles || !_activeEntry.roles.length) && _prevActive) _activeEntry.roles = _prevActive.roles || [];
             }
+            // 401'd by the probe, or the open tab answered signed-out: drop it.
+            if (_heldRejected || (!_activeEntry.token && _provenDead)) _dropWorkerToken(_heldTok);
         } else {
-            // Active origin wasn't even in the probe (no readable tab + no cached token
-            // entry). We still hold a usable session for it — surface it as connected.
+            // Active origin wasn't even in the probe (no tab + no cached token entry):
+            // list it, but disconnected — a tab-less held token is unverified.
+            if (_heldRejected) _dropWorkerToken(_heldTok);
             var _ah = Platform.instanceUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
             Platform.instances.push({
                 url: Platform.instanceUrl,
                 shortName: _ah.split('.')[0],
                 host: _ah,
-                token: _workerSessionToken,
+                token: '',
                 userName: _prevActive ? (_prevActive.userName || '') : '',
                 roles: _prevActive ? (_prevActive.roles || []) : [],
                 tabs: [],
@@ -232,7 +262,62 @@ Platform.resolveInstanceUrl = function(nameOrUrl) {
 
 // Token lookup for a specific instance: active token, then per-instance cache,
 // then live probe via the shared SW helper.
-Platform.getTokenForInstance = async function(instanceUrl) {
+// After a 401 on an ABSOLUTE instance URL (every servicenow_api / run_script /
+// attachment / diff call passes args.instance, so they all bypass the relative-
+// URL shim below): drop the dead token from the registry, re-probe that
+// instance's open tabs (excluding the failed token, validated) and cache the
+// fresh one. Returns '' when no other usable token exists.
+// Single-flight per instance origin: concurrent 401s (parallel tool calls on the
+// same dead session) share ONE in-flight re-probe instead of each re-scanning tabs.
+var _refresh401InFlight = {};
+// Hard cap on one tab re-probe (getSnTabList + per-tab probes + validation). A
+// probe that never settles (tab stuck on a login/SSO page, blocked injection)
+// used to pin the single-flight entry forever: every later 401 with the same
+// dead token joined it, so the instance stayed unreachable until a browser
+// restart cleared SW memory. Resolves null on timeout/rejection.
+// 5s: the lookup only probes tabs of the target origin, in parallel (each
+// bounded at snTimeoutMs('tab') 2.5s), and snGetTokenForInstance has its own
+// 5s whole-lookup cap — an API call must never wait longer for a token.
+var SN_TOKEN_PROBE_DEADLINE_MS = 5000;
+function _probeWithDeadline(p, ms) {
+    return new Promise(function(resolve) {
+        var done = false;
+        var t = setTimeout(function() { if (!done) { done = true; resolve(null); } }, ms || (self && self.__snProbeDeadlineMs) || SN_TOKEN_PROBE_DEADLINE_MS);
+        Promise.resolve(p).then(function(v) { if (!done) { done = true; clearTimeout(t); resolve(v); } },
+            function() { if (!done) { done = true; clearTimeout(t); resolve(null); } });
+    });
+}
+Platform.refreshTokenAfter401 = function(instanceUrl, failedToken) {
+    if (!instanceUrl || typeof self.snGetTokenForInstance !== 'function') return Promise.resolve('');
+    var key = instanceUrl + '\u0000' + (failedToken || '');
+    if (_refresh401InFlight[key]) return _refresh401InFlight[key];
+    var p = (async function() {
+        var probed = null;
+        try { probed = await _probeWithDeadline(self.snGetTokenForInstance(instanceUrl, { excludeToken: failedToken, validate: true })); } catch (e) { probed = null; }
+        var fresh = (probed && probed.token && probed.token !== failedToken) ? probed.token : '';
+        for (var i = 0; i < Platform.instances.length; i++) {
+            if (Platform.instances[i].url !== instanceUrl) continue;
+            Platform.instances[i].token = fresh;
+            if (fresh && probed.userName) Platform.instances[i].userName = probed.userName;
+        }
+        if (instanceUrl === Platform.instanceUrl) {
+            if (fresh) _adoptWorkerToken(fresh);
+            // No replacement: the held token is proven dead (401) — drop it
+            // (memory + storage) so getTokenForInstance() stops handing it out
+            // and list_instances / the page stop reporting it connected.
+            else _dropWorkerToken(failedToken);
+        }
+        return fresh;
+    })();
+    _refresh401InFlight[key] = p;
+    var clear = function() { if (_refresh401InFlight[key] === p) delete _refresh401InFlight[key]; };
+    p.then(clear, clear);
+    return p;
+};
+
+// opts.timeoutMs: the caller's remaining connection budget (tools/020
+// _sfTokenFor) — caps the tab probe below the 5s default.
+Platform.getTokenForInstance = async function(instanceUrl, opts) {
     if (instanceUrl === Platform.instanceUrl && _workerSessionToken) {
         return _workerSessionToken;
     }
@@ -242,7 +327,9 @@ Platform.getTokenForInstance = async function(instanceUrl) {
         }
     }
     if (typeof self.snGetTokenForInstance !== 'function') return '';
-    var probed = await self.snGetTokenForInstance(instanceUrl);
+    var probed = null;
+    var _gtMs = (opts && opts.timeoutMs > 0) ? opts.timeoutMs : undefined;
+    try { probed = await _probeWithDeadline(self.snGetTokenForInstance(instanceUrl), _gtMs); } catch (e) { probed = null; }
     if (!probed || !probed.token) return '';
     // Update cache (or insert if this is a new instance).
     var found = false;
@@ -324,9 +411,11 @@ Platform.ready.then(function() {
 // short-circuit to _workerSessionToken (the dead token) for the active
 // instance, so a healthy sibling tab was never tried and the call fell
 // straight through to the open-for-login flow.
-function _freshTokenAfter401(failedToken) {
+function _freshTokenAfter401(failedToken, ms) {
     if (typeof self.snGetTokenForInstance === 'function') {
-        return self.snGetTokenForInstance(Platform.instanceUrl, { excludeToken: failedToken }).then(function(p) {
+        // Same tab probe as refreshTokenAfter401 → same hang risk: bound it
+        // (by the caller's remaining connection budget when given).
+        return _probeWithDeadline(self.snGetTokenForInstance(Platform.instanceUrl, { excludeToken: failedToken }), ms).then(function(p) {
             return (p && p.token) || '';
         });
     }
@@ -335,6 +424,78 @@ function _freshTokenAfter401(failedToken) {
 
 (function installSnFetchShim() {
     var _origFetch = self.fetch.bind(self);
+
+    // NOTE: absolute-URL 401 recovery lives in _toolFetch (tools/020) via
+    // Platform.refreshTokenAfter401 — NOT here, because the background probes
+    // (snFetchUserName/Roles, heartbeat) also use this global fetch and must SEE
+    // the 401 (a retry would mask a dead token and could recurse).
+    function _knownInstanceOrigin(u) {
+        var o; try { o = new URL(u).origin; } catch (e) { return ''; }
+        if (o === Platform.instanceUrl) return o;
+        for (var i = 0; i < (Platform.instances || []).length; i++) { if (Platform.instances[i].url === o) return o; }
+        return '';
+    }
+    function _hdrToken(h) {
+        if (!h) return '';
+        if (typeof h.get === 'function') return h.get('X-UserToken') || '';
+        return h['X-UserToken'] || h['x-usertoken'] || '';
+    }
+    // extra.deadlineAt: the tool call's 5s connection budget (tools/020
+    // ctx.connDeadlineAt) — bounds the 401 re-probe / login wait, never the
+    // request itself (that stays on the tool's timeout_ms signal).
+    function _absoluteWith401Retry(url, opts, extra) {
+        var deadlineAt = (extra && extra.deadlineAt) || 0;
+        // Relative URLs keep the shim's own active-instance 401 handling.
+        if (typeof url === 'string' && url.charAt(0) === '/') {
+            return self.fetch(url, deadlineAt ? Object.assign({}, opts || {}, { _snDeadlineAt: deadlineAt }) : opts);
+        }
+        var p = _origFetch(url, opts);
+        if (typeof url !== 'string' || !opts || (opts.body && typeof opts.body !== 'string')) return p;
+        var failed = _hdrToken(opts.headers);
+        if (!failed) return p;
+        var origin = _knownInstanceOrigin(url);
+        if (!origin || typeof Platform.refreshTokenAfter401 !== 'function') return p;
+        var sig = opts.signal || null;
+        function _abortErr() {
+            var r = sig && sig.reason;
+            if (r instanceof Error) return r;
+            var e = new Error('The operation was aborted.'); e.name = 'AbortError'; return e;
+        }
+        // Race the (signal-less) tab re-probe against the caller's abort/timeout so
+        // a hung probe can't outlive the tool's deadline.
+        function _refreshRespectingSignal() {
+            var rp = Platform.refreshTokenAfter401(origin, failed);
+            // Past the connection budget: stop waiting on the (shared) re-probe
+            // and surface the 401 — the probe keeps running for the next call.
+            if (deadlineAt) rp = _probeWithDeadline(rp, Math.max(1000, deadlineAt - Date.now())).then(function(v) { return v || ''; });
+            if (!sig) return rp;
+            if (sig.aborted) return Promise.reject(_abortErr());
+            return new Promise(function(resolve, reject) {
+                var onAbort = function() { reject(_abortErr()); };
+                sig.addEventListener('abort', onAbort, { once: true });
+                rp.then(function(v) { sig.removeEventListener('abort', onAbort); resolve(v); },
+                        function(e) { sig.removeEventListener('abort', onAbort); reject(e); });
+            });
+        }
+        return p.then(function(res) {
+            if (res.status !== 401) return res;
+            return _refreshRespectingSignal().then(function(fresh) {
+                if (!fresh) return res;
+                if (sig && sig.aborted) throw _abortErr();
+                var o2 = Object.assign({}, opts);
+                var h = opts.headers;
+                if (h && typeof h.get === 'function') { h = new Headers(h); h.set('X-UserToken', fresh); }
+                else { h = Object.assign({}, h || {}); delete h['x-usertoken']; h['X-UserToken'] = fresh; }
+                o2.headers = h;
+                if (!o2.credentials) o2.credentials = 'include';
+                // A network error on the retry falls back to the original 401, but an
+                // abort (timeout / cancel) must propagate so _toolFetch reports it.
+                return _origFetch(url, o2).catch(function(e) { if (sig && sig.aborted) throw e; return res; });
+            }, function(e) { if (sig && sig.aborted) throw e; return res; });
+        });
+    }
+    // Used by _toolFetch (agent-tool HTTP only) for absolute instance URLs.
+    Platform.fetchWithSessionRetry = _absoluteWith401Retry;
 
     self.fetch = function(url, opts) {
         // Anything that isn't a plain relative path goes straight to native fetch.
@@ -346,14 +507,29 @@ function _freshTokenAfter401(failedToken) {
         }
         var fullUrl = Platform.instanceUrl + url;
         var mergedOpts = Object.assign({}, opts || {});
+        // Connection budget from _absoluteWith401Retry (never sent on the wire).
+        var _dl = mergedOpts._snDeadlineAt || 0;
+        delete mergedOpts._snDeadlineAt;
         mergedOpts.headers = Object.assign({}, (opts && opts.headers) || {});
         mergedOpts.headers['X-UserToken'] = _workerSessionToken || '';
         mergedOpts.credentials = 'include';
 
+        var _t401 = 0;
         return _origFetch(fullUrl, mergedOpts).then(function(res) {
             if (res.status !== 401) return res;
+            _t401 = Date.now();
+            // Fast path: a login wait for this instance is already running and
+            // THIS token already burned its budget (or was dropped) — fail now
+            // instead of stacking another ~5s wait (getRecordVersion + main
+            // request, back-to-back calls).
+            var _key = Platform.instanceUrl || '';
+            var _sent = mergedOpts.headers['X-UserToken'] || '';
+            if (_shimLoginWaits[_key] && _key in _shimExpiredTokens
+                && (_sent === _shimExpiredTokens[_key] || !_sent)) {
+                return _sessionExpiredResponse(res, Platform.instanceUrl);
+            }
             // Token stale — probe a fresh one from an open tab and retry once.
-            return _freshTokenAfter401(mergedOpts.headers['X-UserToken']).then(function(freshToken) {
+            return _freshTokenAfter401(mergedOpts.headers['X-UserToken'], _connLeft()).then(function(freshToken) {
                 if (freshToken && freshToken !== mergedOpts.headers['X-UserToken']) {
                     // Sync caches so subsequent calls see the new token.
                     _adoptWorkerToken(freshToken);
@@ -371,9 +547,27 @@ function _freshTokenAfter401(failedToken) {
             });
         });
 
+        // Remaining connection budget for the token re-probe (min 1s), or
+        // undefined (default 5s probe cap) when the caller passed none.
+        function _connLeft() { return _dl ? Math.max(1000, _dl - Date.now()) : undefined; }
         function _openForLoginAndRetry(failedRes, oldToken) {
             if (typeof self.snOpenForLoginAndWait !== 'function') return failedRes;
-            return self.snOpenForLoginAndWait(oldToken).then(function(loginToken) {
+            var instanceUrl = Platform.instanceUrl;
+            // ONE ~5s budget from the first 401 covers the token re-probe AND the
+            // login wait; the login tab keeps loading in the background.
+            var _cap = (self && self.__snShimLoginWaitMs) || SN_SHIM_LOGIN_WAIT_MS;
+            var _left = Math.max(250, _cap - (_t401 ? Date.now() - _t401 : 0));
+            if (_dl) _left = Math.max(250, Math.min(_left, _dl - Date.now()));
+            return _awaitLoginBounded(instanceUrl, oldToken, mergedOpts.signal, _left).then(function(out) {
+                if (out.timedOut) {
+                    // Still 401 after the whole budget: the token is dead. Drop it
+                    // so later calls stop sending it (the login wait keeps going and
+                    // adopts the fresh token when the user signs in).
+                    _dropWorkerToken(oldToken);
+                    _shimExpiredTokens[instanceUrl || ''] = oldToken || '';
+                    return _sessionExpiredResponse(failedRes, instanceUrl);
+                }
+                var loginToken = out.token;
                 if (!loginToken || loginToken === oldToken) return failedRes;
                 _adoptWorkerToken(loginToken);
                 mergedOpts.headers['X-UserToken'] = loginToken;
@@ -382,3 +576,83 @@ function _freshTokenAfter401(failedToken) {
         }
     };
 })();
+
+// --- Shim login wait: shared + bounded --------------------------------------
+// At v1.1.43 every relative SN call that hit a persistent 401 awaited its OWN
+// snOpenForLoginAndWait (reload/focus the SN tab, then poll up to 4 min). The
+// tool's hard timeout could not abort it (the fetch had already resolved with
+// 401), so the call — its pending handle and the per-instance sys.scripts.do
+// queue behind it — stayed blocked, and every new call reloaded the user's
+// login tab again. Now: ONE detached login wait per instance that later 401s
+// join, and each caller waits at most SN_SHIM_LOGIN_WAIT_MS (or until its
+// abort signal fires) before failing fast with a "session expired" 401.
+// 5s total from the 401 (maintainer: "an API call should not take longer");
+// the detached login wait keeps polling so the NEXT call picks up the token.
+var SN_SHIM_LOGIN_WAIT_MS = 5000;
+var _shimLoginWaits = {};
+// instanceUrl -> the token whose bounded login wait already timed out while
+// _shimLoginWaits[instanceUrl] is still running (shim fast path). Cleared
+// when the login wait settles.
+var _shimExpiredTokens = {};
+function _sharedLoginWait(instanceUrl, oldToken) {
+    var key = instanceUrl || '';
+    if (_shimLoginWaits[key]) return _shimLoginWaits[key];
+    var p = Promise.resolve().then(function() {
+        return self.snOpenForLoginAndWait(oldToken);
+    }).then(function(t) { return t || null; }, function() { return null; }).then(function(t) {
+        // Login finished after every caller gave up: adopt the token so the
+        // NEXT call works without another probe. Guarded — tests evaluate
+        // this section without the worker-token helpers.
+        try {
+            if (t && t !== oldToken && typeof _adoptWorkerToken === 'function'
+                && typeof Platform !== 'undefined' && Platform && Platform.instanceUrl === instanceUrl) {
+                _adoptWorkerToken(t);
+            }
+        } catch (e) {}
+        delete _shimExpiredTokens[key];
+        return t;
+    });
+    _shimLoginWaits[key] = p;
+    // Hard backstop so a wait that never settles can't pin the entry forever.
+    var backstop = setTimeout(function() { if (_shimLoginWaits[key] === p) delete _shimLoginWaits[key]; }, 5 * 60 * 1000);
+    p.then(function() { clearTimeout(backstop); if (_shimLoginWaits[key] === p) delete _shimLoginWaits[key]; });
+    return p;
+}
+// Resolves { token } when the shared login wait yields within the cap, or
+// { timedOut: true } after the cap; rejects with an AbortError if `signal`
+// aborts first (tool hard timeout / cancel).
+function _awaitLoginBounded(instanceUrl, oldToken, signal, capMs) {
+    var cap = capMs || (self && self.__snShimLoginWaitMs) || SN_SHIM_LOGIN_WAIT_MS;
+    return new Promise(function(resolve, reject) {
+        var done = false, timer = null, onAbort = null;
+        function finish(fn, v) {
+            if (done) return;
+            done = true;
+            if (timer) clearTimeout(timer);
+            if (signal && onAbort) { try { signal.removeEventListener('abort', onAbort); } catch (e) {} }
+            fn(v);
+        }
+        if (signal) {
+            onAbort = function() {
+                var r = signal.reason;
+                var err = (r instanceof Error) ? r : new Error('The operation was aborted.');
+                if (!(r instanceof Error)) err.name = 'AbortError';
+                finish(reject, err);
+            };
+            if (signal.aborted) { onAbort(); return; }
+            signal.addEventListener('abort', onAbort, { once: true });
+        }
+        timer = setTimeout(function() { finish(resolve, { timedOut: true }); }, cap);
+        _sharedLoginWait(instanceUrl, oldToken).then(function(t) { finish(resolve, { token: t }); });
+    });
+}
+function _sessionExpiredResponse(failedRes, instanceUrl) {
+    var msg = 'ServiceNow session expired for ' + (instanceUrl || 'the active instance') +
+        ' (HTTP 401) — not connected. Log in to ' + (instanceUrl || 'the instance') + ' (a login tab was opened/reloaded for it), then retry.';
+    if (typeof Response !== 'function') return failedRes;
+    try {
+        return new Response(JSON.stringify({ error: { message: msg, detail: 'session_expired' }, status: 'failure' }), {
+            status: 401, statusText: 'Unauthorized', headers: { 'Content-Type': 'application/json' }
+        });
+    } catch (e) { return failedRes; }
+}

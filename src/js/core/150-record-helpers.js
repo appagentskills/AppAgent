@@ -153,12 +153,16 @@ async function getRecordScope(table, sysId, target) {
     return null;
 }
 
-async function getRecordVersion(table, sysId, target) {
+// opts.deadlineAt: the calling tool's connection budget (tools/020
+// _sfRecOpts) — the SW fetch shim caps its 401 re-probe/login wait by it.
+async function getRecordVersion(table, sysId, target, opts) {
     if (!sysId || !_recValidTable.test(table) || !_recValidSysId.test(sysId)) return null;
     try {
         var url = _recPrefix(target) + '/api/now/table/sys_update_version?sysparm_query=name=' + table + '_' + sysId +
             '^ORDERBYDESCsys_created_on&sysparm_fields=sys_id,sys_created_on,state&sysparm_limit=1';
-        var res = await fetch(url, _recFetchOpts(target));
+        var fo = _recFetchOpts(target);
+        if (opts && opts.deadlineAt && url.charAt(0) === '/') fo = Object.assign({}, fo || {}, { _snDeadlineAt: opts.deadlineAt });
+        var res = await fetch(url, fo);
         var data = await res.json();
         if (data && data.result && data.result[0]) return data.result[0];
     } catch (e) {
@@ -191,21 +195,38 @@ function snMaintCached(instanceUrl, token) {
     var k = _snMaintKey(instanceUrl, token);
     return Object.prototype.hasOwnProperty.call(_snMaintCache, k) ? _snMaintCache[k] : undefined;
 }
-async function snDetectMaint(instanceUrl, token, fetchFn) {
+// ms (optional, capped at 5000): one deadline for the request AND the body read;
+// a timeout counts as transient (false, not cached).
+var SN_MAINT_PROBE_MAX_MS = 5000;
+async function snDetectMaint(instanceUrl, token, fetchFn, ms) {
     var k = _snMaintKey(instanceUrl, token);
     if (Object.prototype.hasOwnProperty.call(_snMaintCache, k)) return _snMaintCache[k];
-    var f = fetchFn || function(u, o) { return fetch(u, o); };
+    var budget = Math.min(SN_MAINT_PROBE_MAX_MS, ms > 0 ? ms : SN_MAINT_PROBE_MAX_MS);
+    var t0 = Date.now();
+    var TO = {};
+    function left() { return Math.max(1, budget - (Date.now() - t0)); }
+    function bounded(p) {
+        return new Promise(function(resolve, reject) {
+            var tm = setTimeout(function() { resolve(TO); }, left());
+            Promise.resolve(p).then(function(v) { clearTimeout(tm); resolve(v); }, function(e) { clearTimeout(tm); reject(e); });
+        });
+    }
+    var f = fetchFn || (typeof snFetchWithTimeout === 'function'
+        ? function(u, o) { return snFetchWithTimeout(u, o, left()); }
+        : function(u, o) { return fetch(u, o); });
     var res;
     try {
-        res = await f(String(instanceUrl || '').replace(/\/+$/, '') + SN_MAINT_PROBE_PATH, {
+        res = await bounded(f(String(instanceUrl || '').replace(/\/+$/, '') + SN_MAINT_PROBE_PATH, {
             method: 'GET', credentials: 'include',
             headers: { 'Accept': 'application/json', 'X-UserToken': token || '' }
-        });
+        }));
     } catch (e) { return false; } // transient: not cached
+    if (res === TO) return false;   // timed out: transient, not cached
     var ok = false;
     try {
         if (res && res.ok) {
-            var data = await res.json();
+            var data = await bounded(res.json());
+            if (data === TO) return false;
             ok = !!(data && Array.isArray(data.result) && data.result.length >= 1);
         }
     } catch (e2) { ok = false; }

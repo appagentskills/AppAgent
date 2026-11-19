@@ -305,6 +305,12 @@ function executeSetChatTitle(args, options) {
         return { success: false, error: 'Title cannot be empty' };
     }
 
+    // Nested callers (sandbox / widget bridge / internal) never fall back to
+    // the streaming/foreground chat — that would retitle another chat.
+    var _sctNested = !!(options && (options.fromSandbox || options.fromWidget || options.parentToolCallId));
+    if (!(options && options.chatId) && _sctNested) {
+        return { success: false, code: 'CHAT_UNRESOLVED', error: 'set_chat_title: the calling chat could not be identified (nested call without chatId); refusing to guess a chat.' };
+    }
     var targetChatId = (options && options.chatId) || activeStreamingChatId || currentChatId;
     var chat = chats[targetChatId];
     if (!chat) {
@@ -481,6 +487,9 @@ function relocateAnswerCard(chat, prop, anchorUserIdx) {
 // hydrate miss keeps the skeleton and the executor fails closed with a clear
 // error (never writes onto, or saves, a message-less chat).
 function _hookToolColdChatId(options) {
+    // Nested caller without chatId: no fallback (the executor fails closed).
+    var _htNested = !!(options && (options.fromSandbox || options.fromWidget || options.parentToolCallId));
+    if (!(options && options.chatId) && _htNested) return null;
     var id = (options && options.chatId) || activeStreamingChatId || currentChatId;
     var c = (typeof chats !== 'undefined' && chats) ? chats[id] : null;
     if (!c || Array.isArray(c.messages) || !c._messagesEvicted) return null;
@@ -501,6 +510,8 @@ function executeSetTldr(args, options) {
     if (!args.tldr || typeof args.tldr !== 'string') return { success: false, error: 'tldr is required' };
     var text = args.tldr.trim().substring(0, 300);
     if (!text) return { success: false, error: 'tldr cannot be empty' };
+    var _stNested = !!(options && (options.fromSandbox || options.fromWidget || options.parentToolCallId));
+    if (!(options && options.chatId) && _stNested) return { success: false, code: 'CHAT_UNRESOLVED', error: 'set_tldr: the calling chat could not be identified (nested call without chatId); refusing to guess a chat.' };
     var targetChatId = (options && options.chatId) || activeStreamingChatId || currentChatId;
     var chat = chats[targetChatId];
     if (!chat || !chat.messages) return { success: false, error: _hookChatMissingError(chat) };
@@ -662,6 +673,8 @@ function mergeChatAutoLinks(chat) {
 function executeSetLinks(args, options) {
     if (!args.links || !Array.isArray(args.links)) return { success: false, error: 'links (array) is required' };
     var links = sanitizeHookLinks(args.links);
+    var _slNested = !!(options && (options.fromSandbox || options.fromWidget || options.parentToolCallId));
+    if (!(options && options.chatId) && _slNested) return { success: false, code: 'CHAT_UNRESOLVED', error: 'set_links: the calling chat could not be identified (nested call without chatId); refusing to guess a chat.' };
     var targetChatId = (options && options.chatId) || activeStreamingChatId || currentChatId;
     var chat = chats[targetChatId];
     if (!chat || !chat.messages) return { success: false, error: _hookChatMissingError(chat) };
@@ -687,6 +700,8 @@ function executeSetCaveat(args, options) {
     if (!args.caveat || typeof args.caveat !== 'string') return { success: false, error: 'caveat is required' };
     var text = args.caveat.trim().substring(0, 300);
     if (!text) return { success: false, error: 'caveat cannot be empty' };
+    var _scNested = !!(options && (options.fromSandbox || options.fromWidget || options.parentToolCallId));
+    if (!(options && options.chatId) && _scNested) return { success: false, code: 'CHAT_UNRESOLVED', error: 'set_caveat: the calling chat could not be identified (nested call without chatId); refusing to guess a chat.' };
     var targetChatId = (options && options.chatId) || activeStreamingChatId || currentChatId;
     var chat = chats[targetChatId];
     if (!chat || !chat.messages) return { success: false, error: _hookChatMissingError(chat) };
@@ -955,9 +970,9 @@ async function executeDiffEdit(args, messageIndex, options) {
             if (!_diffInstanceUrl) {
                 return { success: false, error: 'Unknown instance "' + args.instance + '". Use list_instances to see available instances.' };
             }
-            _diffToken = await Platform.getTokenForInstance(_diffInstanceUrl);
+            _diffToken = await _sfTokenFor(_diffInstanceUrl, options && options._sfCtx);
             if (!_diffToken) {
-                return { success: false, error: 'No token available for instance "' + args.instance + '" (' + _diffInstanceUrl + '). Ensure a tab is open for that instance, or — if the user gave you (or a skill provides) credentials for it — log in with connect_instance.' };
+                return { success: false, error: 'Not connected or session expired — no token available for instance "' + args.instance + '" (' + _diffInstanceUrl + '). Log in to that instance in a browser tab (its session may have expired), or — if the user gave you (or a skill provides) credentials for it — log in with connect_instance.' };
             }
         }
         var _diffApiToken = _diffToken || Platform.getSessionToken() || '';
@@ -969,7 +984,7 @@ async function executeDiffEdit(args, messageIndex, options) {
         var _diffRecTarget = _diffCrossInstance ? { instanceUrl: _diffInstanceUrl, token: _diffApiToken } : null;
 
         // Capture version before the change
-        var versionBefore = await getRecordVersion(args.table, args.sys_id, _diffRecTarget);
+        var versionBefore = await getRecordVersion(args.table, args.sys_id, _diffRecTarget, _sfRecOpts(options));
         var beforeVersion = versionBefore ? versionBefore.sys_id : null;
 
         // Always fetch the full content from the server to ensure we have the complete field
@@ -1056,12 +1071,12 @@ async function executeDiffEdit(args, messageIndex, options) {
         // used to be skipped here, so they never reached the sidebar.
         {
             await new Promise(function(r) { setTimeout(r, 200); });
-            var versionAfter = await getRecordVersion(args.table, args.sys_id, _diffRecTarget);
+            var versionAfter = await getRecordVersion(args.table, args.sys_id, _diffRecTarget, _sfRecOpts(options));
             var afterVersion = versionAfter ? versionAfter.sys_id : null;
             var displayName = await getRecordDisplayValue(args.table, args.sys_id, _diffRecTarget);
             trackRecordMutation({
                 instanceUrl: _diffCrossInstance ? _diffInstanceUrl : undefined,
-                chatId: (options && options.chatId) || activeStreamingChatId || currentChatId,
+                chatId: (options && options.chatId) || ((options && (options.fromSandbox || options.fromWidget || options.parentToolCallId)) ? null : (activeStreamingChatId || currentChatId)),
                 table: args.table,
                 sysId: args.sys_id,
                 field: args.field,
@@ -1251,13 +1266,24 @@ async function _liFetchDirectRoles(instanceUrl, token) {
 }
 
 var _sysScriptsQueues = {};
+// servicenow_run_script default hard timeout (120s) + dispatcher grace.
+var SYS_SCRIPTS_SLOT_CAP_MS = 130000;
 function _enqueueSysScripts(instanceKey, fn) {
     var prev = _sysScriptsQueues[instanceKey] || Promise.resolve();
     // Run fn after the previous request settles (success OR failure).
     var next = prev.then(fn, fn);
     // Store a rejection-swallowed tail so one failed run never poisons the
     // chain for subsequent callers; `next` itself still propagates the result.
-    _sysScriptsQueues[instanceKey] = next.catch(function() {});
+    // Slot cap: a run whose fn never settles (pre-#1363 unbounded token probe
+    // / shim login wait) used to block every later run_script on the instance
+    // until an SW restart. The queue releases the slot after the cap; the
+    // caller's own result still comes from `next` (bounded by the dispatcher's
+    // whole-call deadline).
+    var capMs = (typeof self !== 'undefined' && self && self.__sysScriptsSlotCapMs) || SYS_SCRIPTS_SLOT_CAP_MS;
+    _sysScriptsQueues[instanceKey] = new Promise(function(release) {
+        var t = setTimeout(release, capMs);
+        next.then(function() { clearTimeout(t); release(); }, function() { clearTimeout(t); release(); });
+    });
     return next;
 }
 
@@ -1283,12 +1309,48 @@ var TOOL_FETCH_DEFAULT_TIMEOUT_MS = {
     servicenow_run_script: 120000
 };
 var _sfCtxByHandle = {};
+// Whole-call deadline = timeout_ms + this grace (see _slowFetchDispatch).
+var SF_HARD_DEADLINE_GRACE_MS = 5000;
 // Test hook: shorten the notice threshold (unit tests only).
-function _sfSetNoticeMs(ms) { SLOW_FETCH_NOTICE_MS = ms; }
+function _sfSetNoticeMs(ms, graceMs, connMs, connMinMs) {
+    SLOW_FETCH_NOTICE_MS = ms;
+    if (graceMs != null) SF_HARD_DEADLINE_GRACE_MS = graceMs;
+    if (connMs != null) SF_CONN_BUDGET_MS = connMs;
+    if (connMinMs != null) SF_CONN_MIN_LEFT_MS = connMinMs;
+}
+// ONE connection/auth budget per call (maintainer: a connection or auth
+// failure must error within ~5s, never become a long pending handle). It only
+// bounds the token lookup + 401 re-probe/login wait — never a legit request's
+// own timeout_ms. Set at dispatch, re-based in arm() (approval wait excluded).
+// 4s, not 5s: the budget must run out BEFORE the 5s pending-handle notice
+// (SLOW_FETCH_NOTICE_MS) so a dead session errors inline, never as a handle;
+// the per-step floors (1s probe, 250ms login wait) still fit under 5s.
+var SF_CONN_BUDGET_MS = 4000;
+var SF_CONN_MIN_LEFT_MS = 1000;
+function _sfConnLeft(ctx) {
+    if (!ctx || !ctx.connDeadlineAt) return 0;
+    return Math.max(SF_CONN_MIN_LEFT_MS, ctx.connDeadlineAt - Date.now());
+}
+// getRecordVersion shares the call's budget so it and the main request
+// never stack two auth waits (the second 401 hits the shim fast path).
+function _sfRecOpts(options) {
+    var c = options && options._sfCtx;
+    return (c && c.connDeadlineAt) ? { deadlineAt: c.connDeadlineAt } : undefined;
+}
+// Token lookup bounded by what is left of the call's connection budget.
+function _sfTokenFor(instanceUrl, ctx) {
+    if (typeof Platform === 'undefined' || !Platform || typeof Platform.getTokenForInstance !== 'function') return Promise.resolve('');
+    var left = _sfConnLeft(ctx);
+    return left ? Platform.getTokenForInstance(instanceUrl, { timeoutMs: left }) : Platform.getTokenForInstance(instanceUrl);
+}
 
 async function _toolFetch(url, opts, ctx, fallbackMs) {
     var ms = (ctx && typeof ctx.timeoutMs === 'number' && ctx.timeoutMs > 0) ? ctx.timeoutMs : (fallbackMs || 30000);
     if (ctx && ctx.cancelled) throw new Error('Cancelled by agent');
+    // Whole-call deadline already fired (see _slowFetchDispatch): the caller has
+    // been told timed_out, so never send a request now — a late write after a
+    // slow token lookup would duplicate on retry.
+    if (ctx && ctx.deadlineExpired) throw new Error('Timed out after ' + (ctx.timedOutMs || ms) + 'ms');
     var ac = new AbortController();
     var rec = { ac: ac, timer: null, timedOut: false };
     if (ctx) ctx.controllers.push(rec);
@@ -1298,7 +1360,14 @@ async function _toolFetch(url, opts, ctx, fallbackMs) {
         try { ac.abort(); } catch (_) {}
     }, ms);
     try {
-        return await fetch(url, Object.assign({}, opts || {}, { signal: ac.signal }));
+        // SW: absolute instance URLs (every args.instance call) get one 401 retry
+        // with a fresh token from the instance's open tabs (session change:
+        // logout/login, other user, expiry, reload). See worker/010-platform-stub.js.
+        var _fo = Object.assign({}, opts || {}, { signal: ac.signal });
+        if (typeof Platform !== 'undefined' && Platform && typeof Platform.fetchWithSessionRetry === 'function') {
+            return await Platform.fetchWithSessionRetry(url, _fo, (ctx && ctx.connDeadlineAt) ? { deadlineAt: ctx.connDeadlineAt } : undefined);
+        }
+        return await fetch(url, _fo);
     } catch (e) {
         if (rec.timedOut) throw new Error('Timed out after ' + ms + 'ms');
         if (ctx && ctx.cancelled) throw new Error('Cancelled by agent');
@@ -1374,6 +1443,7 @@ function _slowFetchDispatch(name, args, messageIndex, options) {
     var ctx = {
         name: name, target: _sfTarget(name, args), chatId: chatId, controllers: [],
         startedAt: Date.now(), cancelled: false, timedOut: false, hadAwaiters: false,
+        connDeadlineAt: Date.now() + SF_CONN_BUDGET_MS,
         timeoutMs: (args.timeout_ms != null && Number(args.timeout_ms) > 0) ? Number(args.timeout_ms) : TOOL_FETCH_DEFAULT_TIMEOUT_MS[name]
     };
     var nested = !!(options && (options.fromSandbox || options.fromWidget));
@@ -1415,6 +1485,7 @@ function _slowFetchDispatch(name, args, messageIndex, options) {
         if (armed) return;
         armed = true;
         ctx.startedAt = Date.now(); // approval wait is not request time
+        ctx.connDeadlineAt = ctx.startedAt + SF_CONN_BUDGET_MS;
         if (canBackground) timer = setTimeout(goBackground, SLOW_FETCH_NOTICE_MS);
     }
     var prevHook = options && options._onApprovalSettled;
@@ -1425,14 +1496,39 @@ function _slowFetchDispatch(name, args, messageIndex, options) {
             if (ap && ap.allowed) arm();
         }
     });
-    var inner = Promise.resolve().then(function() {
+    // Whole-call hard deadline. _toolFetch only bounds the fetch phases; the
+    // pre-fetch token lookup (Platform.getTokenForInstance → tab probes) and the
+    // 401 re-probe are awaited outside it, so a hung probe (expired session, tab
+    // stuck on a login/SSO page) left the call — and its pending handle — open
+    // forever. Armed together with the 5s notice (after approval) so approval
+    // waits never count; settles with a timed_out error and aborts the fetches.
+    var hardTimer = null, resolveHard;
+    var hardP = new Promise(function(r) { resolveHard = r; });
+    var _armNotice = arm;
+    arm = function() {
+        var first = !armed;
+        _armNotice();
+        if (!first || hardTimer) return;
+        var hardMs = (ctx.timeoutMs || 30000) + SF_HARD_DEADLINE_GRACE_MS;
+        hardTimer = setTimeout(function() {
+            hardTimer = null;
+            ctx.timedOut = true;
+            ctx.deadlineExpired = true; // _toolFetch refuses any later request
+            if (!ctx.timedOutMs) ctx.timedOutMs = ctx.timeoutMs || 30000;
+            (ctx.controllers || []).forEach(function(rc) { try { rc.ac.abort(); } catch (_) {} });
+            resolveHard({ success: false, error: 'Timed out after ' + ctx.timedOutMs + 'ms (no response; if the ServiceNow session expired, log in again in an instance tab or use connect_instance, then retry)' });
+        }, hardMs);
+    };
+    var inner = Promise.race([Promise.resolve().then(function() {
         return _executeToolInner(name, args, messageIndex, innerOpts);
-    }).then(function(r) {
+    }), hardP]).then(function(r) {
         if (timer) { clearTimeout(timer); timer = null; }
+        if (hardTimer) { clearTimeout(hardTimer); hardTimer = null; }
         _sfClearTimers(ctx);
         return _sfFinalize(ctx, r);
     }, function(err) {
         if (timer) { clearTimeout(timer); timer = null; }
+        if (hardTimer) { clearTimeout(hardTimer); hardTimer = null; }
         _sfClearTimers(ctx);
         return _sfFinalize(ctx, { success: false, error: (err && err.message) ? err.message : String(err) });
     });
@@ -1522,7 +1618,9 @@ async function _executeToolInner(name, args, messageIndex, options) {
         try { options._onApprovalSettled(approval); } catch (eApprovalHook) {}
     }
     if (!approval.allowed) {
-        return { success: false, error: approval.error, _denied: true };
+        var _deniedRes = { success: false, error: approval.error, _denied: true };
+        if (approval.code) _deniedRes.code = approval.code;
+        return _deniedRes;
     }
 
     // -------- Sub-agent dispatch gate (roster + call counter) --------
@@ -1691,7 +1789,15 @@ async function _executeToolInner(name, args, messageIndex, options) {
         if (typeof Handles === 'undefined') {
             return { success: false, error: 'Handle registry not loaded — handle collection unavailable.' };
         }
-        var chatIdH = (options && options.chatId) || (typeof activeStreamingChatId !== 'undefined' ? activeStreamingChatId : null) || (typeof currentChatId !== 'undefined' ? currentChatId : null);
+        // Nested callers (sandbox / widget bridge / internal) never inherit the
+        // foreground/streaming chat: handles are chat-scoped, so guessing would
+        // await (or cancel) another chat's handle. Fail closed instead.
+        var _nestedH = !!(options && (options.fromSandbox || options.fromWidget || options.parentToolCallId));
+        var chatIdH = (options && options.chatId) || (_nestedH ? null
+            : ((typeof activeStreamingChatId !== 'undefined' ? activeStreamingChatId : null) || (typeof currentChatId !== 'undefined' ? currentChatId : null)));
+        if (!chatIdH && _nestedH) {
+            return { success: false, code: 'CHAT_UNRESOLVED', error: name + ': the calling chat could not be identified (nested call without chatId); refusing to guess a chat.' };
+        }
         // P1d: when a TERMINAL snapshot for a sub-agent spawn handle is handed
         // to the caller, stamp report_collected on the sub's persisted record
         // (SubAgents.markCollected is a cheap scan; non-spawn handles simply
@@ -1722,7 +1828,7 @@ async function _executeToolInner(name, args, messageIndex, options) {
                 var _cRes = Handles.cancel(chatIdH, args.handle, 'cancelled by agent (await_handle cancel:true)');
                 return { success: !!_cRes.ok, cancelled: !!_cRes.ok, error: _cRes.ok ? undefined : _cRes.error, snapshot: Handles.poll(chatIdH, args.handle) };
             }
-            var timeoutMsAH = (args.timeout_ms != null) ? Number(args.timeout_ms) : 0;
+            var timeoutMsAH = awaitTimeoutMs(args.timeout_ms);
             // Pool-deadlock prevention (Phase 5): if the caller is a sub-agent
             // and the target handle is a spawn handle (i.e. waiting on a
             // descendant), release the parent sub's pool slot for the duration
@@ -1743,7 +1849,7 @@ async function _executeToolInner(name, args, messageIndex, options) {
             if (!args || !Array.isArray(args.handles) || !args.handles.length) {
                 return { success: false, error: 'await_any requires a non-empty `handles` array.' };
             }
-            var timeoutMsAY = (args.timeout_ms != null) ? Number(args.timeout_ms) : 0;
+            var timeoutMsAY = awaitTimeoutMs(args.timeout_ms);
             var _parkedAidAY = _maybeParkForChildAwaitMulti(chatIdH, args.handles);
             try {
                 var anyRes = await Handles.awaitAny(chatIdH, args.handles, timeoutMsAY);
@@ -1760,7 +1866,7 @@ async function _executeToolInner(name, args, messageIndex, options) {
             if (!args || !Array.isArray(args.handles) || !args.handles.length) {
                 return { success: false, error: 'await_all requires a non-empty `handles` array.' };
             }
-            var timeoutMsAA = (args.timeout_ms != null) ? Number(args.timeout_ms) : 0;
+            var timeoutMsAA = awaitTimeoutMs(args.timeout_ms);
             var _parkedAidAA = _maybeParkForChildAwaitMulti(chatIdH, args.handles);
             try {
                 var allRes = await Handles.awaitAll(chatIdH, args.handles, timeoutMsAA);
@@ -1801,7 +1907,11 @@ async function _executeToolInner(name, args, messageIndex, options) {
         var subCtxChatId = (options && options.chatId)
             || (typeof activeStreamingChatId !== 'undefined' ? activeStreamingChatId : null)
             || (typeof currentChatId !== 'undefined' ? currentChatId : null);
-        var subCtx = { chatId: subCtxChatId };
+        // Nested callers must not inherit the foreground/streaming chat as the
+        // parent/sub identity; noFallback stops the registry's own fallback too.
+        var _subNested = !!(options && (options.fromSandbox || options.fromWidget || options.parentToolCallId));
+        if (_subNested) subCtxChatId = (options && options.chatId) || null;
+        var subCtx = { chatId: subCtxChatId, noFallback: _subNested };
         if (name === 'spawn_sub_agent')  return SubAgents.spawn(args, subCtx);
         if (name === 'report_to_parent') return SubAgents.report(args, subCtx);
         if (name === 'agent_status')     return SubAgents.status(args, subCtx);
@@ -1814,7 +1924,12 @@ async function _executeToolInner(name, args, messageIndex, options) {
     // Execute the tool
     if (name === 'js_eval') {
         try {
-            var chatId = (options && options.chatId) || activeStreamingChatId || currentChatId;
+            // Nested callers (sandbox / widget bridge / internal) never guess the
+            // chat from the foreground globals: inner chat-bound tools must refuse.
+            var _jsNested = !!(options && (options.fromSandbox || options.fromWidget || options.parentToolCallId));
+            var chatId = (options && options.chatId) || (_jsNested ? null
+                : ((typeof activeStreamingChatId !== 'undefined' && activeStreamingChatId)
+                    || (typeof currentChatId !== 'undefined' ? currentChatId : null)));
 
             // Test authority is a host-only opaque key, never a js_eval argument.
             var _testKey = options && options._testRunContext;
@@ -2274,17 +2389,20 @@ async function _executeToolInner(name, args, messageIndex, options) {
         // pill was correct. args.refresh is kept for backward compatibility
         // but a fresh probe is now always implied. On probe failure, fall
         // back to the last-known registry rather than erroring out.
-        // Bounded (15s): a stuck probe must not hang the tool — fall back to the
-        // last-known registry and say so (the probe may still land later).
+        // Bounded (5s, the hard per-call cap; self.__snListInstancesMs overrides in
+        // tests): a stuck probe must not hang the tool — fall back to the
+        // last-known registry and say so (the probe may still land later). The
+        // registry itself answers within ~4.5s with partial entries for slow origins.
+        var _liCapMs = Math.min(5000, (typeof self !== 'undefined' && self && self.__snListInstancesMs) || 5000);
         var _liProbeWarning = null;
         if (Platform.refreshInstances) {
             var _liTO = {};
             var _liR = await new Promise(function(res) {
-                var _t = setTimeout(function() { res(_liTO); }, 15000);
+                var _t = setTimeout(function() { res(_liTO); }, _liCapMs);
                 var _p; try { _p = Promise.resolve(Platform.refreshInstances()); } catch (e) { _p = Promise.resolve(null); }
                 _p.then(function(v) { clearTimeout(_t); res(v); }, function() { clearTimeout(_t); res(null); });
             });
-            if (_liR === _liTO) _liProbeWarning = 'Live instance probe timed out after 15s; showing the last-known registry (a tab may be frozen or still loading).';
+            if (_liR === _liTO) _liProbeWarning = 'Live instance probe timed out after ' + Math.round(_liCapMs / 1000) + 's; showing the last-known registry (a tab may be frozen or still loading).';
         }
         // Per-instance "disabled for agent" flags (toggled from the header
         // instance picker \u2014 setInstanceDisabled in platform-bridge.js, stored
@@ -2306,7 +2424,7 @@ async function _executeToolInner(name, args, messageIndex, options) {
         if (args && args.include_roles) {
             await Promise.all(Platform.instances.filter(function(inst) { return inst.token && !_liDisabledMap[_liNorm(inst.url)]; }).map(async function(inst) {
                 try {
-                    var _tok = (Platform.getTokenForInstance && await Platform.getTokenForInstance(inst.url)) || inst.token;
+                    var _tok = (await _sfTokenFor(inst.url, options && options._sfCtx)) || inst.token;
                     var _dr = await _liFetchDirectRoles(inst.url, _tok);
                     var _mt = false;
                     // maint: no direct roles + no user name + admin-level roles-table read.
@@ -2386,9 +2504,9 @@ async function _executeToolInner(name, args, messageIndex, options) {
                 if (!_attachInstanceUrl) {
                     return { success: false, error: 'Unknown instance "' + args.instance + '". Use list_instances to see available instances.' };
                 }
-                _attachToken = await Platform.getTokenForInstance(_attachInstanceUrl);
+                _attachToken = await _sfTokenFor(_attachInstanceUrl, options && options._sfCtx);
                 if (!_attachToken) {
-                    return { success: false, error: 'No token available for instance "' + args.instance + '". Ensure a tab is open for that instance, or — if the user gave you (or a skill provides) credentials for it — log in with connect_instance.' };
+                    return { success: false, error: 'Not connected or session expired — no token available for instance "' + args.instance + '". Log in to that instance in a browser tab (its session may have expired), or — if the user gave you (or a skill provides) credentials for it — log in with connect_instance.' };
                 }
             }
 
@@ -2441,7 +2559,7 @@ async function _executeToolInner(name, args, messageIndex, options) {
                 if (_attachSysId) {
                     trackRecordMutation({
                         instanceUrl: (_attachInstanceUrl && !_isActiveInstanceUrl(_attachInstanceUrl)) ? _attachInstanceUrl : undefined,
-                        chatId: (options && options.chatId) || activeStreamingChatId || currentChatId,
+                        chatId: (options && options.chatId) || ((options && (options.fromSandbox || options.fromWidget || options.parentToolCallId)) ? null : (activeStreamingChatId || currentChatId)),
                         table: 'sys_attachment',
                         sysId: _attachSysId,
                         displayName: args.attachment_file_name,
@@ -2476,9 +2594,9 @@ async function _executeToolInner(name, args, messageIndex, options) {
                 if (!_atInstanceUrl) {
                     return { success: false, error: 'Unknown instance "' + args.instance + '". Use list_instances to see available instances.' };
                 }
-                _atToken = await Platform.getTokenForInstance(_atInstanceUrl);
+                _atToken = await _sfTokenFor(_atInstanceUrl, options && options._sfCtx);
                 if (!_atToken) {
-                    return { success: false, error: 'No token available for instance "' + args.instance + '" (' + _atInstanceUrl + '). Ensure a tab is open for that instance, or — if the user gave you (or a skill provides) credentials for it — log in with connect_instance.' };
+                    return { success: false, error: 'Not connected or session expired — no token available for instance "' + args.instance + '" (' + _atInstanceUrl + '). Log in to that instance in a browser tab (its session may have expired), or — if the user gave you (or a skill provides) credentials for it — log in with connect_instance.' };
                 }
             }
 
@@ -2543,7 +2661,7 @@ async function _executeToolInner(name, args, messageIndex, options) {
             if (atRes.ok && args.method === 'DELETE') {
                 trackRecordMutation({
                     instanceUrl: _atCrossInstance ? _atInstanceUrl : undefined,
-                    chatId: (options && options.chatId) || activeStreamingChatId || currentChatId,
+                    chatId: (options && options.chatId) || ((options && (options.fromSandbox || options.fromWidget || options.parentToolCallId)) ? null : (activeStreamingChatId || currentChatId)),
                     table: 'sys_attachment',
                     sysId: args.sys_id,
                     displayName: _atDeleteName || ('Attachment ' + args.sys_id),
@@ -2569,9 +2687,9 @@ async function _executeToolInner(name, args, messageIndex, options) {
             if (!_targetInstanceUrl) {
                 return { success: false, error: 'Unknown instance "' + args.instance + '". Use list_instances to see available instances.' };
             }
-            _targetToken = await Platform.getTokenForInstance(_targetInstanceUrl);
+            _targetToken = await _sfTokenFor(_targetInstanceUrl, options && options._sfCtx);
             if (!_targetToken) {
-                return { success: false, error: 'No token available for instance "' + args.instance + '" (' + _targetInstanceUrl + '). Ensure a tab is open for that instance, or — if the user gave you (or a skill provides) credentials for it — log in with connect_instance.' };
+                return { success: false, error: 'Not connected or session expired — no token available for instance "' + args.instance + '" (' + _targetInstanceUrl + '). Log in to that instance in a browser tab (its session may have expired), or — if the user gave you (or a skill provides) credentials for it — log in with connect_instance.' };
             }
         }
 
@@ -2622,7 +2740,7 @@ async function _executeToolInner(name, args, messageIndex, options) {
             // Cross-instance writes are tracked too — helpers hit the target.
             var _apiRecTarget = _apiCrossInstance ? { instanceUrl: _targetInstanceUrl, token: _targetToken } : null;
             if (isModifyingRequest && args.sys_id) {
-                var versionBefore = await getRecordVersion(args.table, args.sys_id, _apiRecTarget);
+                var versionBefore = await getRecordVersion(args.table, args.sys_id, _apiRecTarget, _sfRecOpts(options));
                 beforeVersion = versionBefore ? versionBefore.sys_id : null;
             }
 
@@ -2650,12 +2768,12 @@ async function _executeToolInner(name, args, messageIndex, options) {
                 var recordSysId = args.sys_id || (_apiRes0 && (_apiRes0.sys_id && _apiRes0.sys_id.value ? _apiRes0.sys_id.value : _apiRes0.sys_id));
                 if (recordSysId) {
                     await new Promise(function(r) { setTimeout(r, 200); });
-                    var versionAfter = await getRecordVersion(args.table, recordSysId, _apiRecTarget);
+                    var versionAfter = await getRecordVersion(args.table, recordSysId, _apiRecTarget, _sfRecOpts(options));
                     var afterVersion = versionAfter ? versionAfter.sys_id : null;
                     var displayName = await getRecordDisplayValue(args.table, recordSysId, _apiRecTarget);
                     trackRecordMutation({
                         instanceUrl: _apiCrossInstance ? _targetInstanceUrl : undefined,
-                        chatId: (options && options.chatId) || activeStreamingChatId || currentChatId,
+                        chatId: (options && options.chatId) || ((options && (options.fromSandbox || options.fromWidget || options.parentToolCallId)) ? null : (activeStreamingChatId || currentChatId)),
                         table: args.table,
                         sysId: recordSysId,
                         displayName: displayName,
@@ -2687,9 +2805,9 @@ async function _executeToolInner(name, args, messageIndex, options) {
             if (!_rsTargetUrl) {
                 return { success: false, error: 'Unknown instance "' + args.instance + '". Use list_instances to see available instances.' };
             }
-            _rsTargetToken = await Platform.getTokenForInstance(_rsTargetUrl);
+            _rsTargetToken = await _sfTokenFor(_rsTargetUrl, options && options._sfCtx);
             if (!_rsTargetToken) {
-                return { success: false, error: 'No token available for instance "' + args.instance + '". Ensure a tab is open for that instance, or — if the user gave you (or a skill provides) credentials for it — log in with connect_instance.' };
+                return { success: false, error: 'Not connected or session expired — no token available for instance "' + args.instance + '". Log in to that instance in a browser tab (its session may have expired), or — if the user gave you (or a skill provides) credentials for it — log in with connect_instance.' };
             }
         }
         // Hard admin gate (see _rsCheckAdmin) — never POST as a non-admin.
@@ -2799,13 +2917,19 @@ async function _executeToolInner(name, args, messageIndex, options) {
         var _hkCold = _hookToolColdChatId(options); if (_hkCold) await _hydrateColdHookChat(_hkCold);
         return executeSetCaveat(args, options);
     } else if (name === 'cached_content_outline') {
-        var ccoChatId = (options && options.chatId) || activeStreamingChatId || currentChatId;
+        var _ccNested = !!(options && (options.fromSandbox || options.fromWidget || options.parentToolCallId));
+        var ccoChatId = (options && options.chatId) || (_ccNested ? null : (activeStreamingChatId || currentChatId));
+        if (!ccoChatId && _ccNested) return { success: false, code: 'CHAT_UNRESOLVED', error: name + ': the calling chat could not be identified (nested call without chatId); refusing to guess a chat.' };
         return executeCachedContentOutline(ccoChatId, args);
     } else if (name === 'cached_content_search') {
-        var ccsChatId = (options && options.chatId) || activeStreamingChatId || currentChatId;
+        var _ccsNested = !!(options && (options.fromSandbox || options.fromWidget || options.parentToolCallId));
+        var ccsChatId = (options && options.chatId) || (_ccsNested ? null : (activeStreamingChatId || currentChatId));
+        if (!ccsChatId && _ccsNested) return { success: false, code: 'CHAT_UNRESOLVED', error: name + ': the calling chat could not be identified (nested call without chatId); refusing to guess a chat.' };
         return executeCachedContentSearch(ccsChatId, args);
     } else if (name === 'cached_content_read') {
-        var ccrChatId = (options && options.chatId) || activeStreamingChatId || currentChatId;
+        var _ccrNested = !!(options && (options.fromSandbox || options.fromWidget || options.parentToolCallId));
+        var ccrChatId = (options && options.chatId) || (_ccrNested ? null : (activeStreamingChatId || currentChatId));
+        if (!ccrChatId && _ccrNested) return { success: false, code: 'CHAT_UNRESOLVED', error: name + ': the calling chat could not be identified (nested call without chatId); refusing to guess a chat.' };
         return executeCachedContentRead(ccrChatId, args);
     } else if (name === 'get_skill') {
         return await executeGetSkill(args);
@@ -2841,7 +2965,7 @@ async function _executeToolInner(name, args, messageIndex, options) {
     } else if (name === 'screenshot_by_id') {
         return await executeScreenshotById(args);
     } else if (name === 'get_file') {
-        return await executeGetFile(args);
+        return await executeGetFile(args, options);
     } else if (name === 'read_attached_file') {
         return await executeReadAttachedFile(args, options);
     } else if (name === 'get_cookie') {
@@ -6117,6 +6241,16 @@ async function _wsHandoffPin(targetWk) {
 
 // Upper bound for the default-branch GitHub lookup in _wsPinHandoffTarget.
 var _WS_PIN_LOOKUP_TIMEOUT_MS = 5000;
+
+// await_handle / await_any / await_all never wait forever by default: 0,
+// omitted, negative or non-numeric timeout_ms all mean this cap (the handle is
+// left in flight and reported {status:'pending'}). An explicit positive value
+// (even a very large one) is honoured as-is.
+var AWAIT_HANDLE_DEFAULT_TIMEOUT_MS = 120000;
+function awaitTimeoutMs(raw) {
+    var n = Number(raw);
+    return (raw != null && isFinite(n) && n > 0) ? n : AWAIT_HANDLE_DEFAULT_TIMEOUT_MS;
+}
 
 // Pick the workspace that inherits the pin / PR records when `wk` is deleted:
 // its forked_from parent if cloned, else a locally cloned same-repo ::main or

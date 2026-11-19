@@ -105,7 +105,30 @@ async function executePromptUser(args, options) {
         }]);
     }
 
-    var chatId = (options && options.chatId) || activeStreamingChatId || currentChatId;
+    // Nested callers (sandbox / widget bridge / internal) never fall back to the
+    // foreground/streaming chat — the form would land in the wrong chat.
+    var _puNested = !!(options && (options.fromSandbox || options.fromWidget || options.parentToolCallId));
+    var chatId = (options && options.chatId) || (_puNested ? null : (activeStreamingChatId || currentChatId));
+    if (!chatId && _puNested) {
+        return { success: false, code: 'CHAT_UNRESOLVED', error: 'prompt_user: the calling chat could not be identified (nested call without chatId); refusing to guess a chat.' };
+    }
+    // A WIDGET prompt never waits in a chat the user cannot see (e.g. a
+    // dashboard/home-pinned widget whose origin chat is not open): the form
+    // would park unseen and the widget would hang. Reachable = exactly the
+    // two places the form actually surfaces below: (a) a background Action
+    // owner -> needs-input bell/popup (setActionNeedsInput), or (b) the inline
+    // render, which happens ONLY when the chat view is up AND the owner is
+    // currentChatId. A split pane showing the owner's family while another
+    // chat is current does NOT count: the inline form would not render.
+    if (options.fromWidget) {
+        var _puOwner = (typeof chats !== 'undefined' && chats) ? chats[chatId] : null;
+        var _puBgAction = !!(_puOwner && _puOwner.isBackground && _puOwner.actionId && typeof setActionNeedsInput === 'function');
+        var _puShown = typeof currentView !== 'undefined' && currentView === 'chat' &&
+            typeof currentChatId !== 'undefined' && currentChatId === chatId;
+        if (!_puShown && !_puBgAction) {
+            return { success: false, code: 'CHAT_NOT_VISIBLE', chat_id: chatId, error: 'prompt_user: the widget\'s chat (' + chatId + ') is not open on screen, so the form would wait unseen. Open the widget\'s chat first (or use the widget from inside that chat), then try again.' };
+        }
+    }
     var chat = chats[chatId];
     if (!chat) return { success: false, error: 'No active chat' };
     // Cold-chat eviction: a replayed prompt can target a skeleton (no
@@ -133,6 +156,7 @@ async function executePromptUser(args, options) {
             }
         }
     }
+    var _puHiddenOverlay = null;
     var promptId = (promptMsg && promptMsg.promptId) || ('prompt_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7));
 
     // Add prompt message to chat (similar to approval messages) only if we did not
@@ -167,6 +191,20 @@ async function executePromptUser(args, options) {
     if (chat.isBackground && chat.actionId && typeof setActionNeedsInput === 'function') {
         setActionNeedsInput(chat.actionId, promptId);
     } else if (currentChatId === chatId && currentView === 'chat') {
+        // A widget prompting from #widget-fullscreen-overlay (fixed, above the
+        // chat) would get its inline form painted BEHIND the overlay. Hide the
+        // overlay (display:none keeps the calling iframe alive, unlike
+        // closeWidgetFullscreen which destroys it and its pending call) and
+        // restore it once the prompt resolves.
+        if (options.fromWidget && typeof document !== 'undefined' && document && typeof document.getElementById === 'function') {
+            var _puFs = document.getElementById('widget-fullscreen-overlay');
+            if (_puFs && _puFs.style && _puFs.style.display !== 'none') {
+                _puFs.style.display = 'none';
+                // Global Escape (core/120-init.js) skips a prompt-hidden overlay.
+                if (_puFs.dataset) _puFs.dataset.promptHidden = '1';
+                _puHiddenOverlay = _puFs;
+            }
+        }
         // Foreground chat — render inline as before
         renderMessages();
         scrollToBottomIfAllowed();
@@ -193,6 +231,12 @@ async function executePromptUser(args, options) {
         pendingPromptResolvers[promptId] = resolve;
     });
     delete promptSubmitHooks[promptId];
+    // Restore the fullscreen overlay hidden above (only if it is still mounted:
+    // the user may have closed/replaced it meanwhile).
+    if (_puHiddenOverlay && _puHiddenOverlay.isConnected !== false && _puHiddenOverlay.style) {
+        _puHiddenOverlay.style.display = '';
+        if (_puHiddenOverlay.dataset) delete _puHiddenOverlay.dataset.promptHidden;
+    }
 
     // Mirror the prompt message to the SW so its chat snapshot doesn't wipe
     // it on the next agent-event. submitPromptUser/cancelPromptUser mutated

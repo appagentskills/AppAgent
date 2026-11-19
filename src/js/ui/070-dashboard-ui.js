@@ -952,6 +952,50 @@ window.addEventListener('message', function(event) {
     }
 });
 
+// The chat that OWNS a calling widget render (never the foreground globals
+// for renders that are not part of the visible chat):
+//   • split pane render     → #split-widget-pane[data-chat-id] (the pane's chat)
+//   • inline render in #messages → currentChatId (the chat that view shows)
+//   • fullscreen overlay opened FROM a chat view (inline or split) →
+//     #widget-fullscreen-overlay[data-chat-id] (stamped by openWidgetFullscreen)
+//   • dashboard / home / other fullscreen / parked render → the widget
+//     record's own origin chatId (WidgetStore.view(id).chatId)
+// null when nothing resolves: the bridge then passes chatId:null +
+// fromWidget:true so chat-bound tools fail closed (CHAT_UNRESOLVED).
+function _widgetOwnerChatId(iframe, widgetId) {
+    var node = iframe, inMessages = false;
+    while (node) {
+        if (node.id === 'split-widget-pane') {
+            var pc = node.dataset && node.dataset.chatId;
+            if (pc) return pc;
+            break;
+        }
+        if (node.id === 'messages') inMessages = true;
+        if (node.id === 'widget-fullscreen-overlay') {
+            var oc = node.dataset && node.dataset.chatId;
+            if (oc) return oc;
+            break;
+        }
+        node = node.parentNode || node.host || null;
+    }
+    if (inMessages && typeof currentChatId !== 'undefined' && currentChatId) return currentChatId;
+    if (widgetId && typeof WidgetStore !== 'undefined' && WidgetStore && typeof WidgetStore.view === 'function') {
+        try {
+            var rec = WidgetStore.view(widgetId);
+            if (rec && rec.chatId) {
+                // Stored origin chat only while it still exists (cold chats stay
+                // as _messagesEvicted stubs, so presence is the right test):
+                // a deleted origin must not receive the widget's tool calls.
+                // Before chats hydration the map is incomplete — keep the record.
+                if (typeof _chatsHydrated !== 'undefined' && _chatsHydrated === false) return rec.chatId;
+                var _woc = (typeof chats !== 'undefined' && chats) ? chats[rec.chatId] : null;
+                if (_woc && !_woc._deleted) return rec.chatId;
+            }
+        } catch (e) {}
+    }
+    return null;
+}
+
 // Listen for tool calls from widgets via postMessage (embedded widgets)
 window.addEventListener('message', async function(event) {
     if (event.data && event.data.type === 'widgetToolCall') {
@@ -986,18 +1030,19 @@ window.addEventListener('message', async function(event) {
             // the sub-agent dispatch gates (tools/020-tool-execution.js,
             // worker/120-tool-routing.js) exempt them from the display-only
             // tool-call counter.
-            var result = await executeTool(name, args, null, { chatId: currentChatId, widgetName: widgetName, widgetId: _srcWidgetId, widgetInstanceId: _srcInstance ? _srcInstance.instance_id : null, fromWidget: true });
+            var _ownerChatId = _widgetOwnerChatId(_srcIframe, _srcWidgetId);
+            var result = await executeTool(name, args, null, { chatId: _ownerChatId, widgetName: widgetName, widgetId: _srcWidgetId, widgetInstanceId: _srcInstance ? _srcInstance.instance_id : null, fromWidget: true });
 
             // Persist screenshot to chat.screenshots map so screenshot_by_id can find it after reload
             // (NOT chat.messages — inserting there breaks tool_use/tool_result ordering for the API)
             if (result && result._screenshotMessage) {
                 var ssMsg = result._screenshotMessage;
                 if (ssMsg.screenshot_id) {
-                    var ssChat = chats[currentChatId];
+                    var ssChat = _ownerChatId ? chats[_ownerChatId] : null;
                     if (ssChat) {
                         if (!ssChat.screenshots) ssChat.screenshots = {};
                         ssChat.screenshots[ssMsg.screenshot_id] = { base64: ssMsg.base64, name: ssMsg.name, width: ssMsg.width, height: ssMsg.height, timestamp: ssMsg.timestamp, description: ssMsg.description };
-                        if (ssMsg.file_id) registerFile(ssMsg.file_id, { type: 'screenshots_map', chatId: currentChatId });
+                        if (ssMsg.file_id) registerFile(ssMsg.file_id, { type: 'screenshots_map', chatId: _ownerChatId });
                         saveChatsToStorage();
                     }
                 }

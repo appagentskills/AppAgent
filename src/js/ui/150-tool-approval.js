@@ -43,7 +43,12 @@ async function requestProgrammaticToolApproval(toolName, args, options) {
 
     // Resolve the target chat FIRST: "Allow for this chat" grants are keyed by
     // root chat, so the permission lookup needs the calling chat id.
-    var targetChatId = options.chatId || activeStreamingChatId || currentChatId;
+    // Nested callers (sandbox / widget bridge / internal) never inherit the
+    // foreground/streaming chat: its "Allow for this chat" grants must not
+    // apply to them and its transcript must not host their prompt. Without a
+    // chatId they get global settings only; an 'ask' is refused below.
+    var _apNested = !!(options.fromSandbox || options.fromWidget || options.parentToolCallId);
+    var targetChatId = options.chatId || (_apNested ? null : (activeStreamingChatId || currentChatId));
     var permissionKey = resolvePermissionKey(toolName, methodOrAction);
     // Instance tier is looked up for the host the call TARGETS (core/070
     // getTargetedToolPermission). Fail safe if core/070 isn't loaded: an
@@ -109,6 +114,9 @@ async function requestProgrammaticToolApproval(toolName, args, options) {
     }
 
     // permission === 'ask' OR (auto + confirm:true) - check if already approved, else prompt
+    if (!targetChatId && _apNested) {
+        return Object.assign({ allowed: false, code: 'CHAT_UNRESOLVED', error: displayName + ' needs approval, but the calling chat could not be identified (nested call without chatId); refusing to guess a chat.' }, baseResult);
+    }
     var toolCallId = options.toolCallId || ('prog_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9));
 
     // Check for existing approval for this toolCallId

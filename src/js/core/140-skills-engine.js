@@ -443,7 +443,10 @@ async function executeSkillTool(toolName, args, options, messageIndex) {
     }
 
     try {
-        var chatId = (options && options.chatId) || activeStreamingChatId || currentChatId;
+        var _skNested = !!(options && (options.fromSandbox || options.fromWidget || options.parentToolCallId));
+        var chatId = (options && options.chatId) || (_skNested ? null
+            : ((typeof activeStreamingChatId !== 'undefined' && activeStreamingChatId)
+                || (typeof currentChatId !== 'undefined' ? currentChatId : null)));
 
         // SW context bridges to the offscreen helper, which hosts the
         // real sandbox iframe. The offscreen runs the same MSG_TOOL_CALL /

@@ -156,6 +156,20 @@ document.getElementById('ask').onclick = async function () {
 
 `include_widget: true` prepends `Context: widget <id> ("<title>") — read it with iframe_tool get_visible_text or take_screenshot.` using the calling widget's id (also readable as `window._widgetId`). In foreground modes (`send` without `background`, and `draft`) the view switches to the new chat and this widget's iframe is destroyed — don't await feedback there; use `background: true` if the button must show a result.
 
+## Asking the user from a widget (`prompt_user`)
+
+`executeTool('prompt_user', {...})` from a widget opens the form **in the widget's own chat**, never in whatever chat is on screen. It only proceeds when that chat is actually where the form will surface:
+
+- the widget's chat is the chat currently open in chat view (form renders inline; a fullscreen widget overlay is hidden while the form is pending and restored afterwards), or
+- the widget's chat is a background Action chat (the action button flips to its needs-input bell).
+
+Otherwise (dashboard/home-pinned widget, split pane showing the widget while another chat is current, …) it returns `{success: false, code: 'CHAT_NOT_VISIBLE', chat_id}` immediately instead of waiting unseen. Always handle it:
+
+```js
+var r = await executeTool('prompt_user', { title: 'Pick a format', fields: [{ name: 'fmt', type: 'select', options: ['csv', 'pdf'] }] });
+if (r && r.code === 'CHAT_NOT_VISIBLE') { showMessage('Open this widget\'s chat to answer.'); return; }
+```
+
 ## Common Gotchas
 
 | Issue | Cause | Fix |

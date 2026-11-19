@@ -78,7 +78,7 @@ var SHOUT_RE = /\b(MUST(?:N'T)?|NEVER|ALWAYS|IMPORTANT|CRITICAL|CRUCIAL|ESSENTIA
 
 // Rule 2 allowlist: acronyms, protocol / format names, identifiers. Keep it to real acronyms.
 var ACRONYMS = ('ACL ADB API ARIA ASCII AST ATF CAPTCHA CAS CDATA CDN CORS CRUD CSM CSP CSS CSV DDG DOCTYPE DOM ESC ' +
-    'GET GHE GPT HEAD HTML HTTP HTTPS IDB IIFE ISO ITIL ITSM JPEG JSESSIONID JSON JSX LAN LLM MFA MIME MRVS NUL OOB ' +
+    'GET GHE GPT HEAD HTML HTTP HTTPS IDB IIFE ISO ITIL ITSM JPEG JSESSIONID JSON JSX LAN LLM MBPP MFA MIME MRVS NUL OOB ' +
     'PAT PATCH PDF PHPSESSID PNG POST PUT REST RFC RSS RTL SERP SLA SOW SSO SVG TLDR TTL URL UTF UXF WIP XML XSS YYYY ' +
     'DELETE TODO').split(' ');
 
@@ -91,6 +91,7 @@ var EXEMPTIONS = [
     { file: 'src/js/core/097-sub-agent-registry.js', where: 'WORKER SATURATION rule', words: ['WORKER', 'SATURATION'], reason: 'names the system-prompt section label' },
     { file: 'src/js/tools/020-tool-execution.js', where: 'another RUNNING agent', words: ['RUNNING'], reason: 'ls ownership marker asserted by test/sandbox-loader-bridge.test.js' },
     { file: 'src/js/core/080-tools.js', where: 'ACTIVE SKILLS', words: ['ACTIVE', 'SKILLS'], reason: 'names the system-prompt section label' },
+    { file: 'src/js/core/110-system-prompt.js', where: '(see GROUND YOUR CLAIMS)', words: ['GROUND', 'YOUR', 'CLAIMS'], reason: 'names the system-prompt section label' },
     { file: 'src/js/core/080-tools.js', where: 'ISOLATED', words: ['ISOLATED', 'MAIN'], reason: 'tab_world enum values (Chrome script execution worlds)' },
     { file: 'src/js/tools/020-tool-execution.js', where: 'ISOLATED', words: ['ISOLATED', 'MAIN'], reason: 'tab_world enum values (Chrome script execution worlds)' },
     { file: 'src/js/app/050-image-attachments.js', where: 'pending-file-label', words: ['DOC'], reason: 'file-type badge in composer chip HTML (UI only, not model text)' },

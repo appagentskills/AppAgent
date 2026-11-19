@@ -190,17 +190,22 @@ function appendContextNotice(chat, content) {
         // the non-error status report_to_parent accepts (done|error|need_input)
         // and the one the saturation hard stop below already asks for.
         var subStatus = ' Use status "need_input" (a context-limited partial result is not an error; reserve "error" for real failures) and say in the summary what is done and what is left.';
+        // The handover lives in the report itself (summary/data): the parent
+        // seeds the successor's spawn instructions from it. Subs used to answer
+        // these notices by creating shared Smart Documents titled "handoff" /
+        // "handover" that the user never asked for.
+        var subHandoff = ' Put the handover (done, left, exact next steps, file/line pointers) in the report itself \u2014 do not create a handoff/handover document.';
         if (pct >= 100) {
             notice = isSub
-                ? '\u26d4 [Context full] Your context window is full (~' + pct + '%). Please stop now and call report_to_parent with everything you have, recommending a handoff to a fresh sub-agent for the remainder.' + subStatus
+                ? '\u26d4 [Context full] Your context window is full (~' + pct + '%). Please stop now and call report_to_parent with everything you have, recommending the parent continue with a fresh sub-agent for the remainder.' + subStatus + subHandoff
                 : '\u26d4 [Context full] Your context window is full (~' + pct + '%). Stop working now: give the user your conclusion/report immediately with what you have. Delegate anything unfinished to a sub-agent.';
         } else if (pct >= 60) {
             notice = isSub
-                ? '\u26d4 [Context \u2014 final warning] You are past 60% of your context window (~' + pct + '%). Earlier notices already asked you to wrap up. Please stop all work now and call report_to_parent right away with what you have; the parent must hand remaining work to a fresh sub-agent.' + subStatus
+                ? '\u26d4 [Context \u2014 final warning] You are past 60% of your context window (~' + pct + '%). Earlier notices already asked you to wrap up. Please stop all work now and call report_to_parent right away with what you have; the parent must hand remaining work to a fresh sub-agent.' + subStatus + subHandoff
                 : '\u26d4 [Context \u2014 final warning] You are past 60% of your context window (~' + pct + '%). Earlier notices already asked you to wrap up. Stop taking on new work now: wrap up and give the user your conclusion this turn, and delegate anything unfinished to sub-agents (spawn_sub_agent).';
         } else {
             notice = isSub
-                ? '\u26a0\ufe0f [Context] You are past 50% of your context window (~' + pct + '%). Stop taking on new work: wrap up your current step now and call report_to_parent with your findings so far, recommending the parent hand any remaining work to a fresh sub-agent.' + subStatus
+                ? '\u26a0\ufe0f [Context] You are past 50% of your context window (~' + pct + '%). Stop taking on new work: wrap up your current step now and call report_to_parent with your findings so far, recommending the parent continue any remaining work with a fresh sub-agent.' + subStatus + subHandoff
                 : '\u26a0\ufe0f [Context] You are past 50% of your context window (~' + pct + '%). Model quality degrades from here. Delegate all remaining heavy or verbose work to sub-agents (spawn_sub_agent) and keep this thread lean \u2014 orchestrate, don\'t do.';
         }
         return appendNoticeToContent(content, notice, '_context_notice');
@@ -245,7 +250,7 @@ function maybeSubSaturationHardStop(chat, streamingChatId) {
             chat.messages.push({
                 role: 'context',
                 _saturationHardStop: true,
-                content: '\u26d4 [Required \u2014 context ~' + _hsPct + '%: you are saturated. Write a short handover doc (document create, shared scope: what is done, what is left, exact next steps) and call report_to_parent now with status need_input. Do no other work \u2014 if you have not reported within ' + _hsGrace + ' more turns the runtime will report on your behalf with your last message as the summary.]'
+                content: '\u26d4 [Required \u2014 context ~' + _hsPct + '%: you are saturated. Call report_to_parent now with status need_input, putting the handover in the report itself (summary/data: what is done, what is left, exact next steps) \u2014 do not create a handoff/handover document. Do no other work \u2014 if you have not reported within ' + _hsGrace + ' more turns the runtime will report on your behalf with your last message as the summary.]'
             });
             return 'injected';
         }

@@ -14,8 +14,8 @@ function extractFn(src, name) {
 var O = 'https://dev1.service-now.com';
 var PW = 'S3cr3t"pw\\x';
 
-var LOGIN_FNS = ['snAutoLoginId', 'snAutoLoginFailState', 'snLoginFillAndSubmit', 'snLoginProbeState', 'snLoginLooksSignedIn',
-    'snAutoLoginSleep', 'snAutoLogin', 'snAutoLoginRun', 'snAutoLoginActivate', 'snSetActiveInstance'];
+var LOGIN_FNS = ['snTimeoutMs', 'snWithTimeout', 'snInjectBounded', 'snAutoLoginId', 'snAutoLoginFailState', 'snLoginFillAndSubmit', 'snLoginProbeState', 'snLoginLooksSignedIn',
+    'snAutoLoginHardCapMs', 'snSettleWithin', 'snAutoLoginSleep', 'snAutoLogin', 'snAutoLoginRun', 'snAutoLoginActivate', 'snSetActiveInstance'];
 
 // world: { tabs: [{id,url,status}], have: {token,userName}|null, instanceUrl,
 //          probe: function(ctx) -> state, fillResult, session: shared session store }

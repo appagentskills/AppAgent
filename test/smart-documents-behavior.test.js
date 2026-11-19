@@ -81,12 +81,12 @@ describe('smart document behavior',function(){
         p.status='answered';p.responses={x:'answer'};
         assert.deepStrictEqual((await call({action:'read',doc_id:c.doc_id},'root')).prompt_responses,{[p.id]:{x:'answer'}});
     });
-    test('missing ownership safely falls back to shared and invalid actions do not write',async function(){
+    test('missing ownership fails closed (no shared fallback) and invalid actions do not write',async function(){
         var c=await m.executeSmartDocument({action:'create',title:'Ownerless',scope:'chat'},0,{});
-        assert.strictEqual(c.scope,'shared');assert.strictEqual(rows[c.doc_id].ownerChatId,null);
+        assert.strictEqual(c.success,false);assert.strictEqual(c.code,'CHAT_UNRESOLVED');assert.strictEqual(c.doc_id,undefined);
         assert.deepStrictEqual(await call({}),{success:false,error:'action is required'});
         assert.deepStrictEqual(await call({action:'unknown'}),{success:false,error:'Unknown action: unknown'});
-        assert.strictEqual(Object.keys(rows).length,1);
+        assert.strictEqual(Object.keys(rows).length,0);
     });
     test('read request failure returns no stale content and delete removes durable row',async function(){
         var c=await create('secret');readError=true;

@@ -359,9 +359,14 @@ async function executeUpdateActionState(args, options) {
     // is authoritative per-invocation and is the only lookup that behaves correctly
     // under concurrent background actions. Fall back to activeStreamingChatId for
     // legacy callers, then currentChatId so foreground chats can also report progress.
+    // Nested callers (sandbox / widget bridge / internal) never fall back to the
+    // foreground/streaming chat — fail closed instead.
+    var _uasNested = !!(options && (options.fromSandbox || options.fromWidget || options.parentToolCallId));
     var chatId = (options && options.chatId) ||
-                 activeStreamingChatId ||
-                 currentChatId;
+                 (_uasNested ? null : (activeStreamingChatId || currentChatId));
+    if (!chatId && _uasNested) {
+        return { success: false, code: 'CHAT_UNRESOLVED', error: 'update_action_state: the calling chat could not be identified (nested call without chatId); refusing to guess a chat.' };
+    }
     var chat = chatId ? chats[chatId] : null;
     if (!chat) {
         return { success: false, error: 'No active chat to update.' };
@@ -563,7 +568,8 @@ async function executeUpdateActionState(args, options) {
         } catch (e) { /* best-effort — the SW broadcast corrects the mirror */ }
     }
     AgentEvents.emit('actionStateChanged', {
-        chatId: (options && options.chatId) || activeStreamingChatId || currentChatId,
+        // Same chat the card was written to (resolved above, no nested fallback).
+        chatId: chatId,
         actionId: null,
         status: args && args.state || null
     });
@@ -607,7 +613,12 @@ function executeShowActionButton(args, messageIndex, options) {
     if (!skill) return { success: false, error: 'Skill not found: ' + skillId };
     var action = (skill.actions || []).filter(function(a){ return a.name === actionName; })[0];
     if (!action) return { success: false, error: 'Action not found on skill: ' + actionName };
-    var chatId = (options && options.chatId) || activeStreamingChatId || currentChatId;
+    // Nested callers never fall back to the foreground/streaming chat.
+    var _sabNested = !!(options && (options.fromSandbox || options.fromWidget || options.parentToolCallId));
+    var chatId = (options && options.chatId) || (_sabNested ? null : (activeStreamingChatId || currentChatId));
+    if (!chatId && _sabNested) {
+        return { success: false, code: 'CHAT_UNRESOLVED', error: 'show_action_button: the calling chat could not be identified (nested call without chatId); refusing to guess a chat.' };
+    }
     var chat = chats[chatId];
     if (!chat) return { success: false, error: 'No active chat' };
     // Push a special message that renders as an inline action button

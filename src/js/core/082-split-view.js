@@ -194,6 +194,9 @@ function maybePushSplitViewTailContext(chat, chatId) {
 // --- Tool executor (page realm) ---
 function _splitViewChatId(options) {
     if (options && options.chatId) return options.chatId;
+    // Nested (sandbox / widget-bridge / internal) calls never guess from the
+    // foreground globals: a worker's split_view must target ITS chat family.
+    if (options && (options.fromSandbox || options.fromWidget || options.parentToolCallId)) return null;
     if (typeof activeStreamingChatId !== 'undefined' && activeStreamingChatId) return activeStreamingChatId;
     if (typeof currentChatId !== 'undefined') return currentChatId;
     return null;
@@ -281,7 +284,10 @@ function _splitViewHasDom() {
 // the split_view tool writes, so the agent sees it in its next turn.
 function openSplitViewForWidget(widgetId, chatId, opts) {
     opts = opts || {};
-    chatId = chatId || (typeof currentChatId !== 'undefined' ? currentChatId : null);
+    // Agent-initiated opens (html_widget auto-open) must name their chat —
+    // falling back to the FOREGROUND chat put a worker's widget in another
+    // chat's pane. Only the user's own button click may use currentChatId.
+    if (!chatId && opts.openedBy !== 'agent') chatId = (typeof currentChatId !== 'undefined' ? currentChatId : null);
     var widget = (widgetId && typeof getWidgetById === 'function') ? getWidgetById(widgetId) : null;
     if (!chatId || !widget) return Promise.resolve(false);
     var p = setSplitViewState(chatId, {

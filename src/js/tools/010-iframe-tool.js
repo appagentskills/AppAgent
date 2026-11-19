@@ -236,9 +236,13 @@ function queryWidgetViaPostMessage(iframe, action, args) {
 // `options` (from executeTool) may carry chatId — only used for chat-scoped
 // bookkeeping (e.g. sidepanel close waiting for the run to finish).
 async function executeIframeTool(args, options) {
+    // Nested callers (sandbox / widget bridge / internal) never fall back to
+    // the foreground chat: null (not undefined — the impl re-defaults
+    // undefined to currentChatId) means "no chat-scoped bookkeeping".
+    var _ifNested = !!(options && (options.fromSandbox || options.fromWidget || options.parentToolCallId));
     var _ifChatId = (options && options.chatId && typeof chats !== 'undefined' && chats[options.chatId])
         ? options.chatId
-        : ((typeof currentChatId !== 'undefined') ? currentChatId : undefined);
+        : (_ifNested ? null : ((typeof currentChatId !== 'undefined') ? currentChatId : undefined));
     var _ifTabId = null;
     var _needsTab = !!(args && !args.widget_id && IFRAME_TAB_ACTIONS.indexOf(args.action) !== -1);
     if (_needsTab) {
@@ -977,8 +981,12 @@ async function _executeIframeToolImpl(args, _ifChatId, options, _ifTabId) {
                     result.appliedEdits = editResult.appliedEdits.length;
                     // PER-TURN RENDER: show the edited version at this turn of the
                     // ISSUING chat (core/135-widget-store.js recordWidgetRender).
-                    var _erChatId = (options && options.chatId) || activeStreamingChatId || currentChatId;
-                    var _er = result.deduplicated ? null : recordWidgetRender(_erChatId, widgetId, result.version, options);
+                    // Nested callers never fall back to the foreground/streaming
+                    // chat; without a chat the (already saved) edit just skips
+                    // the per-turn render record.
+                    var _erNested = !!(options && (options.fromSandbox || options.fromWidget || options.parentToolCallId));
+                    var _erChatId = (options && options.chatId) || (_erNested ? null : (activeStreamingChatId || currentChatId));
+                    var _er = (result.deduplicated || !_erChatId) ? null : recordWidgetRender(_erChatId, widgetId, result.version, options);
                     // Durable via the SW mirror (worker/120-tool-routing.js).
                     if (_er) result._widget_render = Object.assign({ chatId: _erChatId }, _er);
                 }

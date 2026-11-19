@@ -177,7 +177,13 @@ async function executeStartChat(args, options) {
             createdAt: Date.now(),
             updatedAt: Date.now(),
             originWidgetInstanceId: originInstanceId,
-            sourceChatId: options.chatId || ((typeof currentChatId !== 'undefined') ? currentChatId : null) || null
+            // Nested callers (widget bridge / sandbox) link only their OWN chat;
+            // unresolved → no origin link rather than the foreground chat.
+            // OPTIONAL: a new chat needs no source, so an unresolved owner never
+            // blocks start_chat (the SW guard in worker/120-tool-routing.js
+            // exempts it) — the chat is simply created without a back-link.
+            sourceChatId: options.chatId || ((options.fromSandbox || options.fromWidget || options.parentToolCallId) ? null
+                : ((typeof currentChatId !== 'undefined') ? currentChatId : null)) || null
         };
         // Same provisional-title helper sendMessage() uses (app/040-send-message.js
         // → ui/260-content-format.js:82). No-op when explicitTitle was set: the

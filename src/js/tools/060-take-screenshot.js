@@ -315,9 +315,15 @@ async function _ssCaptureSplitPaneInPlace(args, maxWidth, callerChatId) {
 // target 'browser' and 'element' REQUIRE an explicit args.tab_id (no active-tab or
 // chat-stored fallback). The extension's own tab is a valid target.
 async function executeTakeScreenshot(args, options) {
-    var _ssChatId = (options && options.chatId && typeof chats !== 'undefined' && chats[options.chatId])
-        ? options.chatId
-        : ((typeof currentChatId !== 'undefined') ? currentChatId : undefined);
+    // A given options.chatId is kept even when the chats mirror lacks it (cold /
+    // evicted chat): falling back to currentChatId attributed a worker's
+    // capture to the foreground chat. Only ABSENT, non-nested calls fall back.
+    var _ssNested = !!(options && (options.fromSandbox || options.fromWidget || options.parentToolCallId));
+    var _ssChatId = (options && options.chatId) ? options.chatId
+        : (_ssNested ? null : ((typeof currentChatId !== 'undefined') ? currentChatId : undefined));
+    if (_ssChatId && typeof chats !== 'undefined' && !chats[_ssChatId] && typeof ensureChatPayloads === 'function') {
+        try { await ensureChatPayloads(_ssChatId); } catch (e) {}
+    }
     var target = args.target;
     var widgetId = args.widget_id;
     var selector = args.selector;
@@ -340,7 +346,10 @@ async function executeTakeScreenshot(args, options) {
     // reuse the widget branch below (temp tab / offscreen re-render), which lost
     // the pane's width, scroll, typed input, pill and progress card.
     if (target === 'split_widget') {
-        return await _ssCaptureSplitPaneInPlace(args, maxWidth, (options && options.chatId) || _ssChatId);
+        // Only a NESTED caller without a chat is refused; top-level calls keep
+        // the prior behaviour (pane lookup handles an unknown chat itself).
+        if (_ssNested && !_ssChatId) return { success: false, code: 'CHAT_UNRESOLVED', error: 'take_screenshot split_widget: the calling chat could not be identified (nested call without chatId); refusing to capture another chat\'s pane.' };
+        return await _ssCaptureSplitPaneInPlace(args, maxWidth, _ssChatId);
     }
 
     var _ssTabId = null;

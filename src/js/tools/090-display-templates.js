@@ -18,6 +18,20 @@ function executeDisplay(args, messageIndex, options) {
     var generator = DISPLAY_GENERATORS[template];
     if (!generator) return { success: false, error: 'Unknown template: ' + template + '. Available: ' + Object.keys(DISPLAY_GENERATORS).join(', ') };
 
+    // Which chat owns the display. An explicit options.chatId always wins. A
+    // NESTED call (fromSandbox / fromWidget / parentToolCallId) must never guess
+    // from activeStreamingChatId / currentChatId: with a sub-agent running next
+    // to a foreground chat those name the WRONG chat. Fail closed, same as
+    // executeHtmlWidget (tools/080-widget-tools.js). Top-level calls keep the
+    // legacy fallback.
+    var _nestedDisplayCall = !!(options && (options.fromSandbox || options.fromWidget || options.parentToolCallId));
+    var chatId = (options && options.chatId) || (_nestedDisplayCall ? null
+        : ((typeof activeStreamingChatId !== 'undefined' && activeStreamingChatId)
+            || (typeof currentChatId !== 'undefined' ? currentChatId : null))) || null;
+    if (!chatId && _nestedDisplayCall) {
+        return { success: false, code: 'CHAT_UNRESOLVED', error: 'display: the calling chat could not be identified (nested call without chatId); the display was not created to avoid attaching it to another chat.' };
+    }
+
     // FLUX-QW7: allocate the id BEFORE generating so stateful templates
     // (checklist) can embed it and address their persisted state later.
     var displayId = 'dsp_' + (++_displayIdCounter) + '_' + Date.now();
@@ -27,7 +41,6 @@ function executeDisplay(args, messageIndex, options) {
     _displayStore[displayId] = { template: template, args: args, html: html };
 
     // Persist on chat for re-render
-    var chatId = (options && options.chatId) || activeStreamingChatId || currentChatId;
     var chat = chats[chatId];
     // Eager-render path: attach the display to a tool_result slot so the
     // renderer emits it alongside that result (same shape as html_widget),

@@ -10,19 +10,23 @@ function extractFn(src, name) {
     return src.slice(f.start, f.end);
 }
 
-var FNS = ['snTimeoutMs', 'snWithTimeout', 'snFetchWithTimeout', 'snProbeTabTokenUser', 'snFetchUserName', 'snFetchUserRoles', 'snCollectTabTokens',
+var FNS = ['snTimeoutMs', 'snWithTimeout', 'snInjectBounded', 'snFetchWithTimeout', 'snLoginProbeState', 'snLoginLooksSignedIn', 'snStrictTokenOk', 'snTokenAccepted', 'snProbeTabTokenUser', 'snFetchUserName', 'snFetchUserRoles', 'snCollectTabTokens',
     'snPickTabToken', 'snResolveInstanceSession', 'snRememberInstanceToken', 'snUpdateInstanceTokens',
-    'snGetInstancesDetailed', 'snGetTokenForInstance', 'handleRefreshToken'];
+    'snGetInstancesDetailed', 'snInjectTabScripts', 'snTabsForOrigin', 'snNotConnectedError', 'snGetTokenForInstance', 'snGetTokenForInstanceUnbounded', 'handleRefreshToken'];
 
 // world: { tabs: [{id, origin, token, userName}], valid: [tokens], cache: {origin: {token}} }
 async function build(world) {
     var src = await loadFile('src/platform/extension/background.js');
     var store = { instanceTokens: world.cache || {}, instanceUrl: world.instanceUrl };
     var calls = [];
+    var touched = [];   // tab ids any executeScript targeted
     var chrome = {
+        tabs: { query: async function() { return world.tabs.filter(function(t) { return !t.closed; }).map(function(t) { return { id: t.id, url: t.origin + '/', title: 't', discarded: !!t.discarded }; }); } },
         scripting: { executeScript: async function(o) {
+            touched.push(o.target.tabId);
             var t = world.tabs.filter(function(x) { return x.id === o.target.tabId; })[0];
             if (!t || t.closed) throw new Error('No tab with id');
+            if (t.frozen) return new Promise(function() {});
             return [{ result: { token: t.token, userName: t.userName || '' } }];
         } },
         storage: { local: {
@@ -35,6 +39,7 @@ async function build(world) {
     var fetch = async function(url, opts) {
         var tok = opts.headers['X-UserToken'];
         calls.push(tok);
+        if (world.fetchHangs) return new Promise(function() {});
         var ok = world.valid.indexOf(tok) !== -1;
         // rolesStatus: {token: status} — a VALID token whose sys_user_has_role read is
         // refused for a non-auth reason (403 ACL, 429, 5xx); rolesThrow: network error.
@@ -50,16 +55,53 @@ async function build(world) {
     var getSnTabList = async function() {
         return world.tabs.map(function(t) { return { id: t.id, origin: t.origin, url: t.origin + '/', title: 't' }; });
     };
-    var body = 'var _snInstanceTokensQueue = Promise.resolve();\n' + FNS.map(function(n) { return extractFn(src, n); }).join('\n') +
+    var body = 'var _snInstanceTokensQueue = Promise.resolve();\nvar snTabs = new Map();\nvar SN_TOKEN_LOOKUP_DEADLINE_MS = 5000;\nvar _snTokenCheckCache = new Map();\nvar SN_TOKEN_CHECK_TTL_MS = 30000;\nfunction injectInterceptors() { return Promise.resolve(); }\n' + FNS.map(function(n) { return extractFn(src, n); }).join('\n') +
         '\nreturn { detailed: snGetInstancesDetailed, forInstance: snGetTokenForInstance, pick: snPickTabToken, refresh: handleRefreshToken, remember: snRememberInstanceToken, update: snUpdateInstanceTokens };';
-    var mk = new Function('chrome', 'fetch', 'getSnTabList', 'snMaintEligible', 'snDetectMaint', body);
+    var mk = new Function('chrome', 'fetch', 'getSnTabList', 'snMaintEligible', 'snDetectMaint', 'self', body);
     var api = mk(chrome, fetch, getSnTabList, world.maint ? function(roles, ok, name) { return ok && !roles.length && !name; } : undefined,
-        world.maint ? async function(u, t) { return world.valid.indexOf(t) !== -1; } : undefined);
-    api.store = store; api.calls = calls;
+        world.maint ? async function(u, t) { return world.valid.indexOf(t) !== -1; } : undefined, world.self || {});
+    api.store = store; api.calls = calls; api.touched = touched;
     return api;
 }
 
 var O = 'https://dev1.service-now.com';
+
+describe('token lookup after session expiry (v1.1.43 hang)', function() {
+    var OTHER = 'https://other.service-now.com';
+    test('only OTHER-instance tabs (one frozen): fails fast with session-expired, never touches them', async function() {
+        var a = await build({ tabs: [{ id: 7, origin: OTHER, token: 'foreign', userName: 'bob' }, { id: 8, origin: OTHER, frozen: true }], valid: ['foreign'] });
+        var t0 = Date.now();
+        var r = await a.forInstance(O);
+        var ms = Date.now() - t0;
+        assert.ok(ms < 5000, 'lookup returned in ' + ms + 'ms');
+        assert.strictEqual(r.token, '', 'never hands out another instance\'s token');
+        assert.ok(!r.userName, 'never hands out another instance\'s user');
+        assert.ok(/session expired/i.test(r.error) && r.error.indexOf('log in to ' + O) !== -1, r.error);
+        assert.deepStrictEqual(a.touched, [], 'no probe/injection into foreign tabs');
+        assert.deepStrictEqual(a.calls, [], 'no request with a foreign token');
+    }, { tags: ['unit'], timeout: 6000 });
+
+    test('frozen tab of the target: probed in parallel with a healthy sibling, bounded', async function() {
+        var a = await build({ self: { __snTimeouts: { tab: 100, fetch: 100 } }, tabs: [{ id: 1, origin: O, frozen: true }, { id: 2, origin: O, frozen: true }, { id: 3, origin: O, token: 'good', userName: 'admin' }, { id: 9, origin: OTHER, frozen: true }], valid: ['good'] });
+        var t0 = Date.now();
+        var r = await a.forInstance(O);
+        assert.strictEqual(r.token, 'good');
+        assert.ok(Date.now() - t0 < 1000, 'parallel probes: ~1 tab timeout, not N');
+        assert.ok(a.touched.indexOf(9) === -1, 'foreign frozen tab untouched');
+    }, { tags: ['unit'], timeout: 3000 });
+
+    test('whole lookup is capped even when validation hangs', async function() {
+        var a = await build({ fetchHangs: true, tabs: [], valid: [], cache: { 'https://dev1.service-now.com': { token: 'cached' } } });
+        var t0 = Date.now();
+        var r = await (async function() { return a.forInstance(O, { validate: true, deadlineMs: 200 }); })();
+        assert.ok(Date.now() - t0 < 1000);
+        assert.strictEqual(r.token, '');
+        assert.strictEqual(r.timedOut, true);
+        assert.ok(/log in to/.test(r.error));
+        var src = await loadFile('src/platform/extension/background.js');
+        assert.ok(/var SN_TOKEN_LOOKUP_DEADLINE_MS = 5000;/.test(src), 'default whole-lookup cap is 5s');
+    }, { tags: ['unit'], timeout: 3000 });
+});
 
 describe('stale-tab instance auth', function() {
     test('single healthy tab: connected, no extra validation request', async function() {
@@ -176,11 +218,21 @@ describe('stale-tab instance auth', function() {
     test('SW shim 401 refresh delegates to the multi-tab probe with excludeToken', async function() {
         var src = await loadFile('src/js/worker/010-platform-stub.js');
         var seen = null;
-        var fn = new Function('self', 'Platform', extractFn(src, '_freshTokenAfter401') + '\nreturn _freshTokenAfter401;')(
+        var fn = new Function('self', 'Platform', 'var SN_TOKEN_PROBE_DEADLINE_MS = 30000;\n' + extractFn(src, '_probeWithDeadline') + '\n' + extractFn(src, '_freshTokenAfter401') + '\nreturn _freshTokenAfter401;')(
             { snGetTokenForInstance: async function(u, o) { seen = [u, o]; return { token: 'good' }; } },
             { instanceUrl: O, getTokenForInstance: async function() { return 'dead'; } });
         assert.strictEqual(await fn('dead'), 'good');
         assert.deepStrictEqual(seen, [O, { excludeToken: 'dead' }]);
+    }, { tags: ['unit'], timeout: 5000 });
+
+    test('SW shim 401 refresh: a hung tab probe returns "" at the deadline', async function() {
+        var src = await loadFile('src/js/worker/010-platform-stub.js');
+        var fn = new Function('self', 'Platform', 'var SN_TOKEN_PROBE_DEADLINE_MS = 30000;\n' + extractFn(src, '_probeWithDeadline') + '\n' + extractFn(src, '_freshTokenAfter401') + '\nreturn _freshTokenAfter401;')(
+            { __snProbeDeadlineMs: 40, snGetTokenForInstance: function() { return new Promise(function() {}); } },
+            { instanceUrl: O });
+        var t0 = Date.now();
+        assert.strictEqual(await fn('dead'), '');
+        assert.ok(Date.now() - t0 < 2000, 'bounded by the probe deadline');
     }, { tags: ['unit'], timeout: 5000 });
 });
 
@@ -207,6 +259,7 @@ async function buildHeartbeat(world) {
     };
     var getSnTabList = async function() { return world.tabs.map(function(t) { return { id: t.id, origin: t.origin }; }); };
     var body = 'var _snInstanceTokensQueue = Promise.resolve();\n' + extractFn(src, 'snUpdateInstanceTokens') + '\n' +
+        ['snTimeoutMs', 'snWithTimeout', 'snInjectBounded'].map(function(n) { return extractFn(src, n); }).join('\n') + '\n' +
         extractFn(src, 'heartbeatAllInstances') + '\nreturn heartbeatAllInstances;';
     var run = new Function('chrome', 'fetch', 'getSnTabList', body)(chrome, fetch, getSnTabList);
     return { run: run, store: store, pings: pings };
@@ -249,7 +302,7 @@ describe('heartbeat with a session-timed-out tab', function() {
 });
 
 // SW Platform stub: the real 010-platform-stub.js evaluated with fake chrome/self.
-async function buildStub(worker, probe) {
+async function buildStub(worker, probe, opts) {
     var src = await loadFile('src/js/worker/010-platform-stub.js');
     var stored = { sessionToken: worker, instanceUrl: O };
     var sets = [];
@@ -263,7 +316,7 @@ async function buildStub(worker, probe) {
     };
     var self = { fetch: async function() { return { status: 200 }; },
         snGetInstancesDetailed: async function() { return probe; },
-        snGetTokenForInstance: async function() { return { token: 'probed' }; } };
+        snGetTokenForInstance: (opts && opts.forInstance) || async function() { return { token: 'probed' }; } };
     var api = new Function('Platform', 'chrome', 'self', src + '\nreturn { P: Platform, tok: function() { return _workerSessionToken; } };')(null, chrome, self);
     await api.P.ready; await new Promise(function(r) { setTimeout(r, 0); });
     api.sets = sets;   // includes the boot-time refreshInstances (Platform.ready)
@@ -290,10 +343,54 @@ describe('SW Platform stub adopts the probed healthy token', function() {
         var s = await buildStub('good', [{ url: O, token: 'good', roles: ['admin'], sessionOk: true, tabs: [] }]);
         await s.P.refreshInstances();
         assert.deepStrictEqual(s.sets, []);
-        var s2 = await buildStub('held', [{ url: O, token: '', roles: [], sessionOk: false, tabs: [] }]);
+        // Open but unreadable tab (Memory Saver discard): the held session is restored.
+        var s2 = await buildStub('held', [{ url: O, token: '', roles: [], sessionOk: false, tabs: [{ id: 1 }] }]);
         var list = await s2.P.refreshInstances();
         assert.strictEqual(list[0].token, 'held');
         assert.strictEqual(await s2.P.getTokenForInstance(O), 'held');
+    }, { tags: ['unit'], timeout: 5000 });
+});
+
+describe('SW Platform stub never resurrects a dead worker token', function() {
+    test('no open tab: active instance listed disconnected (token not restored)', async function() {
+        var s = await buildStub('held', [{ url: O, token: '', roles: [], sessionOk: false, tabs: [] }]);
+        var list = await s.P.refreshInstances();
+        assert.strictEqual(list[0].token, '', 'tab-less held token is not reported connected');
+        assert.deepStrictEqual(s.sets, [], 'unproven (not 401) token is not dropped from storage');
+    }, { tags: ['unit'], timeout: 5000 });
+
+    test('active origin absent from the probe: listed with an empty token', async function() {
+        var s = await buildStub('held', []);
+        var list = await s.P.refreshInstances();
+        assert.strictEqual(list.length, 1);
+        assert.strictEqual(list[0].url, O);
+        assert.strictEqual(list[0].token, '');
+    }, { tags: ['unit'], timeout: 5000 });
+
+    test('held token 401-rejected by the probe: dropped in memory AND storage', async function() {
+        var s = await buildStub('dead', [{ url: O, token: '', roles: [], sessionOk: false, tabs: [{ id: 1 }], rejectedTokens: ['dead'] }]);
+        var list = await s.P.refreshInstances();
+        assert.strictEqual(list[0].token, '');
+        assert.strictEqual(s.tok(), '');
+        assert.deepStrictEqual(s.sets[s.sets.length - 1], { sessionToken: '' });
+    }, { tags: ['unit'], timeout: 5000 });
+
+    test('open tab answered signed out (sawOpenTab, empty g_ck): dropped', async function() {
+        var s = await buildStub('dead', [{ url: O, token: '', roles: [], sessionOk: false, tabs: [{ id: 1 }], sawOpenTab: true }]);
+        await s.P.refreshInstances();
+        assert.strictEqual(s.tok(), '');
+    }, { tags: ['unit'], timeout: 5000 });
+
+    test('refreshTokenAfter401 with no replacement drops + persists; a newer token is never clobbered', async function() {
+        var s = await buildStub('good', [{ url: O, token: 'good', roles: ['admin'], sessionOk: true, tabs: [{ id: 1 }] }],
+            { forInstance: async function() { return null; } });
+        await s.P.refreshInstances();
+        assert.strictEqual(await s.P.refreshTokenAfter401(O, 'good'), '');
+        assert.strictEqual(s.tok(), '');
+        assert.deepStrictEqual(s.sets[s.sets.length - 1], { sessionToken: '' });
+        var s2 = await buildStub('newer', [], { forInstance: async function() { return null; } });
+        await s2.P.refreshTokenAfter401(O, 'older');
+        assert.strictEqual(s2.tok(), 'newer', 'drop only targets the token that failed');
     }, { tags: ['unit'], timeout: 5000 });
 });
 
@@ -368,7 +465,7 @@ describe('roles read refused for a non-auth reason still adopts the working toke
         assert.strictEqual(s2.tok(), 'held');
     }, { tags: ['unit'], timeout: 5000 });
 
-    test('every token 401: nothing adopted, worker token kept', async function() {
+    test('every token 401: nothing adopted, the 401d worker token dropped', async function() {
         var a = await build({ tabs: DEAD_THEN_GOOD.map(function(t) { return { id: t.id, origin: O, token: t.id === 1 ? 'd1' : 'd2', userName: 'admin' }; }), valid: [] });
         var d = await a.detailed();
         assert.strictEqual(d[0].token, '');
@@ -376,15 +473,15 @@ describe('roles read refused for a non-auth reason still adopts the working toke
         assert.deepStrictEqual(d[0].rejectedTokens, ['d1', 'd2']);
         var s = await buildStub('d1', d);
         await s.P.refreshInstances();
-        assert.strictEqual(s.tok(), 'd1');
-        assert.deepStrictEqual(s.sets, []);
+        assert.strictEqual(s.tok(), '');
+        assert.deepStrictEqual(s.sets, [{ sessionToken: '' }]);
     }, { tags: ['unit'], timeout: 5000 });
 
     test('a 401-rejected token is never adopted, even if flagged sessionOk', async function() {
         var s = await buildStub('dead', [{ url: O, token: 'x', roles: [], sessionOk: true, rejectedTokens: ['dead', 'x'], tabs: [] }]);
         await s.P.refreshInstances();
-        assert.strictEqual(s.tok(), 'dead');
-        assert.deepStrictEqual(s.sets, []);
+        assert.strictEqual(s.tok(), '', 'held token was 401d: dropped, x not adopted');
+        assert.deepStrictEqual(s.sets, [{ sessionToken: '' }]);
     }, { tags: ['unit'], timeout: 5000 });
 
     test('single healthy tab with a 403 roles read: one request, no extra validation', async function() {
@@ -408,7 +505,7 @@ async function buildValidate(valid, recoverWith) {
         storage: { local: { set: function(o) { Object.assign(stored, o); } } }
     };
     var origFetch = { call: function(_w, url, opts) { var t = opts.headers['X-UserToken']; pings.push(t); return Promise.resolve({ status: valid.indexOf(t) !== -1 ? 200 : 401 }); } };
-    var body = 'var _snStatusState = "";\n' + extractFn(src, '_adoptRecoveredToken') + '\n' + extractFn(src, 'validateToken') +
+    var body = 'var _snStatusState = "";\n' + extractFn(src, '_sendMessageBounded') + '\n' + extractFn(src, '_adoptRecoveredToken') + '\n' + extractFn(src, 'validateToken') +
         '\nreturn { run: validateToken, state: function() { return _snStatusState; } };';
     var api = new Function('window', 'chrome', 'Platform', '_origFetch', 'updateSnStatus', body)(w, chrome, { instanceUrl: O }, origFetch, function() {});
     api.w = w; api.stored = stored; api.msgs = msgs; api.pings = pings;

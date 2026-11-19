@@ -52,8 +52,22 @@ function widgetApplySlotsToHtml(html, slots) {
 
 async function executeHtmlWidget(args, messageIndex, options) {
     options = options || {};
-    var widgetChatId = options.chatId || activeStreamingChatId || currentChatId;
-    var chat = chats[widgetChatId];
+    // Which chat a widget save / split auto-open belongs to. An explicit
+    // options.chatId always wins. A NESTED call (js_eval / skill sandbox, widget
+    // bridge, or an internal tool such as get_file's download card — anything
+    // carrying fromSandbox / fromWidget / parentToolCallId) must never guess from
+    // the activeStreamingChatId / currentChatId globals: with a sub-agent running
+    // alongside a foreground chat those name the WRONG chat, so the widget and the
+    // split pane landed in that other chat. Unresolved -> fail closed below.
+    // Plain top-level foreground calls keep the legacy fallback.
+    var _nestedWidgetCall = !!(options.fromSandbox || options.fromWidget || options.parentToolCallId);
+    var widgetChatId = options.chatId || (_nestedWidgetCall ? null
+        : ((typeof activeStreamingChatId !== 'undefined' && activeStreamingChatId)
+            || (typeof currentChatId !== 'undefined' ? currentChatId : null))) || null;
+    if (!widgetChatId && args.action !== 'list' && args.action !== 'read' && args.action !== 'export') {
+        return { success: false, code: 'CHAT_UNRESOLVED', error: 'html_widget: the calling chat could not be identified (nested call without chatId); the widget was not saved or opened to avoid attaching it to another chat.' };
+    }
+    var chat = widgetChatId ? chats[widgetChatId] : null;
     try { await WidgetStore.init(); } catch (e) { return { success: false, code: 'STORAGE_ERROR', error: e.message }; }
     if (args.action === 'list') return { success: true, widgets: WidgetStore.list() };
     if (args.create_new && args.widget_id) return { success: false, error: 'Choose widget_id OR create_new, not both' };
@@ -186,7 +200,7 @@ async function executeHtmlWidget(args, messageIndex, options) {
         // A NEW widget ALWAYS auto-opens in the split pane unless the chat
         // family already shows a widget there (never replace it). A previous
         // user close does not suppress this.
-        if (typeof openSplitViewForWidget === 'function' && !widgetSplitPaneBusy(widgetChatId)) {
+        if (widgetChatId && typeof openSplitViewForWidget === 'function' && !widgetSplitPaneBusy(widgetChatId)) {
             try { openSplitViewForWidget(widgetId, widgetChatId, { openedBy: 'agent' }); } catch (e) {}
         }
     }
@@ -644,7 +658,20 @@ function buildWidgetViewHeaderHtml(widget, surface) {
         '</div>';
 }
 
-function openWidgetFullscreen(widgetId, event) {
+function openWidgetFullscreen(widgetId, event, originChatId) {
+    // The chat VIEW this overlay was opened from (split pane or inline in
+    // #messages), read BEFORE anything closes: the widget bridge
+    // (ui/070-dashboard-ui.js _widgetOwnerChatId) attributes the fullscreen
+    // render's tool calls to it. Unknown (sidebar, library, programmatic) →
+    // unset, so the bridge falls back to the widget record's origin chat.
+    var _fsChat = originChatId || null;
+    var _fsT = event && event.target;
+    if (!_fsChat && _fsT && typeof _fsT.closest === 'function') {
+        var _fsPane = _fsT.closest('#split-widget-pane');
+        if (_fsPane) _fsChat = (_fsPane.dataset && _fsPane.dataset.chatId) || null;
+        else if (_fsT.closest('#messages') && (typeof currentView === 'undefined' || currentView === 'chat')
+            && typeof currentChatId !== 'undefined' && currentChatId) _fsChat = currentChatId;
+    }
     if (event) {
         event.stopPropagation();
         event.preventDefault();
@@ -660,6 +687,7 @@ function openWidgetFullscreen(widgetId, event) {
     var overlay = document.createElement('div');
     overlay.className = 'widget-fullscreen-overlay';
     overlay.id = 'widget-fullscreen-overlay';
+    if (_fsChat) overlay.dataset.chatId = _fsChat;
     
     var modal = document.createElement('div');
     modal.className = 'widget-fullscreen-modal';

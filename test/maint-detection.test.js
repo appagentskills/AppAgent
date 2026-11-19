@@ -106,7 +106,9 @@ describe('maint detection', function() {
         assert.strictEqual(bg.indexOf('function snDetectMaint'), -1, 'no local copy — uses the shared helper');
         // Start at the timeout helpers (snTimeoutMs / snWithTimeout / snFetchWithTimeout)
         // that the tab probe + fetches now depend on.
-        var src = between(bg, '// Bound a probe promise', '// Probe a fresh g_ck for a specific instance URL');
+        var EXm = await runFile('test/extract.js', { i18n: false });
+        var src = between(bg, '// Bound a probe promise', '// Probe a fresh g_ck for a specific instance URL') + '\n' +
+            EXm.extractFunctions(bg, ['snLoginProbeState', 'snLoginLooksSignedIn']);
         assert.ok(src.indexOf('// Probe one tab for { token, userName }') !== -1, 'probe section included');
         async function run(o, userName) {
             var f = await mods([], router(o));

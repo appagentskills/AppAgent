@@ -574,7 +574,12 @@ function _widgetOperationScopeId(chatId) {
 // continued chats (root === self) get exactly the old key.
 async function widgetOperationId(args, options, probe) {
     var id = args.operation_id || options && options.toolCallId;
-    var chatId = String(options && options.chatId || currentChatId || 'widget');
+    // Nested callers (sandbox / widget bridge / internal) never key their
+    // operation on the streaming/foreground chat (mirrors executeHtmlWidget).
+    var _woNested = !!(options && (options.fromSandbox || options.fromWidget || options.parentToolCallId));
+    var chatId = String((options && options.chatId) || (_woNested ? null
+        : ((typeof activeStreamingChatId !== 'undefined' && activeStreamingChatId)
+            || (typeof currentChatId !== 'undefined' && currentChatId))) || 'widget');
     var own = chatId + ':' + (id || crypto.randomUUID());
     var root = _widgetOperationScopeId(chatId);
     if (!id || root === chatId || !probe || !probe.data || typeof WidgetStore === 'undefined' || typeof WidgetStore.hasOperation !== 'function') return own;

@@ -194,12 +194,15 @@ async function runWidgetEvalTests(sources) {
     var pickerApi = new Function('document', 'WidgetStore', 'injectWidgetBridge', 'writeWidgetHtml', pickerSource + '\nreturn {attach:attachWidgetVersionPicker,select:selectWidgetRenderVersion,refresh:refreshWidgetVersionViews,frames:widgetVersionFrames};')(
         dlDoc, pickerStore, function(html) { return html; }, function() { return mount.apply(null, arguments); });
     var mountSource = dashboardSource.slice(dashboardSource.indexOf('function writeWidgetHtml('), dashboardSource.indexOf('function renderWidgetContent('));
-    var mount = new Function('window', 'document', 'registerWidgetInstance', 'unregisterWidgetInstance', 'injectWidgetTokens', 'widgetInstanceForIframe', 'executeTool', 'currentChatId', 'attachWidgetVersionPicker', mountSource + '\nreturn writeWidgetHtml;')(
+    var mount = new Function('window', 'document', 'registerWidgetInstance', 'unregisterWidgetInstance', 'injectWidgetTokens', 'widgetInstanceForIframe', 'executeTool', 'currentChatId', 'attachWidgetVersionPicker', 'WidgetStore', 'chats', mountSource + '\nreturn writeWidgetHtml;')(
         dlPage, dlDoc, live.register, live.unregister, function(html) { return html; }, live.lookup,
         function(name, args, unused, options) {
             assert(name === 'start_chat', 'deep-link dispatch uses start_chat');
             var promise = start(args, options); launches.push(promise); return promise;
-        }, 'origin', pickerApi.attach);
+        // Deep-link renders are outside #messages / the split pane, so the bridge
+        // resolves the owner from the widget record (never the page's currentChatId).
+        // The record's origin chat must still exist (ui/070 _widgetOwnerChatId).
+        }, 'not-the-owner', pickerApi.attach, { view: function(id) { return id === 'widget_same' ? { chatId: 'origin' } : null; } }, { origin: { id: 'origin' } });
     var snapshot = { widgetId: 'widget_same', html: '<div>Static snapshot</div>' };
     var initDeepLink = new (Object.getPrototypeOf(async function() {}).constructor)('urlParams', 'getWidgetById', 'dashboardWidgets', 'document', 'window', 'injectWidgetBridge', 'writeWidgetHtml', 'chrome', deepLinkSource);
     async function openDeepLink(staticSnapshot) {

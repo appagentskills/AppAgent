@@ -750,7 +750,9 @@ async function lfShareFile(folder, path, opts) {
     if (opts.card !== false && share) {
         // A failed card never loses the file_id / download_url below.
         var r = null;
-        try { r = await share({ id: id, download: true }, null, { meta: { name: st.name, mime: st.mime, size: st.size } }); }
+        // opts.toolOptions = the caller's dispatch options (chatId): the card
+        // must land in the calling chat, never the foreground one.
+        try { r = await share({ id: id, download: true }, opts.toolOptions || null, { meta: { name: st.name, mime: st.mime, size: st.size } }); }
         catch (e) { r = { success: false, error: (e && e.message) || String(e) }; }
         if (r && r.success) { out.download_url = r.download_url; if (r.widgetId) out.widgetId = r.widgetId; }
         else out.share_error = (r && r.error) || 'download card unavailable';
@@ -778,7 +780,7 @@ async function executeLocalFolder(args, options) {
         if (action === 'grep') return Object.assign({ success: true }, await lfGrep(args.folder, args.path, args.pattern, { ignore_case: args.ignore_case, limit: args.limit }));
         if (action === 'mkdir') { await lfMkdir(args.folder, args.path); return { success: true, path: lfNormalizePath(args.path) }; }
         if (action === 'delete') { await lfDeleteEntry(args.folder, args.path, !!args.recursive); return { success: true, deleted: lfNormalizePath(args.path) }; }
-        if (action === 'share') return Object.assign({ success: true, folder: LOCAL_FOLDER_VIRTUAL_ID, path: lfNormalizePath(args.path) }, await lfShareFile(args.folder, args.path));
+        if (action === 'share') return Object.assign({ success: true, folder: LOCAL_FOLDER_VIRTUAL_ID, path: lfNormalizePath(args.path) }, await lfShareFile(args.folder, args.path, { toolOptions: options }));
         if (action === 'read') {
             var wantB64 = args.encoding === 'base64';
             var st = await lfStatFile(args.folder, args.path);
@@ -834,7 +836,7 @@ async function executeLocalFolder(args, options) {
             // opts js_eval/widget callers in). A failed share never fails the write.
             if (lfIsVirtualFolderRef(args.folder) && args.share !== false) {
                 var card = args.share === true || !lfIsProgrammaticCaller(options);
-                try { Object.assign(wout, await lfShareFile(args.folder, w.path, { card: card }), { size: w.size }); }
+                try { Object.assign(wout, await lfShareFile(args.folder, w.path, { card: card, toolOptions: options }), { size: w.size }); }
                 catch (se) { wout.share_error = (se && se.message) || String(se); }
             }
             return wout;

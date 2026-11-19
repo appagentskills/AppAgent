@@ -164,7 +164,11 @@ function _hydrateApprovalChatThen(chatId, retryFn, giveUpFn) {
 function showToolApprovalPrompt(displayName, args, permissionKey, toolCallId, actualToolName, targetChatId, options) {
     options = options || {};
     return new Promise(function(resolve) {
-        // Use targetChatId if provided (for background streaming), otherwise currentChatId
+        // Use targetChatId if provided (for background streaming), otherwise
+        // currentChatId — top-level only: a nested caller (sandbox / widget /
+        // internal) without a chat is denied, never prompted in the foreground.
+        var _tapNested = !!(options.fromSandbox || options.fromWidget || options.parentToolCallId);
+        if (!targetChatId && _tapNested) { resolve(false); return; }
         var chatId = targetChatId || currentChatId;
         var chat = chats[chatId];
         // Unknown chatId: likely the boot replay race (chats not hydrated
@@ -293,6 +297,8 @@ function showToolApprovalPrompt(displayName, args, permissionKey, toolCallId, ac
 function showToolApprovalPromptBatch(displayName, args, permissionKey, toolCallId, actualToolName, targetChatId, options) {
     options = options || {};
     return new Promise(function(resolve) {
+        var _tapbNested = !!(options.fromSandbox || options.fromWidget || options.parentToolCallId);
+        if (!targetChatId && _tapbNested) { resolve(false); return; }
         var chatId = targetChatId || currentChatId;
         var chat = chats[chatId];
         // Same guard as showToolApprovalPrompt: wait for chat hydration

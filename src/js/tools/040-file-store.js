@@ -377,8 +377,10 @@ function _chatFileIdsSync(chatId, role) {
     return out;
 }
 
-// _internal (3rd param, never reachable from tool args — the dispatcher in
-// tools/020-tool-execution.js calls executeGetFile(args) only): in-process
+// _options: the dispatcher's tool options (chatId / toolCallId / sandbox ctx),
+// forwarded so the download card lands in the CALLING chat (see
+// fileStoreCardToolOptions). _internal (3rd param, never reachable from tool
+// args — the dispatcher passes only (args, options)): in-process
 // callers such as local_folder share pass { meta: {name, mime, size} }.
 async function executeGetFile(args, _options, _internal) {
     var id = args.id;
@@ -477,7 +479,11 @@ async function executeGetFile(args, _options, _internal) {
         // Route via executeTool so SW context routes the widget render to a
         // panel executor (executeHtmlWidget lives in tools/080-widget-tools.js,
         // page-only). The worker tool-routing wrapper handles the dispatch.
-        var _dlWidget = await executeTool('html_widget', { title: '\u2B07\uFE0F ' + fname, html: _dlHtml, height: 'auto', width: '320px' });
+        // Pass the CALLING chat explicitly: without options the SW router and
+        // executeHtmlWidget fell back to activeStreamingChatId/currentChatId,
+        // so a sub-agent's download card (get_file download / local_folder
+        // write+share) was saved into — and split-opened in — another chat.
+        var _dlWidget = await executeTool('html_widget', { title: '\u2B07\uFE0F ' + fname, html: _dlHtml, height: 'auto', width: '320px' }, undefined, fileStoreCardToolOptions(_options));
 
         var _dlResult = {
             success: true,
@@ -490,6 +496,10 @@ async function executeGetFile(args, _options, _internal) {
             height: file.height || undefined
         };
         if (_dlWidget && _dlWidget.widgetId) _dlResult.widgetId = _dlWidget.widgetId;
+        // Card refused (e.g. CHAT_UNRESOLVED) or failed: the file is still
+        // downloadable via download_url, but say why no card was rendered
+        // instead of silently omitting widgetId.
+        else _dlResult.card_error = (_dlWidget && (_dlWidget.error || _dlWidget.code)) || 'download card was not created';
         return _dlResult;
     }
 
@@ -579,6 +589,21 @@ async function executeGetFile(args, _options, _internal) {
     }
 
     return result;
+}
+
+// Nested-call options for the auto download card: the caller's chat, marked
+// as a nested dispatch (fromSandbox) bound to the caller's tool_result slot.
+// No own toolCallId (the SW/page dedup would collide with the get_file call).
+// With no known chatId the card is refused by executeHtmlWidget, never guessed
+// (surfaced to the caller as card_error). Defined AFTER executeGetFile so the
+// test harness slice (executeGetFile .. next section banner) includes it.
+function fileStoreCardToolOptions(options) {
+    options = options || {};
+    return {
+        chatId: options.chatId || null,
+        fromSandbox: true,
+        parentToolCallId: options.parentToolCallId || options.toolCallId || 'file_card'
+    };
 }
 
 // =============================================

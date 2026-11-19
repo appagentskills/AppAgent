@@ -15,7 +15,13 @@ async function executeReadAttachedFile(args, options) {
 
     // Resolve the owning chat: options.chatId (threaded by the dispatcher) is
     // authoritative — currentChatId is permanently null in the SW context.
-    var chatId = (options && options.chatId) || activeStreamingChatId || currentChatId;
+    // Nested callers (sandbox / widget bridge / internal) never fall back to the
+    // foreground/streaming chat — that would read another chat's attachments.
+    var _rafNested = !!(options && (options.fromSandbox || options.fromWidget || options.parentToolCallId));
+    var chatId = (options && options.chatId) || (_rafNested ? null : (activeStreamingChatId || currentChatId));
+    if (!chatId && _rafNested) {
+        return { success: false, code: 'CHAT_UNRESOLVED', error: 'read_attached_file: the calling chat could not be identified (nested call without chatId); refusing to guess a chat.' };
+    }
     var chat = chats[chatId];
     // MSG-EVICT: a skeleton chat (messages evicted) is restored first.
     if (chat && !Array.isArray(chat.messages) && chat._messagesEvicted && typeof ensureChatPayloads === 'function') {

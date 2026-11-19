@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.1.44
+
+### New
+- Faster first connect to new instances.
+
+### Fixes
+- Reconnects after session expiry without hanging.
+- Sub-agent widgets and forms open in the right chat.
+
+---
+
 ## v1.1.43
 
 ### New

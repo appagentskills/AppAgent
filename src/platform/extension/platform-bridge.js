@@ -156,12 +156,12 @@
     }
 
     // Refresh the full instance list from background (probes all open SN tabs)
-    // Bounded: resolves with the last-known registry after ~10s if the background
+    // Bounded: resolves with the last-known registry after 5s if the background
     // probe has not answered; a late answer still updates Platform.instances.
     Platform.refreshInstances = function() {
         return new Promise(function(_resolve) {
             var _settled = false;
-            var _t = setTimeout(function() { resolve(Platform.instances); }, 10000);
+            var _t = setTimeout(function() { resolve(Platform.instances); }, 5000);
             function resolve(v) { if (_settled) return; _settled = true; clearTimeout(_t); _resolve(v); }
             chrome.runtime.sendMessage({ type: 'list-sn-instances-detailed' }, function(response) {
                 if (chrome.runtime.lastError || !response || !response.instances) {
@@ -237,8 +237,8 @@
         }
         // Ask background to probe a fresh token from a tab
         return new Promise(function(resolve) {
-            chrome.runtime.sendMessage({ type: 'get-token-for-instance', instanceUrl: instanceUrl }, function(response) {
-                if (chrome.runtime.lastError || !response || !response.token) {
+            _sendMessageBounded({ type: 'get-token-for-instance', instanceUrl: instanceUrl }, function(response, err) {
+                if (err || !response || !response.token) {
                     resolve('');
                     return;
                 }
@@ -275,8 +275,8 @@
     // (nothing different and valid found — the caller keeps its current token).
     Platform.refreshTokenForInstance = function(instanceUrl, staleToken) {
         return new Promise(function(resolve) {
-            chrome.runtime.sendMessage({ type: 'get-token-for-instance', instanceUrl: instanceUrl, excludeToken: staleToken || '', validate: true }, function(response) {
-                if (chrome.runtime.lastError || !response || !response.token || response.token === staleToken) {
+            _sendMessageBounded({ type: 'get-token-for-instance', instanceUrl: instanceUrl, excludeToken: staleToken || '', validate: true }, function(response, err) {
+                if (err || !response || !response.token || response.token === staleToken) {
                     resolve('');
                     return;
                 }
@@ -388,6 +388,22 @@
         chrome.storage.local.set({ sessionToken: token });
     }
 
+    // chrome.runtime.sendMessage with a hard deadline (<= 5s; window.__snTokenMsgMs
+    // may only lower it): cb(resp, err) runs exactly once — err is the
+    // lastError message, or 'timeout' when the background did not answer in time.
+    function _sendMessageBounded(msg, cb) {
+        var done = false;
+        var ms = Math.min(5000, window.__snTokenMsgMs || 5000);
+        var timer = setTimeout(function() { if (done) return; done = true; cb(null, 'timeout'); }, ms);
+        function finish(resp, err) { if (done) return; done = true; clearTimeout(timer); cb(resp, err); }
+        try {
+            chrome.runtime.sendMessage(msg, function(resp) {
+                var le = chrome.runtime.lastError;   // always read: silences the unchecked-error warning
+                finish(le ? null : resp, le ? (le.message || 'error') : null);
+            });
+        } catch (e) { finish(null, String((e && e.message) || e)); }
+    }
+
     // Sole authority on connection state — validates and recovers tokens
     function validateToken(_recovering) {
         if (!Platform.instanceUrl) {
@@ -402,8 +418,9 @@
         // Disconnected in the header while the picker shows it green; only mark
         // disconnected when neither a tab nor a cached token exists.
         if (!window.sessionToken) {
-            chrome.runtime.sendMessage({ type: 'get-token-for-instance', instanceUrl: Platform.instanceUrl }, function(resp) {
-                if (chrome.runtime.lastError) return;
+            _sendMessageBounded({ type: 'get-token-for-instance', instanceUrl: Platform.instanceUrl }, function(resp, err) {
+                // No answer (error or 5s timeout) proves nothing: status left as-is.
+                if (err) return;
                 if (resp && resp.token) {
                     _adoptRecoveredToken(resp.token);
                     validateToken(); // Now validate the recovered token
@@ -414,11 +431,23 @@
             });
             return;
         }
-        _origFetch.call(window, Platform.instanceUrl + '/api/now/uisession/touch-session', {
+        // Bounded (<= 5s, window.__snValidateMs overrides in tests): a hung
+        // touch-session must not leave the check pending — abort and treat it
+        // like a network error (status left as-is).
+        var _vtMs = Math.min(5000, window.__snValidateMs || 5000);
+        var _vtCtl = (typeof AbortController === 'function') ? new AbortController() : null;
+        var _vtTimer = null;
+        var _vtTimeout = new Promise(function(_res, rej) {
+            _vtTimer = setTimeout(function() { try { if (_vtCtl) _vtCtl.abort(); } catch (e) {} rej(new Error('timeout')); }, _vtMs);
+        });
+        var _vtOpts = {
             method: 'POST',
             headers: { 'X-UserToken': window.sessionToken, 'Content-Type': 'application/json', 'Accept': 'application/json' },
             credentials: 'include'
-        }).then(function(res) {
+        };
+        if (_vtCtl) _vtOpts.signal = _vtCtl.signal;
+        Promise.race([_origFetch.call(window, Platform.instanceUrl + '/api/now/uisession/touch-session', _vtOpts), _vtTimeout]).then(function(res) {
+            clearTimeout(_vtTimer);
             if (res.status === 401) {
                 // Before reporting Disconnected, ask the background for a VALIDATED token
                 // from any OTHER open tab of this instance: a session-timed-out tab may
@@ -426,8 +455,10 @@
                 // recovery attempt per chain (_recovering) so two dead tabs can't ping-pong.
                 var _failed = window.sessionToken;
                 if (!_recovering) {
-                    chrome.runtime.sendMessage({ type: 'get-token-for-instance', instanceUrl: Platform.instanceUrl, excludeToken: _failed, validate: true }, function(resp) {
-                        if (!chrome.runtime.lastError && resp && resp.token && resp.token !== _failed) {
+                    _sendMessageBounded({ type: 'get-token-for-instance', instanceUrl: Platform.instanceUrl, excludeToken: _failed, validate: true }, function(resp, err) {
+                        // The held token got a 401: without a recovered one (error
+                        // or 5s timeout included) the panel is disconnected.
+                        if (!err && resp && resp.token && resp.token !== _failed) {
                             _adoptRecoveredToken(resp.token);
                             validateToken(true);
                             return;
@@ -451,7 +482,8 @@
             _snStatusState = 'connected';
             updateSnStatus();
         }).catch(function() {
-            // Network error — leave status as-is
+            clearTimeout(_vtTimer);
+            // Network error or timeout — leave status as-is
         });
     }
 
@@ -496,6 +528,11 @@
         if (msg.type === 'active-tab-changed') {
             updateActiveTabStatus(msg);
         }
+        // A tab just signed in to an instance (background onTabReady adoption):
+        // refresh now instead of waiting for the 2-minute poll.
+        if (msg.type === 'sn-instances-changed') {
+            _onSnInstancesChanged(msg.origin);
+        }
         // OS-notification click (background.js notifications.onClicked): open
         // the notified chat in this already-loaded page (ui/220-notification-system.js).
         if (msg.type === 'open-chat-from-notification' && typeof handleOpenChatFromNotificationMessage === 'function') {
@@ -503,6 +540,26 @@
                 ? function(cb) { chrome.tabs.getCurrent(cb); } : null);
         }
     });
+
+    // Debounced (coalesces a burst of tabs signing in at once). Re-validates the
+    // header pill when the signed-in origin is the active instance and it is not
+    // shown connected yet; always refreshes the multi-instance registry.
+    var _snChangedTimer = null;
+    var _snChangedOrigins = {};
+    function _onSnInstancesChanged(origin) {
+        if (origin) _snChangedOrigins[_normUrl(origin)] = true;
+        if (_snChangedTimer) clearTimeout(_snChangedTimer);
+        _snChangedTimer = setTimeout(function() {
+            _snChangedTimer = null;
+            var changed = _snChangedOrigins;
+            _snChangedOrigins = {};
+            // validateToken is debounced with the refresh: once per burst.
+            if (Platform.instanceUrl && changed[_normUrl(Platform.instanceUrl)] && _snStatusState !== 'connected') {
+                validateToken();
+            }
+            Platform.refreshInstances();
+        }, 250);
+    }
 
     // Query initial active tab info
     chrome.runtime.sendMessage({ type: 'get-active-tab-info' }, function(response) {
@@ -592,37 +649,67 @@
     };
 
     // Refresh token by extracting g_ck from an open ServiceNow tab
+    // Bounded: a background that never calls sendResponse (SW restarted mid-call,
+    // handler threw) used to leave this promise — and every fetch awaiting it —
+    // pending forever. Resolves null after PB_REFRESH_TOKEN_TIMEOUT_MS.
+    var PB_REFRESH_TOKEN_TIMEOUT_MS = 5000; // hard rule: no connection call > 5s
     function _refreshToken() {
         return new Promise(function(resolve) {
-            chrome.runtime.sendMessage({ type: 'refresh-sn-token', excludeToken: window.sessionToken || '' }, function(response) {
-                if (chrome.runtime.lastError || !response || !response.token) {
-                    resolve(null);
-                    return;
-                }
-                window.sessionToken = response.token;
-                resolve(response.token);
-            });
+            var done = false;
+            var t = setTimeout(function() { if (!done) { done = true; resolve(null); } }, PB_REFRESH_TOKEN_TIMEOUT_MS);
+            try {
+                chrome.runtime.sendMessage({ type: 'refresh-sn-token', excludeToken: window.sessionToken || '' }, function(response) {
+                    if (done) return;
+                    done = true; clearTimeout(t);
+                    if (chrome.runtime.lastError || !response || !response.token) {
+                        resolve(null);
+                        return;
+                    }
+                    window.sessionToken = response.token;
+                    resolve(response.token);
+                });
+            } catch (e) { if (!done) { done = true; clearTimeout(t); resolve(null); } }
         });
     }
 
     // Open a ServiceNow page for the user to log in, wait for new token
+    // Bounded at every step: the open-sn-for-login ack (PB_OPEN_LOGIN_ACK_MS; a
+    // missing sendResponse starts the poll anyway), each poll round (_refreshToken
+    // is bounded and rounds never overlap) and the whole wait (PB_LOGIN_WAIT_MS).
+    var PB_OPEN_LOGIN_ACK_MS = 5000, PB_LOGIN_POLL_MS = 2000, PB_LOGIN_WAIT_MS = 240000;
     function _openSnForLogin() {
         var oldToken = window.sessionToken || '';
         return new Promise(function(resolve) {
-            chrome.runtime.sendMessage({ type: 'open-sn-for-login' }, function() {
-                if (chrome.runtime.lastError) { resolve(null); return; }
-                var attempts = 0;
-                var poll = setInterval(function() {
-                    attempts++;
-                    if (attempts > 120) { clearInterval(poll); resolve(null); return; }
+            var settled = false, started = false, poll = null, busy = false;
+            var deadline = Date.now() + PB_LOGIN_WAIT_MS;
+            function finish(v) {
+                if (settled) return;
+                settled = true;
+                if (poll) clearInterval(poll);
+                clearTimeout(ackTimer);
+                resolve(v);
+            }
+            function startPoll() {
+                if (started || settled) return;
+                started = true;
+                poll = setInterval(function() {
+                    if (Date.now() > deadline) { finish(null); return; }
+                    if (busy) return;
+                    busy = true;
                     _refreshToken().then(function(token) {
-                        if (token && token !== oldToken) {
-                            clearInterval(poll);
-                            resolve(token);
-                        }
-                    });
-                }, 2000);
-            });
+                        busy = false;
+                        if (token && token !== oldToken) finish(token);
+                    }, function() { busy = false; });
+                }, PB_LOGIN_POLL_MS);
+            }
+            var ackTimer = setTimeout(startPoll, PB_OPEN_LOGIN_ACK_MS);
+            try {
+                chrome.runtime.sendMessage({ type: 'open-sn-for-login' }, function() {
+                    if (chrome.runtime.lastError) { finish(null); return; }
+                    clearTimeout(ackTimer);
+                    startPoll();
+                });
+            } catch (e) { finish(null); }
         });
     }
 

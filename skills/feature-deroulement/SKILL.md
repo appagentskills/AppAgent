@@ -14,7 +14,7 @@ Modes:
 - Purely internal changes (rename, comment) can skip it, but say so explicitly.
 
 ## Research basis: why prose alone is not enough
-- **Self-Debugging** (Chen et al., arXiv 2304.05128): a model that only explains its code gains about +2–3%. With execution feedback it gains up to about +12%.
+- **Self-Debugging** (Chen et al., arXiv 2304.05128): explanation-only feedback gains about +2–3% (Spider, no unit tests). Unit-test execution feedback gains up to about +12% (TransCoder, MBPP).
 - **Chain-of-Verification** (2309.11495): answer each verification question *independently* of the draft, and fewer hallucinated facts survive.
 - **CodeT** (2207.10397) and **AlphaCodium** (2401.08500): generated tests plus iterating on real execution results beat single-pass reasoning.
 - **Agentless** (2407.01489): simple localize → repair → validate pipelines work when the validate step is a real run.
@@ -29,7 +29,8 @@ Modes:
 3. **Run the executable phase** (next section) on the changed files and the prose.
 4. **Probe** the main scenario and the edge cases. For a function with **more than 5 branch points**, also run reverse mode R1–R6 and **mutation-lite**.
 5. **Build the claims ledger** (`D.format(rep)`). Fix or retract every refuted claim, then re-run.
-6. **Done-gate:** `rep.gate.pass === true` (0 refuted). The final answer must list **every unverified claim** explicitly (`rep.gate.unverified`) with a reason. Never hide them.
+   - **Refuted rows in code you did not touch** (whole-file cross-refs such as runtime-built ids or shim message handlers; `functionsOnly` does not limit them) are not "pre-existing" by assertion. Prove it: re-run on the base version of the same files (`sources` from the base branch) and diff the refuted rows. Only rows present in both runs may be reported as pre-existing, each with that baseline evidence. The gate is still **failed** and the final answer must say so. Never push a failed gate silently, and never accept one from a worker.
+6. **Done-gate:** `rep.gate.pass === true` (0 refuted). The final answer must list **every unverified claim** explicitly (`rep.gate.unverified`) with a reason. Never hide them. Group recurring unverified noise by cause (CSS classes built in JS from a prefix, message types with no sender found, grep capped at 100 hits) with one reason per group and its rows; "pre-existing" alone is not a reason.
 
 ## Executable phase: `deroulement.js`
 It is a helper next to this file that is **also the skill tool `deroulement_check`** (active while this skill is active). It has no dependencies (only RegExp and Function; DOMParser and CSSStyleSheet when present), and every result is JSON. The tool runs in the skill sandbox iframe, which has a DOM. In a realm without one, the HTML, CSS and DOM post-condition rows are **unverified** with a reason ("DOMParser unavailable…"). They never throw.
@@ -48,6 +49,8 @@ deroulement_check {
 }
 ```
 It returns `{success, summary, gate: {pass, refuted, unverified}, ledger: <D.format markdown>}` (`report` too with `output: 'full'`). The args are the `run()` options below. They differ in three ways: offline source texts go in `sources` (not `files: {...}`); function-valued options (`probes[].stubs`/`post`, `mutation[].check`/`stubs`) are JS **source strings**; `exclude` holds regex sources. `claims[].check` must be `true`/`false`, and the `io` option is JS-only.
+
+**Context budget:** the default `ledger` output can reach 30–40 KB and gets cached out of context. Start with `output: 'summary'` (summary + gate with the refuted/unverified rows) and request `ledger` only to quote trimmed rows. Run the check as soon as the implementation is in place, before long write-ups: workers that postponed it hit the context limit and never ran it.
 
 **Alternative, in-repo (AppAgent workspace, js_eval or tests), when you need the full API** (`D.branches`, `D.probe`, a custom `io`, function-valued claims):
 ```js
@@ -126,6 +129,7 @@ Feed the results into `claims: [{claim, check}]`, or inject a custom `io` (`{liv
 - **R5 Map back:** audit scenario → arms. List the arms that no scenario covers.
 - **R6 New bugs:** same format as the verified bug list.
 - **Mutation-lite** on every function over 5 branches: `mutation: [{file, fn, cases}]`. Every surviving mutant is either a missing test case or an explained equivalent mutant.
+- **Existing unit tests do not replace R2 probes or mutation-lite.** If you rely on tests instead, the R1/R2 rows stay **unverified** and are listed as such, naming the test file. "Covered by tests" is not a probe.
 
 Rules: never skip the empty `else`. Short-circuits count. Each arm gets a concrete trigger, never "some race". "Variant of S1, already covered" is a corner cut: expand the sub-arm.
 

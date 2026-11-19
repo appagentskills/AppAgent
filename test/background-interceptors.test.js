@@ -16,7 +16,8 @@ describe('S0C4-06: console interceptor does not loop (background.js injectInterc
         var src = between(bg, 'async function injectInterceptors(tabId) {', '// --- Dynamic header rules ---');
         var calls = [];
         var chrome = { scripting: { executeScript: function(o) { calls.push(o); return Promise.resolve([]); } } };
-        var inject = new Function('chrome', src + '\nreturn injectInterceptors;')(chrome);
+        var helpers = EX.extractFunctions(bg, ['snTimeoutMs', 'snWithTimeout', 'snInjectBounded']);
+        var inject = new Function('chrome', 'self', helpers + '\n' + src + '\nreturn injectInterceptors;')(chrome, {});
         await inject(7);
         assert.strictEqual(calls.length, 1);
         assert.strictEqual(calls[0].world, 'MAIN');

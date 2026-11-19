@@ -1309,8 +1309,35 @@ executeTool = async function(name, args, messageIndex, options) {
 
     if (name === 'widget_eval') return _routeLiveWidgetTool(args, options);
 
+    // Chat-bound UI tools (widget save / split pane / inline display) dispatched
+    // as NESTED calls (sandbox, widget bridge, internal card) must carry the
+    // caller's chatId. activeStreamingChatId is just the last stream started —
+    // with a sub-agent and a foreground chat running concurrently it names the
+    // wrong chat, which is how a worker's widget opened in another chat.
+    var _nestedUi = !!(options && (options.fromSandbox || options.fromWidget || options.parentToolCallId));
+    // html_widget list/read/export are chat-independent (same exemption as
+    // executeHtmlWidget in tools/080-widget-tools.js) and stay allowed.
+    var _chatFreeWidgetAction = name === 'html_widget' && args
+        && (args.action === 'list' || args.action === 'read' || args.action === 'export');
+    // get_skill only reads skill content — genuinely chat-free. local_folder
+    // (incl. action:'request' and the _lfRouteToPanel panel fallback),
+    // manage_skill and pin_widget never pick a chat either, and iframe_tool
+    // with an explicit tab_id targets that tab directly — exempt them so
+    // nested chat-less callers (skill tools, widgets) keep working.
+    // start_chat creates a NEW chat and needs no source chat: a widget whose
+    // owner chat cannot be resolved still opens it, just without the origin
+    // back-link (tools/150-start-chat.js sourceChatId → null).
+    var _chatFreeUiTool = _chatFreeWidgetAction || name === 'get_skill' || name === 'start_chat'
+        || name === 'local_folder' || name === 'manage_skill' || name === 'pin_widget'
+        || (name === 'iframe_tool' && args && args.tab_id !== undefined && args.tab_id !== null && args.tab_id !== '');
+    // ANY nested UI-routed tool without a chatId is refused (iframe_tool,
+    // take_screenshot, prompt_user, update_action_state, …): the
+    // panel side would otherwise fall back to the foreground chat.
+    if (_nestedUi && !(options && options.chatId) && !_chatFreeUiTool) {
+        return { success: false, code: 'CHAT_UNRESOLVED', error: name + ': the calling chat could not be identified (nested call without chatId); refusing to guess a chat.' };
+    }
     // UI-required tool. Route to a panel; if none connected, park.
-    var chatId = (options && options.chatId) || activeStreamingChatId;
+    var chatId = (options && options.chatId) || (_nestedUi ? null : activeStreamingChatId);
     var toolCallId = (options && options.toolCallId)
         || ('ui_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9));
     var port = pickExecutorPort();
@@ -1645,8 +1672,12 @@ if (typeof requestProgrammaticToolApproval !== 'function') {
         // Resolve the target chat FIRST: "Allow for this chat" grants are keyed
         // by ROOT chat (core/070-permissions.js), so the lookup needs the
         // calling chat — options.chatId is set by the agent loop (chat.id) and
-        // by widget/sandbox dispatches; activeStreamingChatId is the fallback.
-        var targetChatId = options.chatId || activeStreamingChatId;
+        // by widget/sandbox dispatches; activeStreamingChatId is the fallback
+        // for top-level calls only. Nested callers (sandbox / widget bridge /
+        // internal) never inherit another chat's "Allow for this chat" grants
+        // or prompt there; without a chatId an 'ask' is refused below.
+        var _swApNested = !!(options.fromSandbox || options.fromWidget || options.parentToolCallId);
+        var targetChatId = options.chatId || (_swApNested ? null : activeStreamingChatId);
         var permissionKey = resolvePermissionKey(toolName, methodOrAction);
         // Instance tier is looked up for the host the call TARGETS (core/070
         // getTargetedToolPermission). Fail safe if core/070 isn't loaded: an
@@ -1692,6 +1723,9 @@ if (typeof requestProgrammaticToolApproval !== 'function') {
             return Object.assign({ allowed: true }, baseResult);
         }
 
+        if (!targetChatId && _swApNested) {
+            return Object.assign({ allowed: false, code: 'CHAT_UNRESOLVED', error: displayName + ' needs approval, but the calling chat could not be identified (nested call without chatId); refusing to guess a chat.' }, baseResult);
+        }
         // 'ask' (or 'auto' + confirm:true): check pre-existing approval
         // recorded in the chat by an earlier panel-side run. A row settled
         // 'session_allowed' ("Allow for this chat") for THIS toolCallId is an

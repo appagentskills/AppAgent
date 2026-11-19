@@ -311,8 +311,14 @@ async function sdocToolCreate(args, options) {
     var ownerChatId = _sdocChatId(options);
     // A 'chat'-scoped doc with no resolvable owner would be orphaned — invisible
     // to everyone (list/read/edit/delete all gate on accessibility), so it could
-    // never even be deleted. Fall back to 'shared' in that impossible-owner case.
-    if (scope === 'chat' && !ownerChatId) scope = 'shared';
+    // never even be deleted. Silently downgrading it to 'shared' would publish
+    // a private scratchpad globally, so fail closed for every caller (nested
+    // or top-level) and create nothing. Top-level calls normally resolve via
+    // the streaming/current chat, so this only trips when no chat exists.
+    var _sdcNested = !!(options && (options.fromSandbox || options.fromWidget || options.parentToolCallId));
+    if (scope === 'chat' && !ownerChatId) {
+        return { success: false, code: 'CHAT_UNRESOLVED', error: 'document: a chat-scoped document needs the calling chat, which could not be identified' + (_sdcNested ? ' (nested call without chatId)' : '') + '; no document was created. Retry from a chat, or pass scope "shared" only if a global document is really wanted; refusing to guess a chat.' };
+    }
     var fileId = newFileId();
     var doc = {
         id: docId, title: title, currentContent: content, currentVersion: 1,
@@ -474,9 +480,14 @@ async function sdocToolDelete(args, options) {
 
 // Resolve the chat that owns this smart-document call. SW context has no
 // currentChatId fallback, so the agent loop threads chatId via options.
+// Nested callers (sandbox / widget bridge / internal) never fall back to the
+// streaming/foreground chat — that would grant them another chat's private
+// docs and stamp their versions with it. Unresolved → null (fail closed).
 function _sdocChatId(options) {
-    return (options && options.chatId)
-        || (typeof activeStreamingChatId !== 'undefined' && activeStreamingChatId)
+    if (options && options.chatId) return options.chatId;
+    var _sdNested = !!(options && (options.fromSandbox || options.fromWidget || options.parentToolCallId));
+    if (_sdNested) return null;
+    return (typeof activeStreamingChatId !== 'undefined' && activeStreamingChatId)
         || (typeof currentChatId !== 'undefined' && currentChatId)
         || null;
 }
@@ -542,6 +553,9 @@ function sdocCopyDisplays(doc, content, options) {
     var re = /<!--display:(dsp_\w+)-->/g;
     var match;
     var chatId = _sdocChatId(options);
+    // No resolved chat (nested caller without chatId): copy nothing rather
+    // than reading displays from some other chat.
+    if (!chatId) return;
     while ((match = re.exec(content)) !== null) {
         var did = match[1];
         // Lineage union-on-read: the head of a continued chat keeps only the

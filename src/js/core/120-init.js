@@ -273,7 +273,11 @@ async function init() {
         // generic .modal-overlay.show sweep so #widget-history-modal-overlay
         // (ui/070-dashboard-ui.js:1376-1381 — it also carries that class) is
         // closed by closeWidgetHistory() rather than by the generic path.
-        if (document.getElementById('widget-fullscreen-overlay')) { closeWidgetFullscreen(); return; }
+        // Skipped while a widget prompt_user has hidden it (tools/100-prompt-user.js
+        // sets data-prompt-hidden): closing it would destroy the widget iframe
+        // still awaiting the form's answer.
+        var _escFs = document.getElementById('widget-fullscreen-overlay');
+        if (_escFs && !(_escFs.dataset && _escFs.dataset.promptHidden)) { closeWidgetFullscreen(); return; }
         if (document.getElementById('widget-edit-overlay')) { closeWidgetCodeEdit(); return; }
         if (document.getElementById('widget-modal-overlay')) { closeWidgetModal(); return; }
         if (document.getElementById('widget-history-modal-overlay')) { closeWidgetHistory(); return; }

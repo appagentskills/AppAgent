@@ -93,7 +93,7 @@ describe('background probes are bounded (list_instances / refreshInstances)', fu
         if (!(f.end > f.start)) throw new Error('unbalanced: ' + name);
         return src.slice(f.start, f.end);
     }
-    var FNS = ['snTimeoutMs', 'snWithTimeout', 'snFetchWithTimeout', 'snProbeTabTokenUser', 'snFetchUserName', 'snFetchUserRoles',
+    var FNS = ['snTimeoutMs', 'snWithTimeout', 'snFetchWithTimeout', 'snLoginProbeState', 'snLoginLooksSignedIn', 'snProbeTabTokenUser', 'snFetchUserName', 'snFetchUserRoles',
         'snCollectTabTokens', 'snResolveInstanceSession', 'snRememberInstanceToken', 'snUpdateInstanceTokens', 'snGetInstancesDetailed', 'probeTab'];
     async function build(w) {
         var src = await loadFile('src/platform/extension/background.js');
