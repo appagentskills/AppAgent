@@ -36,7 +36,7 @@ describe('hook-run injection deferral (HOOK-MERGE)', function() {
         assert.ok(pend.c1 && pend.c1.text === 'Or search online.', 'entry kept for the follow-up run');
         delete m._hookRunDeferInjectionByChat.c1;
         assert.strictEqual(m.flushPendingInjection(chat), true, 'flushed once the hook run is over');
-        assert.deepStrictEqual(chat.messages[3], { role: 'user', content: 'Or search online.', injected: true, hasUserText: true });
+        assert.deepStrictEqual(chat.messages[3], { role: 'user', content: 'Or search online.', injected: true, midRun: true, hasUserText: true });
     });
 
     test('with the deferral, the hook turn keeps its answer target (no merged user row)', async function() {

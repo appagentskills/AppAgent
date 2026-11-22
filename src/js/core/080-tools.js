@@ -453,6 +453,21 @@ var TOOLS = [
     {
         type: 'function',
         function: {
+            name: 'continue_in_new_chat',
+            description: 'Hand this conversation off to a fresh chat. Only valid during a "Continue in a new chat" handoff (when the user asked to continue in a new chat); anywhere else it fails and does nothing. Call it exactly once with a short title for the new chat and the full handoff summary. The app creates the new chat and appends the user\'s own messages itself.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    title: { type: 'string', description: 'Title for the new chat, at most 60 characters, naming the current task. No "Continued:" prefix.' },
+                    summary: { type: 'string', description: 'The complete handoff summary (markdown) with the sections requested by the handoff instructions.' }
+                },
+                required: ['title', 'summary']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
             name: 'take_screenshot',
             description: 'Capture a real PNG screenshot and send it to the vision model, to see what is actually rendered — UI elements, layouts, colors, charts, errors. Best for debugging visual issues, verifying UI changes, and analyzing widgets or page layouts. target browser/element require an explicit tab_id (no active-tab fallback). Returns a screenshot_id for later retrieval with screenshot_by_id (e.g. to embed in a widget or process in js_eval). Screenshots are not shown in the split pane: to show visual progress there, update a widget and embed the image via screenshot_by_id. target "split_widget" captures the split pane in place (the on-screen pixels cropped to the pane; no new tab, no re-render); it needs AppAgent in a full, front tab — from the Chrome side panel it returns "split pane not visible" (a side panel cannot be captured).',
             parameters: {
@@ -515,11 +530,11 @@ var TOOLS = [
         type: 'function',
         function: {
             name: 'display',
-            description: 'Render structured data with a predefined template as a consistent, interactive inline widget.\n\nWhen to use: when content matches a template trigger below, use display instead of markdown or html_widget (polished UI, no HTML). Plain text for prose, confirmations and 1–4 values; at most one display per answer.\n\nIt renders inline right away with its tool result. Optionally include the returned placeholder (<!--display:ID-->) in your final response to position it there instead; it is never shown twice.\n\nTemplates:\n- table (5+ rows with the same fields): sortable, filterable. Args: columns (string[]), rows (object[] or array[]).\n- card_list (several items with details): grid of expandable cards. Args: cards ({title, subtitle?, icon?, badge?, badge_color?, detail?}[]).\n- checklist (steps or to-dos): checkable items. Args: items (string[] or {label, description?, checked?}[]).\n- status_summary (counts across 3+ categories): metric cards. Args: items ({label, count, icon?, color?}[]).\n- code (code longer than a few lines): syntax-highlighted block with line numbers and copy. Args: code (string), language? (string).\n- timeline (ordered events). Args: events ({title, time?, detail?, color?}[]).\n- chart (numeric comparison): bar or pie. Args: chart_type ("bar"|"pie"), data ({label, value}[]) OR labels (string[]) + values (number[]).\n- diff (any code diff or before/after change). Args: changes (string[] with +/- prefixes, or {type,text}[]) OR old_text + new_text. Optional: file/header (string).',
+            description: 'Render structured data with a predefined template as a consistent, interactive inline widget.\n\nWhen to use: when content matches a template trigger below, use display instead of markdown or html_widget (polished UI, no HTML). Plain text for prose, confirmations and 1–4 values; at most one display per answer.\n\nIt renders inline right away with its tool result. Optionally include the returned placeholder (<!--display:ID-->) in your final response to position it there instead; it is never shown twice.\n\nTemplates:\n- table (5+ rows with the same fields): sortable, filterable. Args: columns (string[]), rows (object[] or array[]).\n- card_list (several items with details): grid of expandable cards. Args: cards ({title, subtitle?, icon?, badge?, badge_color?, detail?}[]).\n- checklist (steps or to-dos): checkable items. Args: items (string[] or {label, description?, checked?}[]).\n- status_summary (counts across 3+ categories): metric cards. Args: items ({label, count, icon?, color?}[]).\n- code (code longer than a few lines): syntax-highlighted block with line numbers and copy. Args: code (string), language? (string).\n- timeline (ordered events). Args: events ({title, time?, detail?, color?}[]).\n- chart (numeric comparison): bar or pie. Args: chart_type ("bar"|"pie"), data ({label, value}[]) OR labels (string[]) + values (number[]).\n- diff (any code diff or before/after change). Args: changes (string[] with +/- prefixes, or {type,text}[]) OR old_text + new_text. Optional: file/header (string).\n- file (Agent Files outputs to download): polished file card(s) with a Download button (Download all when several). Args: files ({path?, file_id?, name?, description?}[] — path in Agent Files, or a file_id), folder? (default "virtual").',
             parameters: {
                 type: 'object',
                 properties: {
-                    template: { type: 'string', enum: ['table', 'card_list', 'checklist', 'status_summary', 'code', 'timeline', 'chart', 'diff'], description: 'Display template to use.' },
+                    template: { type: 'string', enum: ['table', 'card_list', 'checklist', 'status_summary', 'code', 'timeline', 'chart', 'diff', 'file'], description: 'Display template to use.' },
                     title: { type: 'string', description: 'Title (shown in header).' },
                     columns: { type: 'array', items: { type: 'string' }, description: 'table: column headers.' },
                     rows: { type: 'array', items: {}, description: 'table: row objects or arrays.' },
@@ -536,6 +551,8 @@ var TOOLS = [
                     old_text: { type: 'string', description: 'diff: original text.' },
                     new_text: { type: 'string', description: 'diff: modified text.' },
                     file: { type: 'string', description: 'diff: filename header.' },
+                    files: { type: 'array', items: { type: 'object', properties: { path: { type: 'string' }, file_id: { type: 'string' }, name: { type: 'string' }, description: { type: 'string' } } }, description: 'file: files to offer for download — {path (Agent Files path) or file_id, name?, description?}.' },
+                    folder: { type: 'string', description: 'file: folder the paths are in. Default "virtual" (Agent Files).' },
                     width: { type: 'string', description: 'Widget width. Default: "100%".' },
                     height: { type: 'string', description: 'Widget height. Default: "auto".' },
                     status_message: { type: 'string', description: 'Short human-friendly description of this call, shown in the UI header.' }
@@ -865,7 +882,7 @@ var TOOLS = [
         type: 'function',
         function: {
             name: 'connect_instance',
-            description: 'Log in to a ServiceNow instance with a username + password when it is not connected (no open tab / no session) — use it only when the user gave you the credentials in this chat or an active skill provides them; never guess or invent credentials. Opens <instance>/login.do in a new background tab (reuses a tab only if it already shows that instance\'s login.do; your other tabs are never navigated), submits the classic login form and waits up to 30s for a session. Without credentials, first try iframe_tool navigate {tab_id:"new", url:<instance root>} and re-check list_instances — an existing session or SSO often connects the instance; if not, ask the user to log in in that tab. On success the tab stays open, the instance becomes usable by servicenow_api / iframe_tool (and becomes the active instance if none is), and {success, instance, userName, tabId} is returned. On failure returns reason: bad_credentials (after 2 consecutive rejections for the same user the login is paused for 10 min to avoid lockout — reason paused), mfa_required, password_change_required, sso_redirect, timeout. The password is never stored or returned and is redacted from the chat transcript — if a retry is needed after a restart, ask the user for it again. Call this tool directly, never from js_eval (js_eval code is persisted verbatim, so the password would be stored in the chat). Disabled instances are refused.',
+            description: 'Log in to a ServiceNow instance with a username + password when it is not connected (no open tab / no session) — use it only when the user gave you the credentials in this chat or an active skill provides them; never guess or invent credentials. Opens <instance>/login.do in a new background tab (reuses a tab only if it already shows that instance\'s login.do; your other tabs are never navigated), submits the classic login form and waits up to 30s for a session. Without credentials, first try iframe_tool navigate {tab_id:"new", url:<instance root>} and re-check list_instances — an existing session or SSO often connects the instance; if not, ask the user to log in in that tab. On success the tab stays open, the instance becomes usable by servicenow_api / iframe_tool (and becomes the active instance if none is), and {success, instance, userName, tabId} is returned. If the instance already had a session, no login is attempted and alreadyConnected:true is returned with the existing session\'s userName — always check that userName matches the requested username; on a mismatch (userMismatch:true + note) you are still signed in as the other user: do not proceed as the requested user, ask the user to sign out of that instance first, then retry. On failure returns reason: bad_credentials (after 2 consecutive rejections for the same user the login is paused for 10 min to avoid lockout — reason paused), mfa_required, password_change_required, sso_redirect, timeout. The password is never stored or returned and is redacted from the chat transcript — if a retry is needed after a restart, ask the user for it again. Call this tool directly, never from js_eval (js_eval code is persisted verbatim, so the password would be stored in the chat). Disabled instances are refused.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -1212,6 +1229,8 @@ var HEADLESS_TOOLS = {
     servicenow_run_script: true,
     servicenow_diff_edit: true,
     set_chat_title: true,
+    // continue_in_new_chat only validates against the chats map (shared) — headless.
+    continue_in_new_chat: true,
     set_tldr: true,
     set_links: true,
     set_caveat: true,
@@ -1314,6 +1333,7 @@ var TOOL_SHORT_DESCRIPTIONS = {
     servicenow_diff_edit: 'Edit a ServiceNow record field with search-and-replace — for surgical script/code changes.',
     iframe_tool: 'Drive the instance UI in an iframe — navigate, click, fill, inspect — for genuine UI work only (sub-agent browser profile).',
     set_chat_title: 'Set the chat title; normally requested by the after-response hook.',
+    continue_in_new_chat: 'Hand off to a new chat (title + summary); only during a "Continue in a new chat" handoff.',
     set_tldr: 'Set the TL;DR summary card for the final answer; requested by the after-response hook.',
     set_links: 'Provide relevant links for the answer card; requested by the after-response hook.',
     set_caveat: 'Flag one must-read caveat about the final answer; requested by the after-response hook.',
@@ -1328,7 +1348,7 @@ var TOOL_SHORT_DESCRIPTIONS = {
     take_screenshot: 'Capture a PNG screenshot of the browser panel, a widget, or an element for visual analysis (browser/extension-dev profiles).',
     screenshot_by_id: 'Retrieve a previously taken screenshot by its ID.',
     get_file: 'Retrieve any stored file by ID — view it (attach) or hand the user a download.',
-    display: 'Render structured data with a predefined template: table, chart, code, diff, timeline, cards, checklist.',
+    display: 'Render structured data with a predefined template: table, chart, code, diff, timeline, cards, checklist, file (download card).',
     update_action_state: 'Maintain the live progress card (state + todo list) for multi-step work.',
     show_action_button: 'Render a one-click skill Action button inline in chat.',
     prompt_user: 'Show a blocking inline form to collect structured user input or confirm a plan.',
@@ -1396,6 +1416,7 @@ var CORE_TOOL_NAMES = {
     get_skill: true,
     set_tldr: true,
     set_chat_title: true,
+    continue_in_new_chat: true,
     update_action_state: true,
     spawn_sub_agent: true,
     await_handle: true,

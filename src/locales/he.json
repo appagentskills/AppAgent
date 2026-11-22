@@ -1934,5 +1934,7 @@
   "Go to the new chat": "מעבר לצ'אט החדש",
   "Send here anyway": "לשלוח כאן בכל זאת",
   "This chat continues in \"{title}\". Workers, PRs and widgets now live there.": "הצ'אט הזה ממשיך ב\"{title}\". העובדים, בקשות המשיכה והווידג'טים נמצאים שם עכשיו.",
-  "deleted chat": "צ'אט שנמחק"
+  "deleted chat": "צ'אט שנמחק",
+  "Go to new chat": "מעבר לצ'אט החדש",
+  "Go to previous chat": "מעבר לצ'אט הקודם"
 }

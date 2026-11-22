@@ -1934,5 +1934,7 @@
   "Go to the new chat": "새 채팅으로 이동",
   "Send here anyway": "그래도 여기에 보내기",
   "This chat continues in \"{title}\". Workers, PRs and widgets now live there.": "이 채팅은 \"{title}\"에서 계속됩니다. 워커, PR 및 위젯은 이제 그곳에 있습니다.",
-  "deleted chat": "삭제된 채팅"
+  "deleted chat": "삭제된 채팅",
+  "Go to new chat": "새 채팅으로 이동",
+  "Go to previous chat": "이전 채팅으로 이동"
 }

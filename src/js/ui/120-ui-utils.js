@@ -936,6 +936,9 @@ function renderVersionSidebar() {
     // (175-sub-agent-ui.js), re-invoked at the end of this function (this
     // innerHTML rebuild wipes it). Hidden for regular chats.
     html += '<div class="sub-self-parent-host" id="sub-self-parent-host" style="display:none" aria-label="' + t('Back to parent chat') + '"></div>';
+    // "Go to new chat →" / "← Go to previous chat" for continued chats — same
+    // slot and chrome as the worker "Back to parent" button (ui/170 renderLineageNavButton).
+    if (typeof renderLineageNavButton === 'function') { try { html += renderLineageNavButton(chats[currentChatId]); } catch (eLn) {} }
     
     // Pull Requests Section — PRs pushed from this chat via workspace push.
     // Derived from the chat's tool calls/results, so it works retroactively

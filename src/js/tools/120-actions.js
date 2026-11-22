@@ -2621,6 +2621,11 @@ function _isChatUnseen(chatId) {
     // is only about an idle chat with an unread response.
     if (typeof isChatBusy === 'function' && isChatBusy(chatId)) return false;
     var _lastAct = Math.max(c.lastResponseAt || 0, c.lastActivityAt || 0);
+    // A chat handed off via "continue in a new chat": the SW's finished stamp
+    // of the handoff-summary run can land after the handoff's lastViewedAt —
+    // that run's activity is never unread; activity after any later user row
+    // ("Send here anyway") is, immediately (run identity, ui/165).
+    if (_isContinuedHandoffTs(c, _lastAct)) return false;
     // 24 h age cap (UNSEEN_CHAT_MAX_AGE_MS): a stale unread chat stops holding a
     // slot in the run monitor. Measured from the last ACTIVITY (not lastViewedAt),
     // so re-opening an old chat can never revive it as "unread".
@@ -2701,7 +2706,17 @@ function _chatHasUnseenActivity(chatId) {
     if (!c || c.isBackground || c.isSubAgent) return false;
     if (_isChatViewFocused(chatId)) return false;
     var last = Math.max(c.lastResponseAt || 0, c.lastActivityAt || 0);
+    if (_isContinuedHandoffTs(c, last)) return false; // handoff-summary activity: never unread
     return !!(last && last > (c.lastViewedAt || 0));
+}
+
+// Handoff guard (ui/165 isContinuedHandoffActivity): true when the old chat's
+// activity is the "continue in a new chat" handoff run's own (its latest
+// non-hook user row is still the handoff request); `ts` only matters for
+// message-evicted skeletons (timestamp fallback).
+function _isContinuedHandoffTs(c, ts) {
+    if (!c || !c.continuedTo) return false;
+    return (typeof isContinuedHandoffActivity === 'function') ? isContinuedHandoffActivity(c, ts) : true;
 }
 
 // Stamp user-visible activity on a chat. Called from the page-side agent event
@@ -3342,7 +3357,7 @@ function renderJobsDropdown(dropdown) {
         var _cProgText = _cTask || (_cProg && (_cProg.label || _cProg.status_message)) || null;
         // Unseen: the chat got a response after the user last viewed it (the
         // focused chat is always seen) — flag it so the user knows to catch up.
-        var _cUnseen = !_cRunning && !_cErr && !_cPaused && c.lastResponseAt &&
+        var _cUnseen = !_cRunning && !_cErr && !_cPaused && c.lastResponseAt && !_isContinuedHandoffTs(c, c.lastResponseAt) &&
             c.lastResponseAt > (c.lastViewedAt || 0) && !_isChatViewFocused(c.id);
         // Design A: the unread / current / read channels come from the shared
         // _jobsRowSignals helper (it reuses _chatHasUnseenActivity, which the
@@ -3510,7 +3525,7 @@ function _jobsChatState(chatId) {
     // mid-run error can't paint a red dot under a green "Done" badge.
     if (_isChatErrored(chatId)) return 'error';
     var _stLast = c ? Math.max(c.lastResponseAt || 0, c.lastActivityAt || 0) : 0;
-    if (_stLast && _stLast > (c.lastViewedAt || 0) && !_isChatViewFocused(chatId)) return 'unseen';
+    if (_stLast && !_isContinuedHandoffTs(c, _stLast) && _stLast > (c.lastViewedAt || 0) && !_isChatViewFocused(chatId)) return 'unseen';
     return 'done';
 }
 // Recent = non-empty chats touched in the last week (7 days), newest first,

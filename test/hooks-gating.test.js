@@ -82,6 +82,60 @@ describe('#16 TL;DR gating (_hkTurnNeedsTldr, worker/020-page-stubs.js)', functi
     });
 });
 
+// Continue-in-new-chat follow-up to #1377: the handoff summary turn (user row
+// isSummaryRequest) must not fire after-response hooks — the hook's runAgent on
+// the OLD chat bumped lastResponseAt past continuedAt and made it show unread.
+describe('handoff summary turn skips after-response hooks (worker/020-page-stubs.js)', function() {
+    var LONG = new Array(71).join('0123456789');
+    async function run(rows, anchor) {
+        var G = { chats: {}, hooksEnabled: { autoTitle: true, autoTldr: true, autoLinks: true, autoCaveat: false, autoProgress: true, showHookMessages: true } };
+        var runs = [];
+        var M = await loadModules(['src/js/tools/020-tool-execution.js', 'src/js/worker/020-page-stubs.js'], { lenient: true, globals: {
+            window: fakeWindow(), chrome: fakeChrome(), chats: G.chats, hooksEnabled: G.hooksEnabled,
+            _silentHookRunningByChat: {}, saveChatsToStorage: function() {}, runAgent: function(id) { runs.push(id); }
+        }});
+        if (M.hooksEnabled && M.hooksEnabled !== G.hooksEnabled) Object.assign(M.hooksEnabled, G.hooksEnabled);
+        var store = (M.chats && typeof M.chats === 'object') ? M.chats : G.chats;
+        store.c1 = { id: 'c1', title: 'New Chat', titleProvisional: true, messages: rows };
+        var before = rows.length;
+        M.executeAfterResponseHooks('c1', anchor);
+        return { M: M, runs: runs, added: rows.length - before };
+    }
+    function prior() {
+        return [{ role: 'user', content: 'do it' },
+            { role: 'assistant', content: '', tool_calls: [{ id: 't1', function: { name: 'workspace', arguments: '{}' } }] },
+            { role: 'tool', tool_call_id: 't1', content: '{}' },
+            { role: 'assistant', content: 'Done.' }];
+    }
+    test('summary turn (anchored): no hook row, no runAgent', async function() {
+        var rows = prior().concat([{ role: 'user', content: 'Please summarize', isSummaryRequest: true }, { role: 'assistant', content: LONG }]);
+        var r = await run(rows, 4);
+        assert.strictEqual(r.runs.length, 0, 'runAgent must not run on the handed-off chat');
+        assert.strictEqual(r.added, 0, 'no hook message pushed');
+        assert.strictEqual(r.M._hkIsSummaryTurn({ messages: rows }, 4), true);
+    });
+    test('summary turn (unanchored / hook-row anchor falls back to the summary row)', async function() {
+        var rows = prior().concat([{ role: 'user', content: 'Please summarize', isSummaryRequest: true }, { role: 'assistant', content: LONG },
+            { role: 'user', content: 'hook', isHookMessage: true }, { role: 'assistant', content: 'ok' }]);
+        assert.strictEqual((await run(rows.slice(), undefined)).runs.length, 0);
+        assert.strictEqual((await run(rows.slice(), 6)).runs.length, 0);
+    });
+    test('normal turn unaffected: hooks still fire', async function() {
+        var rows = prior().concat([{ role: 'user', content: 'explain' }, { role: 'assistant', content: LONG }]);
+        var r = await run(rows, 4);
+        assert.strictEqual(r.runs.length, 1, 'hook run fires');
+        assert.ok(r.added >= 1, 'hook message pushed');
+        assert.strictEqual(r.M._hkIsSummaryTurn({ messages: rows }, 4), false);
+    });
+    test('a real user row after an earlier summary request is not gated', async function() {
+        var m = (await run(prior(), 0)).M;
+        var rows = [{ role: 'user', content: 'sum', isSummaryRequest: true }, { role: 'assistant', content: 's' }, { role: 'user', content: 'more' }, { role: 'assistant', content: 'a' }];
+        assert.strictEqual(m._hkIsSummaryTurn({ messages: rows }, 2), false);
+        assert.strictEqual(m._hkIsSummaryTurn({ messages: rows }, undefined), false);
+        assert.strictEqual(m._hkIsSummaryTurn({ messages: rows }, 0), true, 'anchored on the summary row');
+    });
+});
+
 // R3 SHOULD-FIX-2: the stamp is scoped to the ORGANIC user turn it was taken
 // under — a card from an earlier turn must not silence the nudge forever.
 describe('#16 progress-card stamp is per-turn (_resetProgressCardStampForTurn, app/030-agent-loop.js)', function() {

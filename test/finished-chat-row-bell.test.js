@@ -58,4 +58,42 @@ describe('finished-chat bell shows on the chat row, not only on the pill', funct
         assert.ok(m.getFinishedChatBell('c2'), 'bell returns once no longer running');
         assert.strictEqual(m.getUnseenFinishedChatsInfo().count, 1);
     }, { tags: ['unit'], timeout: 5000 });
+
+    test('continued chat: the handoff finish is silent, a later run in the old chat rings the bell', async function() {
+        var m = await loadBellModules();
+        var now = Date.now();
+        // Handoff just happened: the summary run's late notifyFinish is suppressed.
+        var hand = [{ role: 'user', content: 'do x' }, { role: 'assistant', content: 'ok' },
+            { role: 'user', content: 'HANDOFF', isSummaryRequest: true }, { role: 'assistant', content: 'done' }];
+        var h = finishedChat('h'); h.continuedTo = 'n'; h.continuedAt = now - 1000; h.messages = hand.slice();
+        m.__scope.chats.h = h;
+        m.noteChatFinishedUnseen('h', false);
+        assert.strictEqual(m.getFinishedChatBell('h'), null, 'handoff finish: no bell');
+        // Legacy link without continuedAt: still suppressed.
+        // (message-evicted skeleton → timestamp fallback)
+        var lg = finishedChat('lg'); lg.continuedTo = 'n'; delete lg.messages; lg._messagesEvicted = true;
+        m.__scope.chats.lg = lg;
+        // Run identity, no grace window: "Send here anyway" 1s after the
+        // handoff (a user row after the request) rings the bell immediately.
+        var q = finishedChat('q'); q.continuedTo = 'n'; q.continuedAt = now - 1000;
+        q.messages = hand.concat([{ role: 'user', content: 'send here anyway' }, { role: 'assistant', content: 'r' }]);
+        m.__scope.chats.q = q;
+        m.noteChatFinishedUnseen('q', false);
+        assert.ok(m.getFinishedChatBell('q'), 'post-handoff run inside the old 30s grace: bell');
+        // Evicted skeleton inside the grace: timestamp fallback still suppresses.
+        var sk = finishedChat('sk'); sk.continuedTo = 'n'; sk.continuedAt = now - 1000; delete sk.messages; sk._messagesEvicted = true;
+        m.__scope.chats.sk = sk;
+        m.noteChatFinishedUnseen('sk', false);
+        assert.strictEqual(m.getFinishedChatBell('sk'), null, 'evicted skeleton: timestamp fallback');
+        m.noteChatFinishedUnseen('lg', false);
+        assert.strictEqual(m.getFinishedChatBell('lg'), null, 'legacy link: no bell');
+        // "Send here anyway" run finishing well after the handoff: bell + unseen.
+        var o = finishedChat('o'); o.continuedTo = 'n'; o.continuedAt = now - 10 * 60 * 1000;
+        o.messages = hand.concat([{ role: 'user', content: 'more' }, { role: 'assistant', content: 'r' }]);
+        m.__scope.chats.o = o;
+        m.noteChatFinishedUnseen('o', false);
+        assert.ok(m.getFinishedChatBell('o'), 'later run: bell');
+        assert.strictEqual(m._jobsChatState('o'), 'unseen');
+        assert.strictEqual(m.getUnseenFinishedChatsInfo().count, 2, 'q (send-here-anyway inside 30s) + o');
+    }, { tags: ['unit'], timeout: 5000 });
 });

@@ -929,6 +929,15 @@ function _widgetIdForIframe(iframe) {
 }
 
 // Listen for download requests from widgets (sandbox can't trigger downloads directly)
+// openFileDownloadTab: open the file-download page in a new tab (not
+// sandboxed, can trigger the download). Shared by widget downloads and the
+// display 'file' template (tools/090-display-templates.js).
+function openFileDownloadTab(fileId, name) {
+    return Promise.resolve().then(function() {
+        var url = chrome.runtime.getURL('file-download.html?id=' + encodeURIComponent(fileId) + '&name=' + encodeURIComponent(name || 'download'));
+        return chrome.tabs.create({ url: url });
+    });
+}
 window.addEventListener('message', function(event) {
     if (event.data && event.data.type === 'widgetDownload') {
         if (!_isWidgetSource(event.source)) return;
@@ -942,11 +951,7 @@ window.addEventListener('message', function(event) {
         var reply = function(ok, error) {
             try { src.postMessage({ type: 'widgetDownloadResult', reqId: reqId, ok: ok, error: error }, '*'); } catch (e) {}
         };
-        Promise.resolve().then(function() {
-            // Open file-download page in a new tab (not sandboxed, can trigger download)
-            var url = chrome.runtime.getURL('file-download.html?id=' + encodeURIComponent(fileId) + '&name=' + encodeURIComponent(name));
-            return chrome.tabs.create({ url: url });
-        }).then(function() { reply(true, null); }, function(e) {
+        openFileDownloadTab(fileId, name).then(function() { reply(true, null); }, function(e) {
             reply(false, String((e && e.message) || e || 'Could not open the download tab'));
         });
     }

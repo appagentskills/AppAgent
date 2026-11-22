@@ -387,9 +387,34 @@ function _hkTurnNeedsTldr(chat, anchorUserIdx, target) {
     return false;
 }
 
+// Continue-in-new-chat (#1374/#1377): the handoff summary turn (user row
+// `isSummaryRequest`, ui/170-chat-management.js summarizeAndStartNewChat) is
+// the old chat's last turn — the page links it and stamps continuedAt. Running
+// TL;DR / title / links / progress hooks on it is pointless AND re-runs the
+// old chat after the handoff, bumping lastResponseAt past the continued-handoff
+// window so the old chat shows unread. Same turn resolution as
+// findHookAnswerSpan: a valid non-hook user-row anchor, else the last non-hook
+// user row (a hook run's own anchor is a hook row → falls back here too).
+function _hkIsSummaryTurn(chat, anchorUserIdx) {
+    var ms = chat && chat.messages;
+    if (!ms) return false;
+    var row = null;
+    if (typeof anchorUserIdx === 'number' && anchorUserIdx >= 0 && anchorUserIdx < ms.length) {
+        var a = ms[anchorUserIdx];
+        if (a && a.role === 'user' && !a.isHookMessage) row = a;
+    }
+    if (!row) {
+        for (var i = ms.length - 1; i >= 0; i--) {
+            if (ms[i] && ms[i].role === 'user' && !ms[i].isHookMessage) { row = ms[i]; break; }
+        }
+    }
+    return !!(row && row.isSummaryRequest);
+}
+
 function executeAfterResponseHooks(chatId, anchorUserIdx) {
     var chat = chats[chatId];
     if (!chat || !chat.messages || chat.messages.length < 2) return;
+    if (_hkIsSummaryTurn(chat, anchorUserIdx)) return;
     var _hkAnchor = (typeof anchorUserIdx === 'number') ? anchorUserIdx : undefined;
     // C4: a WAKE run (anchor row = an injected-only user row — a sub-agent
     // report / lifecycle / message notice) keeps lastUserMsgIndex as its

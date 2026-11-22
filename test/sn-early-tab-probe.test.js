@@ -8,7 +8,7 @@ var EX = await runFile('test/extract.js', { i18n: false });
 
 describe('early SN tab adoption (background.js)', function() {
     var FNS = ['snLoginProbeState', 'snIsNonInstanceHost', 'snLooksLikeSnUrl', 'snLoginLooksSignedIn', 'snEarlyLooksAdoptable',
-        'snTimeoutMs', 'snWithTimeout', 'snInjectBounded', 'snFetchWithTimeout', 'snFetchUserName', 'snStrictTokenOk', 'snTokenAccepted',
+        'snTimeoutMs', 'snWithTimeout', 'snInjectBounded', 'snFetchWithTimeout', 'snIsHtmlResponse', 'snResponseIsDeadInstance', 'snFetchUserName', 'snStrictTokenOk', 'snTokenAccepted',
         'snUpdateInstanceTokens', 'snNotifyInstancesChanged', '_snProbeNegHit', 'snProbeNegForget',
         'probeTab', 'snProbeTabState', 'onTabReady', 'getSnTabList',
         'snEarlyTabProbe', 'snOnTabComplete', 'snOnTabUpdated'];
@@ -66,12 +66,19 @@ describe('early SN tab adoption (background.js)', function() {
         return api;
     }
     var flush = function(ms) { return new Promise(function(r) { setTimeout(r, ms || 30); }); };
+    // Event-driven waits instead of fixed sleeps: fixed 30-150ms flushes and
+    // tight elapsed-time bounds flaked under full-suite load (event-loop stalls).
+    var until = async function(cond, ms) {
+        var end = Date.now() + (ms || 2000);
+        while (!cond()) { if (Date.now() > end) return false; await flush(10); }
+        return true;
+    };
 
     test('onUpdated wiring: loading adopts early, complete does not re-run onTabReady', async function() {
         var a = await build({ page: function(id, n) { return n < 2 ? page({ token: '' }) : page(); } });
         var url = D1 + '/now/nav/ui/home';
         a.updated(5, { status: 'loading' }, { url: url, active: false });
-        await flush(150);
+        await until(function() { return a.e.store.sessionToken === 'gck' && a.notifies() >= 1; });
         assert.strictEqual(a.e.store.sessionToken, 'gck', 'adopted before complete');
         assert.strictEqual(a.e.store.instanceTokens[D1].token, 'gck');
         var probes = a.e.scripts, fetches = a.e.fetches;
@@ -85,10 +92,10 @@ describe('early SN tab adoption (background.js)', function() {
     }, { tags: ['unit'], timeout: 3000 });
 
     test('onTabReady runs once when complete arrives while the early adoption is in flight', async function() {
-        var a = await build({ page: function() { return page(); }, fetch: function() { return { status: 200, delay: 120 }; } });
+        var a = await build({ page: function() { return page(); }, fetch: function() { return { status: 200, delay: 300 }; } });
         var url = D1 + '/';
         a.updated(6, { status: 'loading' }, { url: url });
-        await flush(40); // early run is now inside the token check
+        await until(function() { return a.e.fetches >= 1; }); // early run is now inside the token check
         var c = a.complete(6, url);
         assert.strictEqual(await c, true, 'complete awaited the early run');
         await flush(30);
@@ -100,14 +107,21 @@ describe('early SN tab adoption (background.js)', function() {
     }, { tags: ['unit'], timeout: 3000 });
 
     test('guest g_ck on /navpage.do while readyState is loading is rejected by the strict check (401)', async function() {
-        var a = await build({ maxMs: 300, page: function() { return page({ token: 'guest', path: '/navpage.do', readyState: 'loading' }); },
+        // Event-driven, not wall-clock: the poll is ended by 'complete' once the
+        // 3rd probe ran. (A 300ms deadline flaked under suite load: one event-loop
+        // stall > ~280ms after the 1st probe expired it before a 2nd probe.)
+        var third, reached3 = new Promise(function(r) { third = r; });
+        var a = await build({ page: function(id, n) { if (n === 3) third(); return page({ token: 'guest', path: '/navpage.do', readyState: 'loading' }); },
             fetch: function() { return { status: 401 }; } });
-        var ok = await a.early(7, D1 + '/navpage.do');
-        assert.strictEqual(ok, false);
+        var url = D1 + '/navpage.do';
+        var p = a.early(7, url);
+        await reached3;
+        assert.strictEqual(await a.complete(7, url), false, "'complete' runs onTabReady: the cached 401 still rejects");
+        assert.strictEqual(await p, false);
         assert.strictEqual(a.e.fetches, 1, 'one strict check; the cached 401 is reused while polling');
         assert.strictEqual(a.e.store.sessionToken, undefined);
         assert.strictEqual(a.e.store.instanceTokens, undefined);
-        assert.ok(a.e.scripts >= 2, 'kept polling after the rejection');
+        assert.ok(a.e.scripts >= 3, 'kept polling after the rejection');
         assert.strictEqual(a.e.notImmediate || 0, 0, 'probes use injectImmediately');
     }, { tags: ['unit'], timeout: 3000 });
 
@@ -138,7 +152,7 @@ describe('early SN tab adoption (background.js)', function() {
         var t0 = Date.now();
         assert.strictEqual(await a.early(9, D1 + '/'), false);
         var ms = Date.now() - t0;
-        assert.ok(ms < 600, 'took ' + ms + 'ms (tab timeout is 2500ms)');
+        assert.ok(ms < 2000, 'took ' + ms + 'ms (tab timeout is 2500ms)');
         assert.strictEqual(a.e.scripts, 1);
     }, { tags: ['unit'], timeout: 3000 });
 
@@ -146,7 +160,7 @@ describe('early SN tab adoption (background.js)', function() {
         var a = await build({ maxMs: 300, timeouts: { fetch: 150 }, page: function() { return page(); }, fetch: function() { return 'hang'; } });
         var t0 = Date.now();
         assert.strictEqual(await a.early(10, D1 + '/'), false);
-        assert.ok(Date.now() - t0 < 700, 'took ' + (Date.now() - t0) + 'ms');
+        assert.ok(Date.now() - t0 < 2500, 'took ' + (Date.now() - t0) + 'ms (default fetch timeout is 5000ms)');
         await flush(100);
         assert.strictEqual(a.e.store.sessionToken, undefined);
         assert.strictEqual(a.notifies(), 0);
@@ -166,7 +180,7 @@ describe('early SN tab adoption (background.js)', function() {
         assert.strictEqual(a.e.store.instanceTokens[D1].updated, 1, 'no rewrite');
         var b = await build({ store: store, page: function() { return page({ token: 'gck2' }); } });
         await b.ready(12);
-        await flush(30);
+        await until(function() { return b.notifies() >= 1; });
         assert.strictEqual(b.notifies(), 1, 'token changed');
     }, { tags: ['unit'], timeout: 3000 });
 

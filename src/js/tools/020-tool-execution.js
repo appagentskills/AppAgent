@@ -291,6 +291,37 @@ async function _liOtherTabInfo(excludeIds) {
     return out;
 }
 
+// continue_in_new_chat {title, summary}: the "Continue in a new chat" handoff
+// turn's output channel (ui/170 HANDOFF_SUMMARY_PROMPT). The executor only
+// validates and acknowledges — the page reads the call's arguments from the
+// assistant tool_calls (ui/170 getHandoffResult) and creates the new chat
+// itself, appending the user's messages in code. Valid only while the
+// calling chat's latest non-hook user row is the handoff request
+// (isSummaryRequest); anywhere else it is refused and does nothing. Rows
+// flushed into the run mid-turn (injected && midRun) are skipped like hook
+// rows; an idle-path injected row (no midRun) started a new run and ends it.
+var CONTINUE_IN_NEW_CHAT_OUTSIDE_ERROR = 'continue_in_new_chat can only be called during a "Continue in a new chat" handoff';
+function _isHandoffTurnChat(chat) {
+    var ms = chat && chat.messages;
+    if (!Array.isArray(ms)) return false;
+    for (var i = ms.length - 1; i >= 0; i--) {
+        var m = ms[i];
+        if (m && m.role === 'user' && !m.isHookMessage && !(m.injected && m.midRun)) return !!m.isSummaryRequest;
+    }
+    return false;
+}
+function executeContinueInNewChat(args, options) {
+    var chatId = options && options.chatId;
+    var chat = chatId ? chats[chatId] : null;
+    if (!chat || chat.isSubAgent || chat.parentChatId || chat.continuedTo || !_isHandoffTurnChat(chat)) {
+        return { success: false, error: CONTINUE_IN_NEW_CHAT_OUTSIDE_ERROR };
+    }
+    var a = args || {};
+    if (typeof a.title !== 'string' || !a.title.trim()) return { success: false, error: 'title is required (a short name for the new chat, at most 60 characters)' };
+    if (typeof a.summary !== 'string' || !a.summary.trim()) return { success: false, error: 'summary is required (the full handoff summary, markdown)' };
+    return { success: true, message: 'Handoff recorded. The app will create the new chat with this title and summary and append the user\'s messages itself. Do not repeat the summary as text; reply with at most one short sentence.' };
+}
+
 // Execute set_chat_title tool
 // SW context: currentChatId is always null (page-only global). Threading the
 // chatId through options lets the agent loop tell us which chat to title;
@@ -1221,11 +1252,18 @@ async function _rsCheckAdmin(instanceUrl, token, ctx) {
     var inst = ((typeof Platform !== 'undefined' && Platform.instances) || []).filter(function(i) {
         return i && String(i.url || '').replace(/\/+$/, '') === key;
     })[0] || null;
-    var who = (inst && inst.userName) || 'current user';
+    // The cached roles / user name describe the session of inst.token only. For
+    // any other token (signed out and back in as another user, a fresher tab
+    // token) they prove nothing: no fast path, and the live check below treats
+    // the identity as unknown.
+    var tokMatch = !!(inst && inst.token && token && inst.token === token);
+    var cRoles = (tokMatch && Array.isArray(inst.roles)) ? inst.roles : [];
+    var cUser = (tokMatch && inst.userName) || '';
+    var who = cUser || 'current user';
     var where = (inst && inst.shortName) || key.replace(/^https?:\/\//, '').split('.')[0] || 'this instance';
-    var okKey = key + '|' + ((inst && inst.userName) || '') + '|' + String(token || '');
+    var okKey = key + '|' + cUser + '|' + String(token || '');
     if (_rsAdminOk[okKey]) return { ok: true };
-    if (inst && Array.isArray(inst.roles) && (inst.roles.indexOf('admin') !== -1 || inst.roles.indexOf('maint') !== -1)) { _rsAdminOk[okKey] = true; return { ok: true }; }
+    if (cRoles.indexOf('admin') !== -1 || cRoles.indexOf('maint') !== -1) { _rsAdminOk[okKey] = true; return { ok: true }; }
     var denied = 'User ' + who + ' lacks the admin role on ' + where + '; server scripts require admin — use servicenow_api (Table API) instead.';
     try {
         var res = await _toolFetch(key + '/api/now/table/sys_user_has_role?sysparm_query=' + encodeURIComponent('user=javascript:gs.getUserID()^role.name=admin') + '&sysparm_fields=sys_id&sysparm_limit=1', {
@@ -1239,7 +1277,7 @@ async function _rsCheckAdmin(instanceUrl, token, ctx) {
         // no roles, more access than admin) — only when no user name is known.
         // The lookup above succeeded (a roles probe) — probe maint only with no cached
         // roles and no (non-maint) user name: ONE request, cached per URL+token.
-        if (typeof snMaintEligible === 'function' && snMaintEligible((inst && inst.roles) || [], true, inst && inst.userName)) {
+        if (typeof snMaintEligible === 'function' && snMaintEligible(cRoles, true, cUser)) {
             if (await snDetectMaint(key, token, function(u, o) { return _toolFetch(u, o, ctx, 30000); })) {
                 _rsAdminOk[okKey] = true;
                 return { ok: true };
@@ -2372,7 +2410,12 @@ async function _executeToolInner(name, args, messageIndex, options) {
         catch (e) { return { success: false, error: 'connect_instance failed: ' + ((e && e.message) || e) }; }
         if (_ciRes && _ciRes.success) {
             try { if (Platform.refreshInstances) await Platform.refreshInstances(); } catch (e) {}
-            return { success: true, instance: _ciRes.instance, userName: _ciRes.userName || '', tabId: _ciRes.tabId || null, alreadyConnected: !!_ciRes.alreadyConnected };
+            var _ciOut = { success: true, instance: _ciRes.instance, userName: _ciRes.userName || '', tabId: _ciRes.tabId || null, alreadyConnected: !!_ciRes.alreadyConnected };
+            // An existing session as ANOTHER user is still success:true (no login
+            // was attempted) — keep the warning so the agent can tell the user.
+            if (_ciRes.userMismatch) _ciOut.userMismatch = true;
+            if (_ciRes.note) _ciOut.note = String(_ciRes.note);
+            return _ciOut;
         }
         return { success: false, instance: _ciUrl, reason: (_ciRes && _ciRes.reason) || 'unknown', error: (_ciRes && _ciRes.error) || 'Login failed.' };
     } else if (name === 'list_instances') {
@@ -2428,7 +2471,10 @@ async function _executeToolInner(name, args, messageIndex, options) {
                     var _dr = await _liFetchDirectRoles(inst.url, _tok);
                     var _mt = false;
                     // maint: no direct roles + no user name + admin-level roles-table read.
-                    if (typeof snMaintEligible === 'function' && snMaintEligible(_dr, true, inst.userName)) {
+                    // inst.userName belongs to inst.token only: a different (session/
+                    // fallback) token is another identity (mirrors cUser in _rsCheckAdmin).
+                    var _liUser = _tok === inst.token ? inst.userName : '';
+                    if (typeof snMaintEligible === 'function' && snMaintEligible(_dr, true, _liUser)) {
                         _mt = await snDetectMaint(inst.url, _tok);
                         if (_mt) _dr = ['maint', 'admin'];
                     }
@@ -2907,6 +2953,8 @@ async function _executeToolInner(name, args, messageIndex, options) {
         return await executeIframeTool(args, options);
     } else if (name === 'set_chat_title') {
         return executeSetChatTitle(args, options);
+    } else if (name === 'continue_in_new_chat') {
+        return executeContinueInNewChat(args, options);
     } else if (name === 'set_tldr') {
         var _hkCold = _hookToolColdChatId(options); if (_hkCold) await _hydrateColdHookChat(_hkCold);
         return executeSetTldr(args, options);
@@ -2936,6 +2984,20 @@ async function _executeToolInner(name, args, messageIndex, options) {
     } else if (name === 'manage_skill') {
         return await executeManageSkill(args);
     } else if (name === 'display') {
+        // template 'file': resolve Agent Files paths / file_ids first so the
+        // persisted args carry file_id/size/thumb and re-render synchronously.
+        if (args && args.template === 'file' && typeof resolveDisplayFiles === 'function') {
+            // options (chatId …) gate connected-folder snapshot reads via
+            // lfAuthorizeSourceRead (local_folder:read Off/Ask honoured).
+            args = await resolveDisplayFiles(args, options);
+            var fileDisp = executeDisplay(args, messageIndex, options);
+            if (fileDisp && fileDisp.success) fileDisp.files = (args.files || []).map(function(f) { return f.error ? { name: f.name || f.path || f.file_id, error: f.error } : { name: f.name, file_id: f.file_id, size: f.size }; });
+            if (fileDisp && fileDisp.success && args.files_omitted) {
+                fileDisp.truncated = args.files_omitted;
+                fileDisp.warning = 'Only the first ' + (args.files || []).length + ' files are shown; ' + args.files_omitted + ' more were dropped. Split them across several display calls.';
+            }
+            return fileDisp;
+        }
         return executeDisplay(args, messageIndex, options);
     } else if (name === 'document') {
         return await executeSmartDocument(args, messageIndex, options);

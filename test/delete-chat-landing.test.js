@@ -240,7 +240,7 @@ test('TA-9: continue-from-summary resets a stale composer hint (A6A3-02)', async
     };
     // Handoff helpers the excerpt calls (seed builder + summary extraction).
     var helpers = (/\nvar HANDOFF_USER_MSG_VERBATIM_MAX = \d+;\nvar HANDOFF_USER_MSG_HEAD = \d+;/.exec(src) || [''])[0] + '\n' +
-        ['extractHandoffSummary', '_isTypedUserMessage', 'buildHandoffUserMessages', 'buildContinuationSeed']
+        ['extractHandoffSummary', 'stripContinuedPrefix', 'extractHandoffTitle', 'cleanHandoffTitle', '_findHandoffToolCall', 'getHandoffResult', '_getHandoffTextResult', '_isTypedUserMessage', 'buildHandoffUserMessages', 'buildContinuationSeed']
             .map(function(n) { return dclDeclaration(src, 'function ' + n); }).join('\n');
     var fn = new Function('env', 'with (env) {\n' + dclI18n(all) + '\n' + helpers + '\n' + dclDeclaration(src, 'function resetComposerPlaceholder') + '\n' +
         dclDeclaration(src, 'async function completeSummaryAndCreateNewChat') + '\nreturn completeSummaryAndCreateNewChat;\n}')(env);

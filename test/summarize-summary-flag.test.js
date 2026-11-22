@@ -49,6 +49,75 @@ describe('summarize › isSummary flag (A2B3-01)', function() {
         assert.strictEqual(stamp(chat), false, 'already stamped: no second stamp / save');
     }, { tags: ['unit'] });
 
+    test('_stampSummaryReply stamps the continue_in_new_chat call row of an isSummaryRequest turn (#1391)', async function() {
+        var stamp = await ssfStampFn();
+        var call = { id: 'h1', type: 'function', function: { name: 'continue_in_new_chat', arguments: '{"title":"T","summary":"S"}' } };
+        var chat = { messages: [
+            { role: 'user', content: 'earlier question' },
+            { role: 'assistant', content: 'earlier answer', tool_calls: [{ id: 'old', function: { name: 'continue_in_new_chat', arguments: '{}' } }] },
+            { role: 'user', content: 'Please summarize this conversation', isSummaryRequest: true },
+            { role: 'assistant', content: '<analysis>x</analysis>', tool_calls: [call] },
+            { role: 'tool', tool_call_id: 'h1', content: '{"success":true}' },
+            { role: 'assistant', content: 'Handing off.' },
+            { role: 'assistant', content: '', metrics: { isAggregate: true, callCount: 2 } }
+        ] };
+        assert.strictEqual(stamp(chat), true, 'stamps and reports it (caller saves)');
+        assert.strictEqual(chat.messages[3].isSummary, true, 'the continue_in_new_chat call row is marked');
+        assert.strictEqual(chat.messages[5].isSummary, true, 'the final tool-free reply is still marked');
+        assert.strictEqual(chat.messages[6].isSummary, undefined, 'aggregate metric row not marked');
+        assert.strictEqual(chat.messages[1].isSummary, undefined, 'a call row before the summary request is untouched');
+        assert.strictEqual(chat.messages[4].isSummary, undefined, 'the tool result row is not marked');
+        assert.strictEqual(stamp(chat), false, 'already stamped: no second stamp / save');
+        // Call-only turn (no trailing text reply): the call row alone is stamped.
+        var callOnly = { messages: [{ role: 'user', content: 'sum', isSummaryRequest: true },
+            { role: 'assistant', content: '', tool_calls: [call] }] };
+        assert.strictEqual(stamp(callOnly), true);
+        assert.strictEqual(callOnly.messages[1].isSummary, true);
+        // Same call outside a summary-request turn: never stamped.
+        var normal = { messages: [{ role: 'user', content: 'hi' }, { role: 'assistant', content: '', tool_calls: [call] }] };
+        assert.strictEqual(stamp(normal), false);
+        assert.strictEqual(normal.messages[1].isSummary, undefined);
+    }, { tags: ['unit'] });
+
+    test('_stampSummaryReply skips rows injected mid-run (worker reports, queued user text) (#1391)', async function() {
+        var stamp = await ssfStampFn();
+        var call = { id: 'h1', type: 'function', function: { name: 'continue_in_new_chat', arguments: '{"title":"T","summary":"S"}' } };
+        var chat = { messages: [
+            { role: 'user', content: 'earlier question' },
+            { role: 'user', content: 'Please summarize this conversation', isSummaryRequest: true },
+            { role: 'assistant', content: '', tool_calls: [call] },
+            { role: 'tool', tool_call_id: 'h1', content: '{"success":true}' },
+            { role: 'user', content: '[worker report]', injected: true, midRun: true },
+            { role: 'assistant', content: 'Handing off.' },
+            { role: 'user', content: 'typed mid-run', injected: true, midRun: true, hasUserText: true }
+        ] };
+        assert.strictEqual(stamp(chat), true, 'the injected rows do not hide the isSummaryRequest row');
+        assert.strictEqual(chat.messages[2].isSummary, true, 'call row stamped');
+        assert.strictEqual(chat.messages[5].isSummary, true, 'final text reply stamped');
+        assert.strictEqual(chat.messages[4].isSummary, undefined, 'injected rows untouched');
+        assert.strictEqual(chat.messages[6].isSummary, undefined);
+        // An injected row after a NORMAL turn still never stamps.
+        var normal = { messages: [{ role: 'user', content: 'hi' }, { role: 'assistant', content: 'hello' },
+            { role: 'user', content: '[wake]', injected: true }, { role: 'assistant', content: 'ok' }] };
+        assert.strictEqual(stamp(normal), false);
+    }, { tags: ['unit'] });
+
+    test('_stampSummaryReply: an idle-path injected row (no midRun) after the summary request ends the turn (#1391)', async function() {
+        var stamp = await ssfStampFn();
+        var call = { id: 'h1', type: 'function', function: { name: 'continue_in_new_chat', arguments: '{"title":"T","summary":"S"}' } };
+        // Failed/abandoned handoff, then a later wake run started by an idle-path notice row.
+        var chat = { messages: [
+            { role: 'user', content: 'Please summarize this conversation', isSummaryRequest: true },
+            { role: 'assistant', content: 'abandoned' },
+            { role: 'user', content: '[sub-agent report]', injected: true },
+            { role: 'assistant', content: '', tool_calls: [call] },
+            { role: 'tool', tool_call_id: 'h1', content: '{"success":false}' },
+            { role: 'assistant', content: 'wake run reply' }
+        ] };
+        assert.strictEqual(stamp(chat), false, 'the wake run is not the summary turn');
+        [1, 3, 5].forEach(function(i) { assert.strictEqual(chat.messages[i].isSummary, undefined, 'row ' + i + ' not stamped'); });
+    }, { tags: ['unit'] });
+
     test('_stampSummaryReply is a no-op for a normal turn, a tool_calls reply and an aggregate row', async function() {
         var stamp = await ssfStampFn();
         var normal = { messages: [{ role: 'user', content: 'hi' }, { role: 'assistant', content: 'hello' }] };
@@ -74,7 +143,7 @@ describe('summarize › isSummary flag (A2B3-01)', function() {
             var m = new RegExp('\\nvar ' + n + ' = \\d+;').exec(src);
             if (!m) throw new Error('Missing declaration: ' + n);
             return m[0];
-        }).join('\n') + '\n' + ['extractHandoffSummary', '_isTypedUserMessage', 'buildHandoffUserMessages', 'buildContinuationSeed']
+        }).join('\n') + '\n' + ['extractHandoffSummary', 'stripContinuedPrefix', 'extractHandoffTitle', 'cleanHandoffTitle', '_findHandoffToolCall', 'getHandoffResult', '_getHandoffTextResult', '_isTypedUserMessage', 'buildHandoffUserMessages', 'buildContinuationSeed']
             .map(function(n) { return ssfDeclaration(src, n); }).join('\n');
         var code = ssfI18n(all) + '\n' + helpers + '\n' + ssfDeclaration(src, 'completeSummaryAndCreateNewChat', 'async ');
         var snacks = [], runs = 0, saves = 0;

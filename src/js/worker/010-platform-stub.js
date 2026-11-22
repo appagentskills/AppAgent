@@ -223,8 +223,10 @@ Platform.refreshInstances = async function() {
             var _hasTabs = !!(_activeEntry.tabs && _activeEntry.tabs.length);
             if (!_activeEntry.token && !_provenDead && _hasTabs) {
                 _activeEntry.token = _heldTok;
-                if (!_activeEntry.userName && _prevActive) _activeEntry.userName = _prevActive.userName || '';
-                if ((!_activeEntry.roles || !_activeEntry.roles.length) && _prevActive) _activeEntry.roles = _prevActive.roles || [];
+                // Carry the prior identity only when it belongs to the held token.
+                var _prevSame = !!(_prevActive && _prevActive.token === _heldTok);
+                if (!_activeEntry.userName && _prevSame) _activeEntry.userName = _prevActive.userName || '';
+                if ((!_activeEntry.roles || !_activeEntry.roles.length) && _prevSame) _activeEntry.roles = _prevActive.roles || [];
             }
             // 401'd by the probe, or the open tab answered signed-out: drop it.
             if (_heldRejected || (!_activeEntry.token && _provenDead)) _dropWorkerToken(_heldTok);
@@ -238,8 +240,10 @@ Platform.refreshInstances = async function() {
                 shortName: _ah.split('.')[0],
                 host: _ah,
                 token: '',
-                userName: _prevActive ? (_prevActive.userName || '') : '',
-                roles: _prevActive ? (_prevActive.roles || []) : [],
+                // Carry the prior identity only when it belongs to the held token
+                // (Memory-Saver restore, same user); otherwise it is another user's.
+                userName: (_prevActive && _prevActive.token === _heldTok) ? (_prevActive.userName || '') : '',
+                roles: (_prevActive && _prevActive.token === _heldTok) ? (_prevActive.roles || []) : [],
                 tabs: [],
                 isActive: true
             });
@@ -297,6 +301,16 @@ Platform.refreshTokenAfter401 = function(instanceUrl, failedToken) {
         var fresh = (probed && probed.token && probed.token !== failedToken) ? probed.token : '';
         for (var i = 0; i < Platform.instances.length; i++) {
             if (Platform.instances[i].url !== instanceUrl) continue;
+            // Roles / maint describe the OLD token's user: a replacement token
+            // may be another user (signed out and back in), so they are dropped
+            // until the next registry resolve re-reads them for the new token.
+            if (Platform.instances[i].token !== fresh) {
+                Platform.instances[i].roles = [];
+                if ('isMaint' in Platform.instances[i]) Platform.instances[i].isMaint = false;
+                // The old token's user name must not survive either: a stale name
+                // made _rsCheckAdmin skip the maint probe and name the wrong user.
+                Platform.instances[i].userName = (fresh && probed.userName) || '';
+            }
             Platform.instances[i].token = fresh;
             if (fresh && probed.userName) Platform.instances[i].userName = probed.userName;
         }

@@ -763,6 +763,17 @@ async function lfShareFile(folder, path, opts) {
     }
     return out;
 }
+// SNAPSHOT: a connected-folder file -> a blob file_id (display 'file' cards).
+// file-download.html only resolves Agent Files folder pointers, so a pointer
+// into a user-connected folder would render a card whose Download fails.
+// Bytes are read once (lfReadFileBytes: TOO_LARGE over maxReadBytes) and
+// stored under the stable per-path id, so re-displaying the same path
+// overwrites one record. Returns the bytes too (thumbnails).
+async function lfSnapshotFile(folder, path) {
+    var r = await lfReadFileBytes(folder, path);
+    var id = await _lfRegister({ type: 'memory', data: r.bytes, name: r.name, mime: r.mime }, lfShareFileId(r.folder, r.path));
+    return { file_id: id, name: r.name, mime: r.mime, size: r.size, lastModified: r.lastModified, folder: r.folder, path: r.path, bytes: r.bytes };
+}
 function lfDataUrlCharLimit(args, options) {
     var prog = lfIsProgrammaticCaller(options);
     var ceiling = prog ? LF_DATA_URL_PROGRAMMATIC_MAX_CHARS : LF_DATA_URL_DIRECT_OVERRIDE_MAX_CHARS;

@@ -1934,5 +1934,7 @@
   "Go to the new chat": "Yeni sohbete git",
   "Send here anyway": "Yine de buraya gönder",
   "This chat continues in \"{title}\". Workers, PRs and widgets now live there.": "Bu sohbet \"{title}\" içinde devam ediyor. Çalışanlar, PR'lar ve widget'lar artık orada.",
-  "deleted chat": "silinmiş sohbet"
+  "deleted chat": "silinmiş sohbet",
+  "Go to new chat": "Yeni sohbete git",
+  "Go to previous chat": "Önceki sohbete git"
 }

@@ -1934,5 +1934,7 @@
   "Go to the new chat": "Siirry uuteen keskusteluun",
   "Send here anyway": "Lähetä silti tänne",
   "This chat continues in \"{title}\". Workers, PRs and widgets now live there.": "Tämä keskustelu jatkuu kohteessa \"{title}\". Workerit, PR:t ja widgetit ovat nyt siellä.",
-  "deleted chat": "poistettu keskustelu"
+  "deleted chat": "poistettu keskustelu",
+  "Go to new chat": "Siirry uuteen keskusteluun",
+  "Go to previous chat": "Siirry edelliseen keskusteluun"
 }

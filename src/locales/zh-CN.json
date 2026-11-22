@@ -1934,5 +1934,7 @@
   "Go to the new chat": "前往新对话",
   "Send here anyway": "仍然在此发送",
   "This chat continues in \"{title}\". Workers, PRs and widgets now live there.": "此对话已在“{title}”中延续。工作者、PR 和小组件现在都在那里。",
-  "deleted chat": "已删除的对话"
+  "deleted chat": "已删除的对话",
+  "Go to new chat": "前往新聊天",
+  "Go to previous chat": "前往上一个聊天"
 }

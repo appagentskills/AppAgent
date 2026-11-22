@@ -1934,5 +1934,7 @@
   "Go to the new chat": "الانتقال إلى المحادثة الجديدة",
   "Send here anyway": "الإرسال هنا على أي حال",
   "This chat continues in \"{title}\". Workers, PRs and widgets now live there.": "تتابع هذه المحادثة في \"{title}\". أصبح العمال وطلبات السحب والأدوات موجودة هناك الآن.",
-  "deleted chat": "محادثة محذوفة"
+  "deleted chat": "محادثة محذوفة",
+  "Go to new chat": "انتقل إلى المحادثة الجديدة",
+  "Go to previous chat": "انتقل إلى المحادثة السابقة"
 }

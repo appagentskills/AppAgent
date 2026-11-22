@@ -1498,6 +1498,30 @@ function snFetchWithTimeout(url, opts, ms) {
     });
 }
 
+// Sync: is this an HTML page (not a REST answer)? A real /api/ response is JSON
+// or empty; a response without readable headers counts as non-HTML.
+function snIsHtmlResponse(res) {
+    var ct = '';
+    try { ct = (res && res.headers && typeof res.headers.get === 'function' && res.headers.get('content-type')) || ''; } catch (e) {}
+    return /text\/html/i.test(String(ct));
+}
+// A non-401 /api/ answer is NOT proof of a live session: a hibernating PDI answers
+// EVERY URL with HTTP 200 text/html, its "Instance Hibernating page" (meta refresh
+// to developer.servicenow.com). Mirrors platform-bridge _snResponseIsDeadInstance:
+// true for that page or an off-instance redirect, false for any other answer (the
+// body is read only when the answer is HTML, within min(ms, 3s)), null when an HTML
+// body could not be read in time (unknown). Never rejects.
+async function snResponseIsDeadInstance(res, instanceUrl, ms) {
+    try {
+        if (res && res.redirected && res.url && instanceUrl &&
+            new URL(res.url).origin !== new URL(instanceUrl).origin) return true;
+    } catch (e) {}
+    if (!snIsHtmlResponse(res) || typeof res.text !== 'function') return false;
+    var txt = await snWithTimeout(Promise.resolve().then(function() { return res.text(); }), Math.max(1, Math.min(ms || 3000, 3000)), null);
+    if (txt === null) return null;
+    return /instance\s+hibernating|your instance is hibernating|developer\.servicenow\.com\/dev\.do/i.test(String(txt || ''));
+}
+
 // Probe one tab for { token, userName } from its MAIN world. Returns null on failure.
 // The token of a login / SSO / MFA / password-change page (a guest g_ck) is
 // blanked: the tab still counts as open (sawOpenTab) but never yields a session.
@@ -1548,6 +1572,10 @@ async function snFetchUserName(instanceUrl, token, ms) {
             headers: { 'X-UserToken': token, 'Accept': 'application/json' }
         }, _budget);
         if (!apiRes.ok) return { name: '', userName: '', rows: -1, responded: true, status: apiRes.status };
+        // dead: a hibernating instance's 200 HTML page (or off-instance redirect).
+        if (await snResponseIsDeadInstance(apiRes, instanceUrl, Math.max(1, _budget - (Date.now() - _t0))) === true) {
+            return { name: '', userName: '', rows: -1, responded: true, status: apiRes.status, dead: true };
+        }
         var apiData = await snWithTimeout(apiRes.json(), Math.max(1, _budget - (Date.now() - _t0)), null);
         var row = apiData && apiData.result && apiData.result[0];
         // userName: the row's raw user_name only (the strict token check needs it).
@@ -1634,6 +1662,10 @@ async function snFetchUserRoles(instanceUrl, token, ms) {
             headers: { 'X-UserToken': token, 'Accept': 'application/json' }
         }, _budget);
         if (!rolesRes.ok) return { roles: roles, responded: true, status: rolesRes.status };
+        // dead: see snFetchUserName.
+        if (await snResponseIsDeadInstance(rolesRes, instanceUrl, Math.max(1, _budget - (Date.now() - _t0))) === true) {
+            return { roles: roles, responded: true, status: rolesRes.status, dead: true };
+        }
         var rolesData = await snWithTimeout(rolesRes.json(), Math.max(1, _budget - (Date.now() - _t0)), null);
         var rows = (rolesData && rolesData.result) || [];
         for (var ri = 0; ri < rows.length; ri++) {
@@ -1717,6 +1749,7 @@ async function snResolveInstanceSession(instanceUrl, token, userName) {
     // Track whether the instance EXPLICITLY rejected the
     // session (HTTP 401) — that is the only response that proves the token is dead.
     var authRejected = false;
+    var _dead = false;     // a probe got a hibernating instance's page (not a session)
     var _nameOk = false;   // identity probe answered 2xx
     // Identity and roles reads run in PARALLEL (each bounded by snTimeoutMs('fetch')).
     var _pName = (token && !userName) ? snFetchUserName(instanceUrl, token) : null;
@@ -1725,6 +1758,7 @@ async function snResolveInstanceSession(instanceUrl, token, userName) {
         var _nm = await _pName;
         userName = _nm.name;
         if (_nm.status === 401) authRejected = true;
+        if (_nm.dead) _dead = true;
         if (_nm.status >= 200 && _nm.status < 300) _nameOk = true;
     }
     var roles = [];
@@ -1733,6 +1767,7 @@ async function snResolveInstanceSession(instanceUrl, token, userName) {
         _rr = await _pRoles;
         roles = _rr.roles;
         if (_rr.status === 401) authRejected = true;
+        if (_rr.dead) _dead = true;
     }
     // A token by itself is NOT proof of an authenticated session: a logged-out tab
     // still exposes an anonymous g_ck, and a cached heartbeat token can outlive its
@@ -1750,6 +1785,10 @@ async function snResolveInstanceSession(instanceUrl, token, userName) {
     if (token && roles.length === 0 && authRejected) {
         token = '';
     }
+    // A hibernating instance (HTTP 200 + its HTML page for every URL) has no
+    // session at all: clear the token so sessionOk is false (not a 401, so it is
+    // not reported in authRejected / rejectedTokens).
+    if (token && _dead) token = '';
     // maint: no roles + no user name (maint is not a sys_user) + admin-level read
     // of the roles table. Synthetic roles ['maint','admin'] so the badge, the
     // list_instances admin check and the servicenow_run_script gate treat it as admin.
@@ -2013,8 +2052,13 @@ async function snGetInstancesDetailed() {
         var _maint = !!(pick && last && last.isMaint && last.token === pick.token);
         var _lastOk = !!(pick && last && last.sessionOk && last.token === pick.token && Date.now() - (last.at || 0) < _LAST_OK_MS);
         var sessionOk = !!pick && (!!(ck && typeof snStrictTokenOk === 'function' && snStrictTokenOk(ck.status, ck.user, ck.rows, _maint)) || _lastOk);
-        return { url: inst.url, tabs: inst.tabs, token: pick ? pick.token : '', userName: (pick && pick.userName) || (last && last.userName) || '',
-            roles: (last && last.roles) || [], isMaint: !!(last && last.isMaint), sessionOk: sessionOk, rejectedTokens: rejected,
+        // The last resolve's identity (roles, maint, user name) belongs to ITS
+        // token: reuse it only for the same token. A different token (signed
+        // out and back in as another user) must not inherit the old roles.
+        var _sameTok = !!(pick && last && last.token === pick.token);
+        return { url: inst.url, tabs: inst.tabs, token: pick ? pick.token : '',
+            userName: (pick && pick.userName) || (_sameTok && last.userName) || '',
+            roles: (_sameTok && last.roles) || [], isMaint: _maint, sessionOk: sessionOk, rejectedTokens: rejected,
             sawOpenTab: !!(rec.col && rec.col.sawOpenTab), partial: true };
     }
 
@@ -8334,7 +8378,9 @@ async function heartbeatAllInstances() {
                 }
             }
 
-            if (res.status === 401) {
+            // A hibernating instance answers 200 + its HTML page: no session either.
+            var _deadAns = res.status !== 401 && (await snResponseIsDeadInstance(res, origin)) === true;
+            if (res.status === 401 || _deadAns) {
                 // Drop the cache entry if the instance has logged us out for good.
                 // Every tab token was rejected, so the browser session is gone: the
                 // cached token (same cookie jar) goes too, even if it was not pinged.

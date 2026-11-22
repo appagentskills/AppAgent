@@ -79,6 +79,38 @@ function listUnseenFinishedChats() {
     return out;
 }
 
+// "Continue in a new chat" handoff guard (shared with the unseen predicates
+// in tools/120-actions.js). Run identity, not time: the old chat's activity
+// belongs to the handoff (never unread, no bell) only while its latest
+// non-hook user row is still the handoff request (isSummaryRequest) — i.e.
+// the activity is the summary run's own (incl. its late SW finish stamp /
+// notifyFinish). Any later user row ("Send here anyway", or an idle-path
+// injected wake notice) makes the following activity unread immediately, with
+// no grace window. Rows flushed INTO the summary run (injected && midRun,
+// app/030 flushPendingInjection) belong to that run and are skipped.
+// Fallback, message-evicted skeletons only (core/130 / app/045
+// _messagesEvicted: no `messages` key, so the run can't be identified): the
+// old timestamp rule — activity at/before continuedAt + a short grace is the
+// handoff's; legacy links without continuedAt keep full suppression. A
+// skeleton is only ever an idle, unviewed chat, and "Send here anyway"
+// requires opening (hydrating) it, so the post-handoff run itself is always
+// judged by run identity.
+var CONTINUED_HANDOFF_GRACE_MS = 30000;
+function isContinuedHandoffActivity(c, ts) {
+    if (!c || !c.continuedTo) return false;
+    var ms = c.messages;
+    if (Array.isArray(ms) && ms.length && !c._messagesEvicted) {
+        for (var i = ms.length - 1; i >= 0; i--) {
+            var m = ms[i];
+            if (m && m.role === 'user' && !m.isHookMessage && !(m.injected && m.midRun)) return !!m.isSummaryRequest;
+        }
+        return false;
+    }
+    var at = Number(c.continuedAt) || 0;
+    if (!at) return true;
+    return (Number(ts) || 0) <= at + CONTINUED_HANDOFF_GRACE_MS;
+}
+
 // Called from the notifyFinish handler (036-agent-event-handlers-page.js)
 // when a run finishes on a chat the user is not currently viewing.
 function noteChatFinishedUnseen(chatId, hasError) {
@@ -89,6 +121,11 @@ function noteChatFinishedUnseen(chatId, hasError) {
     // invisible plumbing, Action (background) chats have their own
     // action-button surface — neither belongs on the bell.
     if (c.isSubAgent || c.isBackground) return;
+    // A chat handed off via "Continue in a new chat": the handoff-summary
+    // run's notifyFinish lands after the page already switched to the
+    // successor — suppress only that (isContinuedHandoffActivity); a later
+    // run ("Send here anyway") rings the bell normally.
+    if (isContinuedHandoffActivity(c, Date.now())) return;
     // Skip only when the user is ACTUALLY LOOKING at this chat: currentChatId
     // matches AND the chat view is the active view. On home/history/settings
     // views currentChatId still points at the last-viewed chat, but the user

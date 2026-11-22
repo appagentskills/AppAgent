@@ -13,7 +13,7 @@ function extractFn(src, name) {
 }
 
 var FNS = ['snTimeoutMs', 'snWithTimeout', 'snInjectBounded', 'snFetchWithTimeout', 'snLoginProbeState', 'snLoginLooksSignedIn', 'probeTab',
-    'snProbeTabTokenUser', 'snFetchUserName', 'snStrictTokenOk', 'snTokenAccepted', 'snCollectTabTokens', 'snPickTabToken', 'snRememberInstanceToken',
+    'snProbeTabTokenUser', 'snIsHtmlResponse', 'snResponseIsDeadInstance', 'snFetchUserName', 'snStrictTokenOk', 'snTokenAccepted', 'snCollectTabTokens', 'snPickTabToken', 'snRememberInstanceToken',
     'snUpdateInstanceTokens', 'snInjectTabScripts', 'snTabsForOrigin', 'snNotConnectedError', 'snGetTokenForInstance',
     'snGetTokenForInstanceUnbounded', 'snProbeNegForget', 'onTabReady', 'snOpenForLoginAndWait', 'handleRefreshToken'];
 

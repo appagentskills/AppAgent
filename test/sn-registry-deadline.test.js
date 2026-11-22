@@ -15,7 +15,7 @@ function sleepMs(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
 
 var A = 'https://a.service-now.com', B = 'https://b.service-now.com';
 var FNS = ['snTimeoutMs', 'snWithTimeout', 'snInjectBounded', 'snFetchWithTimeout', 'snLoginProbeState', 'snLoginLooksSignedIn', 'snStrictTokenOk', 'snTokenAccepted', 'snForgetRegistryOrigin',
-    'snProbeTabTokenUser', 'snFetchUserName', 'snFetchUserRoles', 'snCollectTabTokens', 'snPickTabToken', 'snResolveInstanceSession', 'snRememberInstanceToken',
+    'snProbeTabTokenUser', 'snIsHtmlResponse', 'snResponseIsDeadInstance', 'snFetchUserName', 'snFetchUserRoles', 'snCollectTabTokens', 'snPickTabToken', 'snResolveInstanceSession', 'snRememberInstanceToken',
     'snUpdateInstanceTokens', 'snNotifyInstancesChanged', 'snGetInstancesDetailed'];
 
 // Every registry built by a test: its queued trailing-notify timers are
@@ -458,7 +458,8 @@ describe('panel validateToken touch-session is bounded', function() {
             return new Promise(function() {});   // never settles, ignores abort
         } };
         var fakeSetTimeout = function(fn, ms) { timers.push({ fn: fn, ms: ms }); return timers.length; };
-        var body = 'var _snStatusState = "connected";\n' + extractFn(src, '_sendMessageBounded') + '\n' + extractFn(src, '_adoptRecoveredToken') + '\n' + extractFn(src, 'validateToken') +
+        var body = 'var _snStatusState = "connected";\nvar _snActiveDead = null;\n' + extractFn(src, '_sendMessageBounded') + '\n' + extractFn(src, '_adoptRecoveredToken') + '\n' +
+            extractFn(src, '_snIsHtmlResponse') + '\n' + extractFn(src, '_snResponseIsDeadInstance') + '\n' + extractFn(src, 'validateToken') +
             '\nreturn { run: validateToken, state: function() { return _snStatusState; } };';
         if (w.__fetch401) origFetch = { call: function() { return Promise.resolve({ status: 401 }); } };
         var sentMsgs = [];

@@ -968,7 +968,7 @@ function _isHookRunStart(chat, lastUserMsgIndex) {
         && !!msgs[lastUserMsgIndex] && msgs[lastUserMsgIndex].isHookMessage === true;
 }
 
-function flushPendingInjection(chat) {
+function flushPendingInjection(chat, opts) {
     var chatId = chat && chat.id;
     if (chatId && _hookRunDeferInjectionByChat[chatId]) return false; // HOOK-MERGE: defer past the hook run
     var entry = chatId ? pendingInjectionsByChatId[chatId] : null;
@@ -993,7 +993,15 @@ function flushPendingInjection(chat) {
         // genuinely-new re-send equal to a paragraph of an earlier
         // multi-paragraph message would be silently dropped. The flag survives
         // IDB persistence (structured clone) and port postMessage.
+        // midRun: this row was flushed INTO a live run (every caller is inside
+        // runAgent), so it continues the current turn — unlike the idle-path
+        // _noticeRow (core/097), which starts a new wake run. Handoff-turn scans
+        // (_stampSummaryReply, _isHandoffTurnChat, ui/170, ui/165) skip only these.
+        // opts.idle: the REG391-2 end-of-run drain flushes the entry BEFORE
+        // starting a NEW follow-up run, so the row starts that run (no midRun)
+        // and ends any failed/abandoned handoff turn.
         var _injRow = { role: 'user', content: text, injected: true };
+        if (!(opts && opts.idle)) _injRow.midRun = true;
         // SUB-NOTICE-META: carry the entry's UI metadata onto the row
         // (render-only — buildAPIMessages sends user rows as role+content,
         // so the model payload is unchanged).
@@ -1200,24 +1208,31 @@ async function executePendingApprovedTools(chat) {
 // A2B3-01: stamp a summarize turn's reply with isSummary IN THE SW REALM (called
 // from runAgent's finish), so the SW's own saves and snapshots carry the flag. The
 // page-side stamp in completeSummaryAndCreateNewChat only touched the page mirror
-// and was lost on the SW's next put. Scans back to the turn's user row and stamps
-// only the tool-free, non-aggregate assistant reply of an isSummaryRequest turn.
-// Returns true when it stamped (the caller saves).
+// and was lost on the SW's next put. Scans back to the turn's user row; when it
+// is an isSummaryRequest row, stamps the turn's last tool-free, non-aggregate
+// assistant reply AND every assistant row carrying a continue_in_new_chat call
+// (the handoff's tool channel, ui/170 getHandoffResult). Rows flushed into the
+// run mid-turn (injected && midRun: worker reports, wake notices, queued user
+// text — flushPendingInjection) are not the turn's user row and are skipped;
+// an idle-path injected row (no midRun) started a new wake run and ends the
+// turn. Returns true when it stamped anything (the caller saves).
 function _stampSummaryReply(chat) {
     var ms = chat && chat.messages;
     if (!Array.isArray(ms)) return false;
-    for (var i = ms.length - 1; i >= 0; i--) {
+    var u = ms.length - 1;
+    while (u >= 0 && !(ms[u] && ms[u].role === 'user' && !(ms[u].injected && ms[u].midRun))) u--;
+    if (u < 0 || !ms[u].isSummaryRequest) return false;
+    var stamped = false, sawText = false;
+    for (var i = ms.length - 1; i > u; i--) {
         var m = ms[i];
-        if (!m || m.role === 'user') return false;
-        if (m.role !== 'assistant' || !m.content || (m.metrics && m.metrics.isAggregate)) continue;
-        if (m.tool_calls && m.tool_calls.length) return false;
-        var u = i - 1;
-        while (u >= 0 && !(ms[u] && ms[u].role === 'user')) u--;
-        if (u < 0 || !ms[u].isSummaryRequest || m.isSummary) return false;
-        m.isSummary = true;
-        return true;
+        if (!m || m.role !== 'assistant' || (m.metrics && m.metrics.isAggregate)) continue;
+        var calls = Array.isArray(m.tool_calls) ? m.tool_calls : [];
+        var isHandoffCall = calls.some(function(tc) { return tc && tc.function && tc.function.name === 'continue_in_new_chat'; });
+        var isFinalText = !sawText && !calls.length && !!m.content;
+        if (isFinalText) sawText = true;
+        if ((isHandoffCall || isFinalText) && !m.isSummary) { m.isSummary = true; stamped = true; }
     }
-    return false;
+    return stamped;
 }
 
 async function runAgent(overrideChatId) {
@@ -2562,6 +2577,19 @@ async function runAgent(overrideChatId) {
                 && !isChatPaused(streamingChatId)
                 && !runningChatIds[streamingChatId]
                 && typeof runAgent === 'function') {
+                // Flush the parked entry now as an idle-path row (no midRun):
+                // the follow-up is a NEW run, not part of the turn that just
+                // ended — otherwise a wake run after a failed handoff would
+                // still count as the handoff turn (continue_in_new_chat
+                // accepted, reply stamped isSummary, unread suppressed).
+                // Save right away like every other flush site: the flush
+                // deleted both the in-memory entry and the durable pending-
+                // wake record, so an SW death before the follow-up run's
+                // first save would otherwise lose the report.
+                if (flushPendingInjection(chat, { idle: true })) {
+                    saveChatsToStorage();
+                    AgentEvents.emit('userInjected', { chatId: streamingChatId });
+                }
                 _followUpScheduled = true;
                 Promise.resolve()
                     .then(function() { return runAgent(streamingChatId); })

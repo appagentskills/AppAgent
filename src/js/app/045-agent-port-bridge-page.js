@@ -620,6 +620,14 @@ function _mergePageChatMeta(prevChat, inChat) {
     // revealed background chat doesn't vanish from the sidebar when a
     // hello / chat-snapshot / pull-chat-heal envelope replaces the entry.
     if (prevChat._revealed && inChat._revealed === undefined) inChat._revealed = true;
+    // Handoff time (core/070 registerLineageLink stamp): the SW stamps it
+    // too, but a snapshot generated before the SW learned the link must not
+    // drop the page's stamp — keep it while the snapshot carries the SAME
+    // link, so ui/165 never treats the chat as legacy.
+    if (prevChat.continuedAt && !inChat.continuedAt && prevChat.continuedTo
+        && inChat.continuedTo === prevChat.continuedTo) {
+        inChat.continuedAt = prevChat.continuedAt;
+    }
     // FLUX-4C (narrow pull-forward): the seven chat-meta fields
     // (lastResponseAt/lastActivityAt/lastViewedAt/updatedAt + _jobsHidden/
     // pinned/_lastApiError) are SW-CANONICAL now — every page writer

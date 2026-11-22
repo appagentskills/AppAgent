@@ -1934,5 +1934,7 @@
   "Go to the new chat": "Zum neuen Chat wechseln",
   "Send here anyway": "Trotzdem hier senden",
   "This chat continues in \"{title}\". Workers, PRs and widgets now live there.": "Dieser Chat wird in „{title}“ fortgesetzt. Worker, PRs und Widgets befinden sich jetzt dort.",
-  "deleted chat": "gelöschter Chat"
+  "deleted chat": "gelöschter Chat",
+  "Go to new chat": "Zum neuen Chat",
+  "Go to previous chat": "Zum vorherigen Chat"
 }

@@ -81,26 +81,70 @@
     // if the probe missed the origin entirely). Mirrors the SW Platform stub's
     // refreshInstances guard and getTokenForInstance, which already trust the active
     // session token unconditionally.
+    // ...except a token validateToken / the picker test just confirmed DEAD for the
+    // active instance (hibernating PDI: 200 + hibernation HTML). window.sessionToken
+    // is deliberately kept (no 401), so remember it here and never re-inject it into
+    // the picker entry — otherwise the row renders connected and a click just closes
+    // the picker instead of opening the instance to sign in. Cleared by a later
+    // successful validation of the same token; ignored once the token changes.
+    var _snActiveDead = null; // {url, token}
+
+    // Per-instance dead registry, persisted (chrome.storage.local snDeadInstances:
+    // normUrl -> {token, at}) so a hibernating/dead instance stays dead across panel
+    // reloads instead of re-rendering connected until the next validation. Set by
+    // validateToken / testInstanceConnection on a dead (HTML) answer; cleared by a
+    // successful validation or a background-verified token for that origin.
+    var _SN_DEAD_KEY = 'snDeadInstances';
+    var _snDeadInstances = {};
+    try {
+        chrome.storage.local.get(_SN_DEAD_KEY, function(d) {
+            var m = (d && d[_SN_DEAD_KEY]) || {};
+            Object.keys(m).forEach(function(k) { if (!(k in _snDeadInstances)) _snDeadInstances[k] = m[k]; });
+            var a = Platform.instanceUrl ? m[_normUrl(Platform.instanceUrl)] : null;
+            if (!_snActiveDead && a && a.token && a.token === window.sessionToken) _snActiveDead = { url: Platform.instanceUrl, token: a.token };
+        });
+    } catch (e) {}
+    function _isInstanceDeadUrl(url) { return !!(url && _snDeadInstances[_normUrl(url)]); }
+    function _setInstanceDead(url, token, dead) {
+        if (!url) return;
+        var u = _normUrl(url);
+        if (dead) { if (_snDeadInstances[u] && _snDeadInstances[u].token === (token || '')) return; _snDeadInstances[u] = { token: token || '', at: Date.now() }; }
+        else { if (!(u in _snDeadInstances)) return; delete _snDeadInstances[u]; }
+        try { var _o = {}; _o[_SN_DEAD_KEY] = _snDeadInstances; chrome.storage.local.set(_o); } catch (e) {}
+    }
+
+    // Token injection is limited to an entry with an OPEN tab whose g_ck the probe
+    // could not read. A tab-less entry (or an origin the probe missed entirely) has
+    // no background-confirmed session: never paint it connected from the panel's
+    // held token (dead dev428560: tabs [], instanceTokens {} -> was shown green).
     function _reconcileActiveToken(list) {
         list = list || [];
         if (!Platform.instanceUrl || !window.sessionToken) return list;
         var norm = _normUrl(Platform.instanceUrl);
+        var _deadTok = !!(_snActiveDead && _snActiveDead.token === window.sessionToken && _normUrl(_snActiveDead.url) === norm);
         // Carry the active instance's already-resolved identity (roles/userName) forward
         // from the live registry: the tab probe returns them empty for the active
         // instance (g_ck unreadable), but _ensureActiveRoles patches Platform.instances
         // once fetched, so reuse that so the badge survives subsequent refreshes.
         var prevActive = (Platform.instances || []).filter(function(p) { return p && _normUrl(p.url) === norm; })[0];
+        // ...but only for the SAME token: the identity belongs to the session it
+        // was resolved for. A new token (signed out and back in, maybe as another
+        // user) starts blank and _ensureActiveRoles re-fetches its roles.
+        function _prevFor(tok) { return (prevActive && prevActive.token && prevActive.token === tok) ? prevActive : null; }
         var seen = false;
         list.forEach(function(i) {
             if (i && _normUrl(i.url) === norm) {
                 seen = true;
-                if (!i.token) i.token = window.sessionToken;
-                if ((!i.roles || !i.roles.length) && prevActive && prevActive.roles && prevActive.roles.length) i.roles = prevActive.roles;
-                if (!i.userName && prevActive && prevActive.userName) i.userName = prevActive.userName;
+                if (!i.token && !_deadTok && i.tabs && i.tabs.length) { i.token = window.sessionToken; i._injectedToken = true; }
+                var prev = _prevFor(i.token);
+                if ((!i.roles || !i.roles.length) && prev && prev.roles && prev.roles.length) i.roles = prev.roles;
+                if (!i.userName && prev && prev.userName) i.userName = prev.userName;
             }
         });
         if (!seen) {
-            list.push({ url: Platform.instanceUrl, tabs: [], userName: (prevActive && prevActive.userName) || '', roles: (prevActive && prevActive.roles) || [], token: window.sessionToken });
+            var _pushTok = '';
+            var prevS = _pushTok ? _prevFor(_pushTok) : null;
+            list.push({ url: Platform.instanceUrl, tabs: [], userName: (prevS && prevS.userName) || '', roles: (prevS && prevS.roles) || [], token: _pushTok });
         }
         return list;
     }
@@ -109,26 +153,32 @@
     // empty and the privilege badge (admin / security_admin) is missing even though we
     // hold a usable session token. Fetch the role list directly via window.sessionToken
     // (same query as the per-row roles panel), patch the registry + the passed list, and
-    // re-render so the badge appears. Guarded to fire at most once per instance so the
-    // re-render can't loop.
+    // re-render so the badge appears. Guarded to fire at most once per instance + session
+    // token so the re-render can't loop, while a new token (another user) re-fetches.
     var _activeRolesFetchedFor = '';
     function _ensureActiveRoles(inst, instances) {
         if (!inst || inst.url !== Platform.instanceUrl || !window.sessionToken) return;
         if (inst.roles && inst.roles.length) return;
-        if (_activeRolesFetchedFor === inst.url) return;
-        _activeRolesFetchedFor = inst.url;
+        var _guardKey = inst.url + '|' + window.sessionToken;
+        if (_activeRolesFetchedFor === _guardKey) return;
+        _activeRolesFetchedFor = _guardKey;
+        // The token this fetch speaks for: a response that lands after a user
+        // switch must not write the old user's roles onto the new user's entry.
+        var tok = window.sessionToken;
+        function _sameTok(p) { return !!p && (!p.token || p.token === tok); }
         var url = inst.url + '/api/now/table/sys_user_has_role'
             + '?sysparm_query=user=javascript:gs.getUserID()^inherited=false'
             + '&sysparm_fields=role.name'
             + '&sysparm_limit=500';
         _origFetch.call(window, url, {
             method: 'GET',
-            headers: { 'X-UserToken': window.sessionToken, 'Accept': 'application/json' },
+            headers: { 'X-UserToken': tok, 'Accept': 'application/json' },
             credentials: 'include'
         }).then(function(res) {
             if (!res.ok) throw new Error('HTTP ' + res.status);
             return res.json();
         }).then(function(data) {
+            if (window.sessionToken !== tok) return;
             var rows = (data && data.result) || [];
             var roles = [];
             for (var i = 0; i < rows.length; i++) {
@@ -141,16 +191,16 @@
                 // Shared snMaintEligible/snDetectMaint (core/150-record-helpers.js): the roles
                 // probe succeeded with 0 roles; probe only without a (non-maint) user name.
                 if (typeof snMaintEligible !== 'function' || !snMaintEligible(roles, true, inst.userName)) return;
-                return snDetectMaint(inst.url, window.sessionToken, function(u, o) { return _origFetch.call(window, u, o); }).then(function(isMaint) {
-                    if (!isMaint) return;
+                return snDetectMaint(inst.url, tok, function(u, o) { return _origFetch.call(window, u, o); }).then(function(isMaint) {
+                    if (!isMaint || window.sessionToken !== tok) return;
                     var mRoles = ['maint', 'admin'];
-                    (Platform.instances || []).forEach(function(p) { if (p && p.url === inst.url) { p.roles = mRoles; p.isMaint = true; if (!p.userName) p.userName = 'maint'; } });
-                    inst.roles = mRoles; inst.isMaint = true; if (!inst.userName) inst.userName = 'maint';
+                    (Platform.instances || []).forEach(function(p) { if (p && p.url === inst.url && _sameTok(p)) { p.roles = mRoles; p.isMaint = true; if (!p.userName) p.userName = 'maint'; } });
+                    if (_sameTok(inst)) { inst.roles = mRoles; inst.isMaint = true; if (!inst.userName) inst.userName = 'maint'; }
                     if (_instanceDropdown) renderInstanceDropdown(instances);
                 });
             }
-            (Platform.instances || []).forEach(function(p) { if (p && p.url === inst.url) p.roles = roles; });
-            inst.roles = roles;
+            (Platform.instances || []).forEach(function(p) { if (p && p.url === inst.url && _sameTok(p)) p.roles = roles; });
+            if (_sameTok(inst)) inst.roles = roles;
             if (_instanceDropdown) renderInstanceDropdown(instances);
         }).catch(function() { _activeRolesFetchedFor = ''; });
     }
@@ -184,6 +234,9 @@
                     };
                 });
                 _cacheInstances(_reconciled); // keep the picker's instant-open cache warm
+                // The active instance gets no stale exemption: if its tab has not
+                // been seen for _INSTANCE_TAB_STALE_MS, move the pill off it.
+                _retireStaleActiveInstance();
                 resolve(Platform.instances);
             });
         });
@@ -404,6 +457,39 @@
         } catch (e) { finish(null, String((e && e.message) || e)); }
     }
 
+    // Sync: is this an HTML page (not a REST answer)? A real /api/ response is
+    // JSON or empty; responses without readable headers (fakes) count as non-HTML.
+    function _snIsHtmlResponse(res) {
+        var ct = '';
+        try { ct = (res && res.headers && typeof res.headers.get === 'function' && res.headers.get('content-type')) || ''; } catch (e) {}
+        return /text\/html/i.test(String(ct));
+    }
+
+    // A non-401 answer from an /api/ endpoint is NOT proof of a live session: a
+    // hibernating PDI answers EVERY URL (touch-session included) with HTTP 200
+    // text/html, its "Instance Hibernating page" (meta refresh to
+    // developer.servicenow.com) — so a stale stored token rendered the instance as
+    // Connected. Resolves true for that page or an off-instance redirect, false for
+    // any normal REST answer (the body is only read when the answer is HTML), and
+    // null when an HTML body cannot be read within 3s (unknown). Never rejects.
+    function _snResponseIsDeadInstance(res, instanceUrl) {
+        return new Promise(function(resolve) {
+            try {
+                if (res && res.redirected && res.url && instanceUrl &&
+                    new URL(res.url).origin !== new URL(instanceUrl).origin) { resolve(true); return; }
+            } catch (e) {}
+            if (!_snIsHtmlResponse(res) || typeof res.text !== 'function') { resolve(false); return; }
+            var done = false;
+            var timer = setTimeout(function() { if (!done) { done = true; resolve(null); } }, 3000);
+            function finish(v) { if (done) return; done = true; clearTimeout(timer); resolve(v); }
+            try {
+                res.text().then(function(txt) {
+                    finish(/instance\s+hibernating|your instance is hibernating|developer\.servicenow\.com\/dev\.do/i.test(String(txt || '')));
+                }, function() { finish(null); });
+            } catch (e) { finish(null); }
+        });
+    }
+
     // Sole authority on connection state — validates and recovers tokens
     function validateToken(_recovering) {
         if (!Platform.instanceUrl) {
@@ -434,6 +520,7 @@
         // Bounded (<= 5s, window.__snValidateMs overrides in tests): a hung
         // touch-session must not leave the check pending — abort and treat it
         // like a network error (status left as-is).
+        var _vtTok = window.sessionToken;
         var _vtMs = Math.min(5000, window.__snValidateMs || 5000);
         var _vtCtl = (typeof AbortController === 'function') ? new AbortController() : null;
         var _vtTimer = null;
@@ -479,8 +566,18 @@
             // every tab has been closed — the user may have closed the tab without
             // paying attention, and the heartbeat keeps the session warm. A truly
             // dead session returns 401 above and is marked disconnected.
-            _snStatusState = 'connected';
-            updateSnStatus();
+            // Except a hibernating instance: HTTP 200 + its hibernation HTML page
+            // for every URL — never Connected (see _snResponseIsDeadInstance).
+            // Any HTML answer (hibernation page, login page, or a body unreadable
+            // within 3s) is NOT a REST answer: never connected, never as-is.
+            return _snResponseIsDeadInstance(res, Platform.instanceUrl).then(function(dead) {
+                dead = dead !== false || _snIsHtmlResponse(res);
+                if (dead && window.sessionToken === _vtTok) _snActiveDead = { url: Platform.instanceUrl, token: _vtTok };
+                else if (!dead && _snActiveDead && _snActiveDead.token === _vtTok) _snActiveDead = null;
+                if (typeof _setInstanceDead === 'function' && window.sessionToken === _vtTok) _setInstanceDead(Platform.instanceUrl, _vtTok, dead);
+                _snStatusState = dead ? 'disconnected' : 'connected';
+                updateSnStatus();
+            });
         }).catch(function() {
             clearTimeout(_vtTimer);
             // Network error or timeout — leave status as-is
@@ -624,7 +721,12 @@
                             });
                         });
                     }
-                    if (_snStatusState !== 'connected') {
+                    // An HTML page from an /api/ URL (e.g. a hibernating instance's
+                    // 200 "Instance Hibernating page") is no proof of a session.
+                    // Any HTML page (e.g. a hibernating instance's 200 "Instance
+                    // Hibernating page" for /stats.do or /api/...) is no proof of a
+                    // session: only a non-HTML answer may mark the panel connected.
+                    if (_snStatusState !== 'connected' && !_snIsHtmlResponse(res)) {
                         _snStatusState = 'connected';
                         updateSnStatus();
                     }
@@ -746,6 +848,16 @@
     // last saw it live. Past this window it is evicted from the cache entirely.
     var _INSTANCE_RETENTION_MS = 24 * 60 * 60 * 1000; // 1 day
 
+    // How long an instance may go WITHOUT an open tab before it is hidden from
+    // the header pill's picker list. Tracked per cache entry as `tabLastSeen`
+    // (refreshed by _cacheInstances on every probe that reports >= 1 open tab).
+    // Hiding is display-only: the snInstancesCache entry, the heartbeat token
+    // (instanceTokens) and per-instance settings are kept, and the row comes
+    // back as soon as a tab for that origin is open again. list_instances is
+    // NOT filtered (it reads the live Platform.instances registry): a tab-less
+    // instance whose session is still alive stays targetable by the agent.
+    var _INSTANCE_TAB_STALE_MS = 14 * 24 * 60 * 60 * 1000; // 14 days
+
     // Store a slim copy (only what the dropdown renders — no tokens) in memory and
     // in chrome.storage so it survives panel reloads. Instances that drop out of the
     // live probe (tab closed / signed out) are RETAINED as disconnected until they
@@ -755,6 +867,9 @@
     // "https://x.service-now.com/" (older persisted entry) merge into ONE picker row
     // instead of rendering duplicates with the same host.
     function _normUrl(u) { return String(u || '').replace(/\/+$/, ''); }
+    // typeof-guarded wrappers so extracted-function harnesses need no dead registry.
+    function _deadUrl(u) { return typeof _isInstanceDeadUrl === 'function' ? _isInstanceDeadUrl(u) : false; }
+    function _markDead(u, tok, dead) { if (typeof _setInstanceDead === 'function') _setInstanceDead(u, tok, dead); }
 
     // Per-instance "disabled for agent" flags. Persisted in chrome.storage.local
     // under `disabledInstances` (map of normalized URL -> true) so the tool layer
@@ -799,6 +914,89 @@
         return true;
     }
 
+    // True when a picker row should be hidden: no open tab and its last open
+    // tab was seen more than _INSTANCE_TAB_STALE_MS ago. The ACTIVE instance is
+    // not exempt (see _retireStaleActiveInstance, which moves the pill off it).
+    // No timestamp (legacy entry not yet stamped) = never hidden.
+    // Also stale at ANY age (meta = the picker cache entry, when known): a
+    // tab-less entry confirmed dead (hibernating), or one with no tab evidence
+    // (only a provisional stamp) and no background-verified token.
+    function _isStaleTablessInstance(entry, tabLastSeen, now, meta) {
+        if (!entry || !entry.url) return false;
+        if (entry.tabs && entry.tabs.length) return false;
+        meta = meta || entry;
+        if (meta.dead || entry.dead || (typeof _isInstanceDeadUrl === 'function' && _isInstanceDeadUrl(entry.url))) return true;
+        if ((!tabLastSeen || meta.tabSeenProvisional) && meta.url && !entry.token && !entry.connected && !meta.connected && !entry.retained) {
+            return !!(meta.tabSeenProvisional);
+        }
+        if (!tabLastSeen) return false;
+        return (now - tabLastSeen) > _INSTANCE_TAB_STALE_MS;
+    }
+
+    // Drop stale tab-less rows from a picker render list. `tabLastSeen` comes
+    // from the picker cache (authoritative, kept fresh by _cacheInstances),
+    // falling back to the entry's own field.
+    function _hideStaleTablessInstances(list) {
+        var now = Date.now();
+        var seen = {};
+        var metas = {};
+        (_instancesCache || []).forEach(function(c) { if (c && c.url) { seen[_normUrl(c.url)] = c.tabLastSeen || 0; metas[_normUrl(c.url)] = c; } });
+        return (list || []).filter(function(i) {
+            if (!i || !i.url) return !!i;
+            return !_isStaleTablessInstance(i, seen[_normUrl(i.url)] || i.tabLastSeen || 0, now, metas[_normUrl(i.url)]);
+        });
+    }
+
+    // Active-instance URL a stale-retire switch is in flight for ('' = none).
+    // Prevents repeated switch messages from overlapping refreshes.
+    var _staleActiveRetiringFor = '';
+
+    // The header pill labels from Platform.instanceUrl, which the background
+    // keeps sticky (an unrelated SN tab never steals it). When the active
+    // instance itself has had no open tab for _INSTANCE_TAB_STALE_MS, move the
+    // pill off it: switch to the first instance with an open tab (connected
+    // first, then alphabetical), or, if no instance has a tab, clear the stored
+    // active instance/session so the pill shows "Not connected". Both go through
+    // the existing background `switch-sn-instance` handler (snSetActiveInstance;
+    // an empty instanceUrl writes instanceUrl/sessionToken/userName = ''), so no
+    // new page-side storage write. Reopening a tab re-adopts it (background
+    // adopts a tab's session when no instance is stored). Does NOT close an open
+    // picker: this is a background housekeeping change, not a user click.
+    // Uses the picker cache (tabs from the latest probe + tabLastSeen).
+    // Returns true when a switch/clear message was sent.
+    function _retireStaleActiveInstance() {
+        var active = Platform.instanceUrl;
+        if (!active || !_instancesCache) return false;
+        var a = _normUrl(active);
+        if (_staleActiveRetiringFor === a) return false;
+        var entry = null;
+        _instancesCache.forEach(function(c) { if (c && c.url && _normUrl(c.url) === a) entry = c; });
+        // Unknown to the cache = no evidence it is stale; never act on a guess.
+        if (!entry || !_isStaleTablessInstance(entry, entry.tabLastSeen || 0, Date.now())) return false;
+        var target = _orderInstances(_instancesCache.filter(function(c) {
+            return c && c.url && _normUrl(c.url) !== a && c.tabs && c.tabs.length && c.tabs[0] && c.tabs[0].id;
+        }))[0] || null;
+        _staleActiveRetiringFor = a;
+        try {
+            chrome.runtime.sendMessage({
+                type: 'switch-sn-instance',
+                instanceUrl: target ? target.url : '',
+                tabId: target ? target.tabs[0].id : null
+            }, function(response) {
+                _staleActiveRetiringFor = '';
+                if (chrome.runtime.lastError) return;
+                // Mirror eagerly (storage.onChanged follows) unless the user
+                // switched elsewhere meanwhile.
+                if (_normUrl(Platform.instanceUrl || '') !== a) return;
+                Platform.instanceUrl = target ? target.url : '';
+                window.sessionToken = (response && response.token) || '';
+                (Platform.instances || []).forEach(function(p) { if (p) p.isActive = p.url === Platform.instanceUrl; });
+                updateSnStatus();
+            });
+        } catch (e) { _staleActiveRetiringFor = ''; return false; }
+        return true;
+    }
+
     function _cacheInstances(list) {
         if (!list) return;
         var now = Date.now();
@@ -813,19 +1011,47 @@
             if (!c || !c.url) return;
             var u = _normUrl(c.url);
             if (_isRecentlyRemoved(u)) return;
-            merged[u] = { url: u, tabs: [], userName: c.userName || '', roles: c.roles || [], connected: false, lastSeen: c.lastSeen || now };
+            // A stamp invented here (legacy entry, no evidence of when a tab
+            // was last seen) is marked provisional so a genuine stored stamp
+            // hydrated later wins over it (see the startup hydration merge).
+            merged[u] = { url: u, tabs: [], userName: c.userName || '', roles: c.roles || [], connected: false, lastSeen: c.lastSeen || now, tabLastSeen: c.tabLastSeen || 0, tabSeenProvisional: !c.tabLastSeen || !!c.tabSeenProvisional, dead: _deadUrl(u) };
         });
         // 2) Upsert everything currently live with a fresh lastSeen + latest details.
         (list || []).forEach(function(i) {
             if (!i || !i.url) return;
             var u = _normUrl(i.url);
             if (_isRecentlyRemoved(u)) return;
-            merged[u] = { url: u, tabs: i.tabs || [], userName: i.userName || '', roles: i.roles || [], connected: !!i.token, lastSeen: now };
+            // tabLastSeen only advances when the probe reports an open tab; a
+            // tab-less (heartbeat-token-only) entry keeps its previous stamp so
+            // it can age out of the picker (_hideStaleTablessInstances).
+            var _prevTab = merged[u] && merged[u].tabLastSeen;
+            var _prevProv = !_prevTab || !!(merged[u] && merged[u].tabSeenProvisional);
+            var _hasTab = !!(i.tabs && i.tabs.length);
+            // A token the BACKGROUND returned (not one the panel injected) was
+            // verified by its probe/heartbeat: that origin is alive again.
+            if (i.token && !i._injectedToken) _markDead(u, '', false);
+            var _dead = _deadUrl(u);
+            // No fresh `now` for a tab-less entry: only a real open tab is evidence.
+            merged[u] = { url: u, tabs: i.tabs || [], userName: i.userName || '', roles: i.roles || [], connected: !!i.token && !_dead, lastSeen: now, tabLastSeen: _hasTab ? now : (_prevTab || 0), tabSeenProvisional: _hasTab ? false : _prevProv, dead: _dead };
         });
-        // 3) Drop anything not seen within the retention window.
+        // 2b) The ACTIVE instance must stay tracked so _retireStaleActiveInstance
+        //     can age it out of the pill even after it drops out of the probe
+        //     (signed out, heartbeat token deleted) or was evicted before
+        //     tabLastSeen existed. Missing -> seed a provisional stamp (a genuine
+        //     stored stamp still wins at hydration); never evicted below.
+        var _act = (typeof Platform !== 'undefined' && Platform && Platform.instanceUrl) ? _normUrl(Platform.instanceUrl) : '';
+        if (_act && !merged[_act] && !_isRecentlyRemoved(_act)) {
+            merged[_act] = { url: _act, tabs: [], userName: '', roles: [], connected: false, lastSeen: now, tabLastSeen: 0, tabSeenProvisional: true, dead: _deadUrl(_act) };
+        }
+        // 3) Drop anything not seen within the retention window (except the active one).
         var cutoff = now - _INSTANCE_RETENTION_MS;
         _instancesCache = Object.keys(merged).map(function(k) { return merged[k]; })
-            .filter(function(c) { return (c.lastSeen || 0) >= cutoff; });
+            .filter(function(c) { return (c.lastSeen || 0) >= cutoff || (_act && c.url === _act); });
+        _persistInstancesCache();
+    }
+
+    // Single storage write site for the picker cache.
+    function _persistInstancesCache() {
         try { var _o = {}; _o[_INSTANCES_CACHE_KEY] = _instancesCache; chrome.storage.local.set(_o); } catch (e) {}
     }
 
@@ -836,12 +1062,15 @@
         liveList = (liveList || []).filter(function(i) { return i && !_isRecentlyRemoved(_normUrl(i.url)); });
         var liveUrls = {};
         liveList.forEach(function(i) { if (i && i.url) liveUrls[_normUrl(i.url)] = true; });
+        // Retained rows follow the 1-day retention window as before; the active
+        // entry kept past it (only so it can age to stale) is not listed.
+        var _cut = Date.now() - _INSTANCE_RETENTION_MS;
         var retained = (_instancesCache || []).filter(function(c) {
-            return c && c.url && !liveUrls[_normUrl(c.url)];
+            return c && c.url && !liveUrls[_normUrl(c.url)] && (!c.lastSeen || c.lastSeen >= _cut);
         }).map(function(c) {
             return { url: c.url, tabs: [], userName: c.userName || '', roles: c.roles || [], connected: false, retained: true };
         });
-        return _orderInstances(liveList.concat(retained));
+        return _orderInstances(_hideStaleTablessInstances(liveList.concat(retained)));
     }
 
     // Render list for a cache-seeded open (before the live probe returns): mark any
@@ -852,7 +1081,7 @@
         seed = (seed || []).filter(function(i) {
             return i && (!i.lastSeen || i.lastSeen >= cutoff) && !_isRecentlyRemoved(_normUrl(i.url));
         });
-        return _orderInstances(seed.map(function(i) {
+        return _orderInstances(_hideStaleTablessInstances(seed.map(function(i) {
             if (!i) return i;
             var connected = !!(i.token || i.connected);
             var hasTab = !!(i.tabs && i.tabs.length);
@@ -860,7 +1089,7 @@
                 return { url: i.url, tabs: [], userName: i.userName || '', roles: i.roles || [], connected: false, retained: true };
             }
             return i;
-        }));
+        })));
     }
 
     // Deterministic display order: connected instances first, signed-out last,
@@ -881,25 +1110,46 @@
     // "checking…" placeholder. Guarded so it never clobbers fresher in-memory data.
     try {
         chrome.storage.local.get(_INSTANCES_CACHE_KEY, function(d) {
-            var stored = (d && d[_INSTANCES_CACHE_KEY]) || [];
-            if (!stored.length) return;
-            if (!_instancesCache || !_instancesCache.length) {
-                _instancesCache = stored;
-                return;
-            }
-            // A live refresh beat hydration: fold in stored entries the fresh
-            // list doesn't know about so retained instances aren't evicted.
-            // The live probe has ALREADY run and did not see these entries, so
-            // they have no live session right now — fold them in as disconnected
-            // rather than trusting a connected flag persisted by a prior session.
-            var known = {};
-            _instancesCache.forEach(function(c) { if (c && c.url) known[_normUrl(c.url)] = true; });
-            stored.forEach(function(c) {
-                if (!c || !c.url || known[_normUrl(c.url)]) return;
-                _instancesCache.push({ url: _normUrl(c.url), tabs: [], userName: c.userName || '', roles: c.roles || [], connected: false, lastSeen: c.lastSeen || 0 });
-            });
+            _hydrateInstancesCache((d && d[_INSTANCES_CACHE_KEY]) || []);
         });
     } catch (e) {}
+
+    function _hydrateInstancesCache(stored) {
+        if (!stored || !stored.length) return;
+        if (!_instancesCache || !_instancesCache.length) {
+            _instancesCache = stored;
+            return;
+        }
+        // A live refresh beat hydration: fold in stored entries the fresh
+        // list doesn't know about so retained instances aren't evicted.
+        // The live probe has ALREADY run and did not see these entries, so
+        // they have no live session right now — fold them in as disconnected
+        // rather than trusting a connected flag persisted by a prior session.
+        var known = {};
+        _instancesCache.forEach(function(c) { if (c && c.url) known[_normUrl(c.url)] = c; });
+        var _stampFixed = false;
+        stored.forEach(function(c) {
+            if (!c || !c.url) return;
+            var mem = known[_normUrl(c.url)];
+            if (mem) {
+                // The probe-first run had no stored history and invented a
+                // provisional "now" tab stamp; a real stored stamp wins so an
+                // instance whose tab has been gone 14+ days stays stale.
+                if (mem.tabSeenProvisional && c.tabLastSeen && !(mem.tabs && mem.tabs.length)) {
+                    mem.tabLastSeen = c.tabLastSeen;
+                    mem.tabSeenProvisional = !!c.tabSeenProvisional;
+                    _stampFixed = true;
+                }
+                return;
+            }
+            _instancesCache.push({ url: _normUrl(c.url), tabs: [], userName: c.userName || '', roles: c.roles || [], connected: false, lastSeen: c.lastSeen || 0, tabLastSeen: c.tabLastSeen || 0, tabSeenProvisional: !!c.tabSeenProvisional });
+        });
+        if (_stampFixed) {
+            _persistInstancesCache();
+            // The probe already ran with the provisional stamp; re-check now.
+            _retireStaleActiveInstance();
+        }
+    }
     // Last-rendered instance list signature — used to skip re-rendering when
     // nothing meaningful changed (avoids collapsing an open per-row roles panel
     // or flickering when a refresh returns identical data).
@@ -1161,7 +1411,8 @@
                 // The background probe now reports an EMPTY token for an open-but-logged-out
                 // tab, so a logged-out session correctly reads as signed-out here without a
                 // tab-presence check (which would wrongly demote valid tab-less instances).
-                var isConnected = !!(inst.token || inst.connected);
+                // ...but never a dead (hibernating) instance, whatever token it holds.
+                var isConnected = !!(inst.token || inst.connected) && !_isInstanceDeadUrl(inst.url);
                 // Non-connected rows (logged out while open, or closed/evicted) render as a
                 // dimmed "signed out" row that OPENS on click instead of selecting.
                 var signedOut = !isConnected;
@@ -1630,15 +1881,26 @@
                 headers: { 'X-UserToken': token, 'Content-Type': 'application/json', 'Accept': 'application/json' },
                 credentials: 'include'
             }).then(function(res) {
-                if (res.ok) {
+                // A 200 can be a hibernating instance's HTML page: not connected.
+                if (!res.ok) return { res: res, dead: false };
+                return _snResponseIsDeadInstance(res, inst.url).then(function(dead) { return { res: res, dead: dead !== false || _snIsHtmlResponse(res) }; });
+            }).then(function(r) {
+                var res = r.res;
+                var ok = res.ok && !r.dead;
+                if (ok) {
                     _showConnected();
+                } else if (r.dead) {
+                    _showFailed(t('Unavailable'), t('Could not reach the instance. Check your connection and retry.'));
                 } else {
                     var f = _friendlyConnError(res.status);
                     _showFailed(f.label, f.title);
                 }
                 // Sync header status for active instance
+                if (ok || r.dead) _setInstanceDead(inst.url, token, !ok);
                 if (isActive) {
-                    if (res.ok) {
+                    if (ok && _snActiveDead && _snActiveDead.token === token) _snActiveDead = null;
+                    else if (r.dead && token === window.sessionToken) _snActiveDead = { url: inst.url, token: token };
+                    if (ok) {
                         if (token !== window.sessionToken) window.sessionToken = token;
                         _snStatusState = 'connected';
                     } else {

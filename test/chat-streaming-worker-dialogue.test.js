@@ -309,7 +309,7 @@ function runChatStreamingWorkerDialogueTests(sources, domDocument) {
         var notice=f.env.pendingInjectionsByChatId.parent.text,rows=f.env.chats.parent.messages;
         check(notice.indexOf('sent a message: **bold** - item')>=0,'model injection missing');
         // C1: the model notice ends with the cumulative-final reminder, and meta.text covers it (UI hides the span).
-        check(/ - item\nReminder: your final message must be a cumulative digest of everything since the user's last message\.$/.test(notice),'cumulative-final reminder missing from model notice');
+        check(/ - item\nReminder: while other sub-agents are still running, reply with a 1-3 line interim update; after the last report, your final message must be a brief cumulative digest of everything since the user's last message\.$/.test(notice),'cumulative-final reminder missing from model notice');
         var _nm=f.env.pendingInjectionsByChatId.parent.subNotices;
         check(Array.isArray(_nm) && _nm.length===1 && _nm[0].text===notice && _nm[0].summary==='**bold**\n\n- item','meta.text must cover the whole notice incl. reminder');
         var u=uiFixture({},true),standalone=rows[rows.length-1],html=u.renderSubAgentMessage(standalone,1);

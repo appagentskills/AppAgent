@@ -23,14 +23,14 @@ describe('sub-notice metadata (consumer side)', function() {
         assert.strictEqual(m.flushPendingInjection(chat), true);
         assert.strictEqual(chat.messages.length, 1);
         var row = chat.messages[0];
-        assert.deepStrictEqual(row, { role: 'user', content: 'NOTICE\n\nuser typed', injected: true, subNotices: [META], hasUserText: true });
+        assert.deepStrictEqual(row, { role: 'user', content: 'NOTICE\n\nuser typed', injected: true, midRun: true, subNotices: [META], hasUserText: true });
         assert.notStrictEqual(row.subNotices, undefined);
         assert.strictEqual(pend.c1, undefined, 'entry consumed');
         assert.deepStrictEqual(cleared, [['c1', 'NOTICE\n\nuser typed']], 'targeted durable clear still keyed on the exact text');
         // Legacy entry (no metadata) → the pre-change row shape, byte for byte.
         pend.c1 = { text: 'plain', images: [] };
         assert.strictEqual(m.flushPendingInjection(chat), true);
-        assert.deepStrictEqual(chat.messages[1], { role: 'user', content: 'plain', injected: true });
+        assert.deepStrictEqual(chat.messages[1], { role: 'user', content: 'plain', injected: true, midRun: true });
     });
 
     test('040 sendMessage (running chat) keeps subNotices, sets hasUserText, leaves the prior entry object intact', async function() {

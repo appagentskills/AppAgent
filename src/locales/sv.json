@@ -1934,5 +1934,7 @@
   "Go to the new chat": "Gå till den nya chatten",
   "Send here anyway": "Skicka här ändå",
   "This chat continues in \"{title}\". Workers, PRs and widgets now live there.": "Den här chatten fortsätter i \"{title}\". Workers, PR:er och widgetar finns nu där.",
-  "deleted chat": "borttagen chatt"
+  "deleted chat": "borttagen chatt",
+  "Go to new chat": "Gå till ny chatt",
+  "Go to previous chat": "Gå till föregående chatt"
 }

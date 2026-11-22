@@ -65,12 +65,12 @@ describe('maint detection', function() {
     }, { tags: ['unit'] });
 
     test('gate: user with roles => admin lookup only, ZERO maint probes', async function() {
-        var f = await mods([{ url: URL, shortName: 'dev1', userName: '', roles: ['itil'] }], router());
+        var f = await mods([{ url: URL, shortName: 'dev1', userName: '', roles: ['itil'], token: 'tok' }], router());
         assert.strictEqual((await f.m._rsCheckAdmin(URL, 'tok')).ok, false);
         assert.strictEqual(f.calls.length, 1); assert.strictEqual(f.probes(), 0);
     }, { tags: ['unit'] });
     test('gate: known non-maint name => ZERO maint probes', async function() {
-        var f = await mods([{ url: URL, shortName: 'dev1', userName: 'erin', roles: [] }], router());
+        var f = await mods([{ url: URL, shortName: 'dev1', userName: 'erin', roles: [], token: 'tok' }], router());
         assert.strictEqual((await f.m._rsCheckAdmin(URL, 'tok')).ok, false);
         assert.strictEqual(f.probes(), 0);
     }, { tags: ['unit'] });
@@ -87,7 +87,7 @@ describe('maint detection', function() {
         assert.strictEqual(f.calls.length, 2);
     }, { tags: ['unit'] });
     test('gate: cached maint roles => ZERO requests; pass does not survive a token switch', async function() {
-        var f = await mods([{ url: URL, shortName: 'dev1', userName: 'maint', roles: ['maint', 'admin'], isMaint: true }], router());
+        var f = await mods([{ url: URL, shortName: 'dev1', userName: 'maint', roles: ['maint', 'admin'], isMaint: true, token: 'tok' }], router());
         assert.strictEqual((await f.m._rsCheckAdmin(URL, 'tok')).ok, true);
         assert.strictEqual(f.calls.length, 0);
         var g = await mods([{ url: URL, shortName: 'dev1', userName: '', roles: [] }], router());

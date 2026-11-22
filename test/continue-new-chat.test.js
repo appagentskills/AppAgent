@@ -26,12 +26,12 @@ function cnEl() {
 }
 // Handoff helpers (prompt constant + pure functions) cut from 170-chat-management.js.
 function cnHandoffSrc(src) {
-    var consts = ['HANDOFF_SUMMARY_PROMPT', 'HANDOFF_USER_MSG_VERBATIM_MAX', 'HANDOFF_USER_MSG_HEAD'].map(function(n) {
+    var consts = ['HANDOFF_SUMMARY_PROMPT', 'HANDOFF_USER_MSG_VERBATIM_MAX', 'HANDOFF_USER_MSG_HEAD', 'HANDOFF_USER_MSG_TOTAL_BUDGET', 'HANDOFF_TITLE_MAX'].map(function(n) {
         var m = new RegExp('\\nvar ' + n + ' =[\\s\\S]*?;\\n').exec(src);
         if (!m) throw new Error('missing ' + n);
         return m[0];
     }).join('');
-    return consts + cnCut(src, ['extractHandoffSummary', '_isTypedUserMessage', 'buildHandoffUserMessages', 'buildContinuationSeed']);
+    return consts + cnCut(src, ['extractHandoffSummary', 'stripContinuedPrefix', 'extractHandoffTitle', 'cleanHandoffTitle', '_findHandoffToolCall', 'getHandoffResult', '_getHandoffTextResult', '_isTypedUserMessage', 'buildHandoffUserMessages', 'buildContinuationSeed']);
 }
 async function cnHandoff() {
     var src = await loadFile('src/js/ui/170-chat-management.js');
@@ -190,7 +190,7 @@ describe('continue in a new chat', function() {
 
     test('buildHandoffUserMessages: verbatim, truncation pointer, exclusions, multi-part', async function() {
         var h = await cnHandoff();
-        var long = 'L'.repeat(299) + 'X' + 'Y'.repeat(400); // 700 chars
+        var long = 'L'.repeat(2999) + 'X' + 'Y'.repeat(1400); // 4400 chars
         var ms = [
             { role: 'user', content: 'short one\nline two' },                          // 0 typed
             { role: 'screenshot', base64: 'x' },                                          // 1 attachment of 0
@@ -206,7 +206,7 @@ describe('continue in a new chat', function() {
         var out = h.buildHandoffUserMessages(ms, 'OLD9');
         assert.match(out, /^All user messages from chat `OLD9`/);
         assert.ok(out.indexOf('1. (messages[0])\n   short one\n   line two\n   [+1 image \u2014 chat_history get {chat_id: "OLD9", path: "messages[1]"}]') >= 0, 'screenshot row pointer');
-        assert.match(out, /2\. \(messages\[6\]\)\n   L{299}X\u2026\[truncated \u2014 700 chars total; full text: chat_history get \{chat_id: "OLD9", path: "messages\[6\]\.content"\}\]/);
+        assert.match(out, /2\. \(messages\[6\]\)\n   L{2999}X\u2026\[truncated \u2014 4400 chars total; full text: chat_history get \{chat_id: "OLD9", path: "messages\[6\]\.content"\}\]/);
         assert.strictEqual(/Y/.test(out), false, 'tail beyond the head is cut');
         assert.match(out, /3\. \(messages\[7\]\)\n   queued typed/);
         assert.ok(out.indexOf('4. (messages[8])\n   part A\n   part B\n   [+1 image \u2014 chat_history get {chat_id: "OLD9", path: "messages[8].content"}]') >= 0, 'inline image part pointer');
@@ -215,9 +215,9 @@ describe('continue in a new chat', function() {
             assert.strictEqual(out.indexOf(s), -1, s + ' excluded');
         });
         assert.strictEqual(/^5\./m.test(out), false, 'exactly four entries');
-        var exact = 'E'.repeat(500);
+        var exact = 'E'.repeat(4000);
         assert.ok(h.buildHandoffUserMessages([{ role: 'user', content: exact }], 'C').indexOf(exact + '') > 0 &&
-            h.buildHandoffUserMessages([{ role: 'user', content: exact }], 'C').indexOf('[truncated') === -1, '500 chars stays verbatim');
+            h.buildHandoffUserMessages([{ role: 'user', content: exact }], 'C').indexOf('[truncated') === -1, '4000 chars stays verbatim');
         assert.strictEqual(h.buildHandoffUserMessages([{ role: 'assistant', content: 'a' }], 'C'), '', 'no user messages: empty section');
     }, { tags: ['unit'] });
 
@@ -243,12 +243,15 @@ describe('continue in a new chat', function() {
         assert.strictEqual(out.indexOf('paths:'), -1, 'only single-path chat_history calls');
     }, { tags: ['unit'] });
 
-    test('summary prompt: text-only guard, analysis/summary tags, latest request verbatim', async function() {
+    test('summary prompt: single continue_in_new_chat call, analysis block, latest request verbatim', async function() {
         var h = await cnHandoff();
         var p = h.HANDOFF_SUMMARY_PROMPT;
-        assert.match(p, /Respond with TEXT ONLY\. Do NOT call any tools/);
+        // #1391: the handoff is ONE continue_in_new_chat {title, summary} call, not text.
+        assert.match(p, /Your ONLY action is ONE call to the `continue_in_new_chat` tool with two arguments, `title` and `summary`\. Do NOT call any other tool/);
+        assert.match(p, /Never write the summary as plain text/);
         assert.match(p, /<analysis> block \(it will be discarded\)/);
-        assert.match(p, /output a <summary> block/);
+        assert.match(p, /call `continue_in_new_chat` exactly once\. Its `summary` argument is the handoff summary/);
+        assert.match(p, /Its `title` argument is a short title for the new chat \(at most 60 characters\)/);
         assert.match(p, /quote the most recent instruction\(s\) VERBATIM/);
         assert.match(p, /appends every user message/);
         assert.match(p, /`chat_history` tool/);

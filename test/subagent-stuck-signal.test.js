@@ -520,7 +520,7 @@ describe('#971 review fixes (B1 / M1 / M2 / B2 / pausedChats)', function() {
         var env = await load();
         var W = env.idb.wakes();
         var HEAD = 'errored \u2014 orphaned by a service-worker restart before it reported (wake or resurrect it to retry)';
-        var REMINDER_LINE = "\nReminder: your final message must be a cumulative digest of everything since the user's last message.";
+        var REMINDER_LINE = "\nReminder: while other sub-agents are still running, reply with a 1-3 line interim update; after the last report, your final message must be a brief cumulative digest of everything since the user's last message.";
         async function notices(pcid) {
             for (var i = 0; i < 60 && !(W[pcid] && W[pcid].notices && W[pcid].notices.length); i++) await tick(5);
             return (W[pcid] && W[pcid].notices) || [];

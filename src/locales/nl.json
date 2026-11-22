@@ -1934,5 +1934,7 @@
   "Go to the new chat": "Naar de nieuwe chat",
   "Send here anyway": "Toch hier verzenden",
   "This chat continues in \"{title}\". Workers, PRs and widgets now live there.": "Deze chat gaat verder in \"{title}\". Workers, PR's en widgets staan nu daar.",
-  "deleted chat": "verwijderde chat"
+  "deleted chat": "verwijderde chat",
+  "Go to new chat": "Naar nieuwe chat",
+  "Go to previous chat": "Naar vorige chat"
 }

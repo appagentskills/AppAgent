@@ -16,7 +16,7 @@
     },
     "saveChatsToStorage": {
       "src/js/app/020-api-messages.js": 3,
-      "src/js/app/030-agent-loop.js": 29,
+      "src/js/app/030-agent-loop.js": 30,
       "src/js/app/045-agent-port-bridge-page.js": 1,
       "src/js/app/040-send-message.js": 3,
       "src/js/app/050-image-attachments.js": 1,
@@ -93,7 +93,7 @@
       "src/js/app/030-agent-loop.js": 9,
       "src/js/app/036-agent-event-handlers-page.js": 1,
       "src/js/app/050-image-attachments.js": 2,
-      "src/js/core/070-permissions.js": 2,
+      "src/js/core/070-permissions.js": 3,
       "src/js/core/097-sub-agent-registry.js": 1,
       "src/js/core/100-cached-results.js": 2,
       "src/js/core/130-indexeddb.js": 8,
@@ -129,7 +129,7 @@
       "src/js/ui/270-iframe-panel.js": 1,
       "src/js/worker/010-platform-stub.js": 1,
       "src/platform/extension/background.js": 17,
-      "src/platform/extension/platform-bridge.js": 6
+      "src/platform/extension/platform-bridge.js": 7
     }
   }
 }

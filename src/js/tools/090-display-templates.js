@@ -658,6 +658,223 @@ function displayToggleExpand(el) {
     el.classList.toggle('expanded');
 }
 
+// ─── File Template (Agent Files download cards) ───
+// args.files: [{path?, file_id?, name?, description?}] (or path strings).
+// resolveDisplayFiles (async, page-only) enriches each entry BEFORE
+// executeDisplay stores the args, so persisted args re-render synchronously:
+// {file_id, name, mime, size, modified, thumb} or {error}.
+var DISPLAY_FILE_MAX = 20;
+// Thumbnails decode the whole image: skip them above this size.
+var DISPLAY_THUMB_MAX_BYTES = 10 * 1024 * 1024;
+var DISPLAY_FILE_KINDS = [
+    ['pdf', /^pdf$/],
+    ['doc', /^(docx?|odt|rtf|pages)$/],
+    ['sheet', /^(xlsx?|xlsm|csv|tsv|ods|numbers)$/],
+    ['slides', /^(pptx?|odp|key)$/],
+    ['archive', /^(zip|gz|tgz|tar|7z|rar|bz2|xz|crx)$/],
+    ['image', /^(png|jpe?g|gif|webp|svg|bmp|ico|avif|heic|tiff?)$/],
+    ['video', /^(mp4|mov|webm|mkv|avi|m4v)$/],
+    ['audio', /^(mp3|wav|ogg|flac|m4a|aac)$/],
+    ['code', /^(js|mjs|ts|tsx|jsx|py|java|rb|go|rs|c|cpp|h|cs|php|sh|json|xml|html?|css|scss|ya?ml|sql|md)$/],
+    ['text', /^(txt|log|ini|cfg|conf)$/]
+];
+function displayFileExt(name) {
+    var m = /\.([A-Za-z0-9]{1,8})$/.exec(String(name || ''));
+    return m ? m[1].toLowerCase() : '';
+}
+function displayFileKind(ext, mime) {
+    for (var i = 0; i < DISPLAY_FILE_KINDS.length; i++) if (DISPLAY_FILE_KINDS[i][1].test(ext)) return DISPLAY_FILE_KINDS[i][0];
+    mime = String(mime || '');
+    if (/^image\//.test(mime)) return 'image';
+    if (/^video\//.test(mime)) return 'video';
+    if (/^audio\//.test(mime)) return 'audio';
+    if (/pdf/.test(mime)) return 'pdf';
+    if (/^text\//.test(mime)) return 'text';
+    return 'file';
+}
+function displayFileSize(n) {
+    n = Number(n);
+    if (!isFinite(n) || n < 0) return '';
+    if (n < 1024) return t('{size} B', { size: n });
+    if (n < 1024 * 1024) return t('{size} KB', { size: (n / 1024).toFixed(n < 10240 ? 1 : 0) });
+    return t('{size} MB', { size: (n / 1048576).toFixed(n < 10485760 ? 1 : 0) });
+}
+function displayFileDate(ms) {
+    var d = new Date(Number(ms));
+    if (!ms || isNaN(d.getTime())) return '';
+    try { return d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }); } catch (e) { return d.toISOString().slice(0, 16).replace('T', ' '); }
+}
+function displayFileList(args) {
+    return Array.isArray(args.files) ? args.files : ((args.path || args.file_id) ? [{ path: args.path, file_id: args.file_id, name: args.name, description: args.description }] : []);
+}
+// Entries dropped by the DISPLAY_FILE_MAX cap (reported in the tool result).
+function displayFileOverflow(args) {
+    return Math.max(0, displayFileList(args || {}).length - DISPLAY_FILE_MAX);
+}
+function displayFileEntries(args) {
+    return displayFileList(args).slice(0, DISPLAY_FILE_MAX).map(function(f) { return typeof f === 'string' ? { path: f } : (f && typeof f === 'object' ? f : { error: 'invalid file entry' }); });
+}
+function displayFileBaseName(f) {
+    var n = f.name || (f.path ? String(f.path).split('/').pop() : '') || f.file_id || '';
+    return String(n);
+}
+var DISPLAY_DOWNLOAD_ICON = '<svg class="display-file-dl-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v11"/><path d="m7 10 5 5 5-5"/><path d="M5 20h14"/></svg>';
+var DISPLAY_FILE_WARN_ICON = '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 8v5"/><path d="M12 16h.01"/></svg>';
+
+function generateFile(args) {
+    var files = displayFileEntries(args || {});
+    if (!files.length) return null;
+    var ready = files.filter(function(f) { return f.file_id && !f.error; }).length;
+    var multi = files.length > 1;
+    var html = '<div class="display-template display-files' + (multi ? ' display-files-multi' : '') + '" role="group" aria-label="' + escDisplay(args.title || (multi ? t('Files') : t('File'))) + '">';
+    if (multi || args.title) {
+        html += '<div class="display-files-header"><div class="display-files-heading">';
+        html += '<span class="display-files-title">' + escDisplay(args.title || t('Files')) + '</span>';
+        if (multi) html += '<span class="display-files-count">' + escDisplay(t('{count} files', { count: files.length })) + '</span>';
+        html += '</div>';
+        if (ready > 1) html += '<button type="button" class="display-files-all" onclick="displayFileDownloadAll(this)">' + DISPLAY_DOWNLOAD_ICON + '<span>' + escDisplay(t('Download All')) + '</span></button>';
+        html += '</div>';
+    }
+    html += '<ul class="display-files-list">';
+    files.forEach(function(f) {
+        var name = displayFileBaseName(f);
+        var ok = !!f.file_id && !f.error;
+        var ext = displayFileExt(name);
+        var kind = ok ? displayFileKind(ext, f.mime) : 'missing';
+        html += '<li class="display-file display-file--' + kind + (ok ? '' : ' display-file-error') + '">';
+        html += '<div class="display-file-icon" aria-hidden="true">';
+        if (!ok) html += DISPLAY_FILE_WARN_ICON;
+        else if (f.thumb && /^data:image\/(jpeg|png|webp|gif);base64,[A-Za-z0-9+/=]+$/.test(String(f.thumb))) html += '<img class="display-file-thumb" src="' + escDisplay(f.thumb) + '" alt="">';
+        else html += '<span class="display-file-ext">' + escDisplay((ext || kind).slice(0, 4).toUpperCase()) + '</span>';
+        html += '</div><div class="display-file-body">';
+        html += '<div class="display-file-name" title="' + escDisplay(f.path || name) + '">' + escDisplay(name || t('Unknown')) + '</div>';
+        var meta = [];
+        if (ok) {
+            var sz = displayFileSize(f.size); if (sz) meta.push(sz);
+            meta.push(ext ? ext.toUpperCase() : (f.mime || t('File')));
+            var dt = displayFileDate(f.modified); if (dt) meta.push(dt);
+        } else {
+            meta.push(t('File not found'));
+        }
+        html += '<div class="display-file-meta">' + meta.map(function(x) { return '<span>' + escDisplay(x) + '</span>'; }).join('<span class="display-file-dot" aria-hidden="true">\u00b7</span>') + '</div>';
+        if (!ok && f.error) html += '<div class="display-file-errmsg">' + escDisplay(f.error) + '</div>';
+        if (f.description) html += '<div class="display-file-desc">' + escDisplay(f.description) + '</div>';
+        html += '</div>';
+        if (ok) {
+            html += '<button type="button" class="display-file-dl" data-file-id="' + escDisplay(f.file_id) + '" data-name="' + escDisplay(name) + '" aria-label="' + escDisplay(t('Download') + ': ' + name) + '" onclick="displayFileDownload(this)">';
+            html += DISPLAY_DOWNLOAD_ICON + '<span class="display-file-dl-label" aria-live="polite">' + escDisplay(t('Download')) + '</span></button>';
+        }
+        html += '</li>';
+    });
+    html += '</ul></div>';
+    return html;
+}
+
+// Button states: idle -> Opening... -> Opened (resets) | Failed, retry.
+function displayFileDownload(btn) {
+    if (!btn || btn.classList.contains('is-busy')) return Promise.resolve(false);
+    var label = btn.querySelector('.display-file-dl-label');
+    var set = function(state, text) {
+        btn.classList.remove('is-busy', 'is-done', 'is-failed');
+        if (state) btn.classList.add(state);
+        if (label) label.textContent = text;
+    };
+    set('is-busy', t('Opening...'));
+    var fileId = btn.getAttribute('data-file-id');
+    var name = btn.getAttribute('data-name') || 'download';
+    var opener = typeof openFileDownloadTab === 'function' ? openFileDownloadTab : function() { return Promise.reject(new Error('download unavailable')); };
+    return Promise.resolve().then(function() { return opener(fileId, name); }).then(function() {
+        set('is-done', t('Opened'));
+        setTimeout(function() { if (btn.classList.contains('is-done')) set('', t('Download')); }, 2500);
+        return true;
+    }, function(e) {
+        set('is-failed', t('Failed, retry'));
+        if (typeof showSnackbar === 'function') showSnackbar(t('Download failed: {error}', { error: String((e && e.message) || e) }), 'error');
+        return false;
+    });
+}
+async function displayFileDownloadAll(btn) {
+    var root = btn && btn.closest ? btn.closest('.display-files') : null;
+    if (!root) return 0;
+    var n = 0;
+    var btns = root.querySelectorAll('.display-file-dl');
+    for (var i = 0; i < btns.length; i++) if (await displayFileDownload(btns[i])) n++;
+    return n;
+}
+
+// Page-only: resolve each entry against Agent Files / a connected folder /
+// the file store. Never throws; a failing entry carries {error} and renders
+// as a missing card.
+//  - Agent Files path: a folder-pointer file_id (lfShareFile).
+//  - connected-folder path: a blob snapshot (lfSnapshotFile) — the download
+//    page can only read Agent Files pointers, so a pointer would not download.
+//    The snapshot reads bytes on the caller's behalf, so it is gated by
+//    lfAuthorizeSourceRead (local_folder:read Off → refused, Ask → prompt)
+//    exactly like servicenow_api attachment_source / web_fetch body_source;
+//    a denied read becomes that card's error (fail closed if the gate is
+//    not loaded).
+//  - file_id: metadata only (resolveFileMeta: no byte read for folder
+//    pointers); bytes are loaded only for a capped image thumbnail.
+async function resolveDisplayFiles(args, options) {
+    var out = Object.assign({}, args);
+    var folder = args.folder || 'virtual';
+    var isVirtual = typeof lfIsVirtualFolderRef === 'function' ? lfIsVirtualFolderRef(folder) : folder === 'virtual';
+    var omitted = displayFileOverflow(args);
+    if (omitted) out.files_omitted = omitted;
+    var isImg = function(m) { return /^image\//.test(m || ''); };
+    var thumbable = function(e) { return isImg(e.mime) && !(Number(e.size) > DISPLAY_THUMB_MAX_BYTES); };
+    out.files = await Promise.all(displayFileEntries(args).map(async function(f) {
+        var e = Object.assign({}, f);
+        if (e.error) return e;
+        try {
+            var blob = null;
+            if (e.path && !isVirtual) {
+                if (typeof lfAuthorizeSourceRead !== 'function') throw new Error('Reading "' + e.path + '" is not permitted: the local_folder:read permission gate is unavailable here.');
+                await lfAuthorizeSourceRead(folder, e.path, options);
+                var sn = await lfSnapshotFile(folder, e.path);
+                e.file_id = sn.file_id; e.name = e.name || sn.name; e.mime = sn.mime; e.size = sn.size; e.modified = sn.lastModified;
+                if (thumbable(e) && sn.bytes) blob = new Blob([sn.bytes], { type: sn.mime });
+            } else if (e.path) {
+                var sh = await lfShareFile(folder, e.path, { card: false });
+                e.file_id = sh.file_id; e.name = e.name || sh.name; e.mime = sh.mime; e.size = sh.size;
+                try { var st = await lfStatFile(folder, e.path, 32); e.modified = st.lastModified; } catch (x) {}
+                if (thumbable(e) && typeof lfGetFile === 'function') { try { blob = (await lfGetFile(folder, e.path)).file; } catch (x) {} }
+            } else if (e.file_id) {
+                var r = typeof resolveFileMeta === 'function' ? await resolveFileMeta(e.file_id) : await resolveFile(e.file_id);
+                if (!r) return Object.assign(e, { error: t('File not found: {id}', { id: e.file_id }) });
+                // A pointer into a connected (non-virtual) folder is not
+                // downloadable (file-download only serves virtual pointers):
+                // snapshot it like a connected-folder path, behind the same gate.
+                if (r.kind === 'folder' && r.folder && !(typeof lfIsVirtualFolderRef === 'function' ? lfIsVirtualFolderRef(r.folder) : r.folder === 'virtual')) {
+                    if (typeof lfAuthorizeSourceRead !== 'function') throw new Error('Reading "' + r.path + '" is not permitted: the local_folder:read permission gate is unavailable here.');
+                    await lfAuthorizeSourceRead(r.folder, r.path, options);
+                    var fsn = await lfSnapshotFile(r.folder, r.path);
+                    e.file_id = fsn.file_id; e.name = e.name || fsn.name; e.mime = fsn.mime; e.size = fsn.size; e.modified = fsn.lastModified;
+                    if (thumbable(e) && fsn.bytes) blob = new Blob([fsn.bytes], { type: fsn.mime });
+                } else {
+                e.name = e.name || r.name; e.mime = r.mime; e.size = r.size;
+                if (r.lastModified) e.modified = r.lastModified;
+                if (thumbable(e)) {
+                    blob = r.blob || null;
+                    if (!blob && r.kind === 'folder') { try { var full = await resolveFile(e.file_id); blob = full && full.blob; } catch (x) {} }
+                }
+                }
+            } else {
+                return Object.assign(e, { error: 'path or file_id is required' });
+            }
+            if (blob && /^image\/(png|jpe?g|gif|webp|bmp|avif)$/i.test(e.mime || '') && typeof fileStoreThumbnail === 'function') {
+                var th = await fileStoreThumbnail(blob, e.mime, 96);
+                if (th && th.data_url) e.thumb = th.data_url;
+            }
+        } catch (err) {
+            e.error = String((err && err.message) || err);
+            delete e.file_id;
+        }
+        return e;
+    }));
+    return out;
+}
+
 // ─── Post-render init ───
 // Called after renderMessages innerHTML to initialize checklist summaries
 function initDisplayChecklists() {
@@ -675,5 +892,6 @@ var DISPLAY_GENERATORS = {
     code: generateCode,
     timeline: generateTimeline,
     chart: generateChart,
-    diff: generateDiff
+    diff: generateDiff,
+    file: generateFile
 };

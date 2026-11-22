@@ -1934,5 +1934,7 @@
   "Go to the new chat": "Přejít do nového chatu",
   "Send here anyway": "Přesto odeslat sem",
   "This chat continues in \"{title}\". Workers, PRs and widgets now live there.": "Tento chat pokračuje v „{title}“. Pracovníci, PR a widgety jsou nyní tam.",
-  "deleted chat": "smazaný chat"
+  "deleted chat": "smazaný chat",
+  "Go to new chat": "Přejít na nový chat",
+  "Go to previous chat": "Přejít na předchozí chat"
 }

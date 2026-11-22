@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.1.45
+
+### New
+- Download cards for files the agent shares in chat.
+- The agent uses tables, code blocks, diffs and charts more consistently.
+- Shorter, more complete summaries when sub-agents finish.
+- Instances whose tab hasn't been open for 14 days are hidden from the instance pill until you open them again.
+
+### Fixes
+- Hibernating or dead instances no longer show as connected.
+- Logging in as a different user no longer keeps the previous user's name or roles.
+- "Continue in a new chat": cleaner titles, and the old chat no longer shows as unread.
+
+---
+
 ## v1.1.44
 
 ### New

@@ -1934,5 +1934,7 @@
   "Go to the new chat": "Перейти в новый чат",
   "Send here anyway": "Всё равно отправить сюда",
   "This chat continues in \"{title}\". Workers, PRs and widgets now live there.": "Этот чат продолжается в «{title}». Воркеры, PR и виджеты теперь находятся там.",
-  "deleted chat": "удалённый чат"
+  "deleted chat": "удалённый чат",
+  "Go to new chat": "Перейти в новый чат",
+  "Go to previous chat": "Перейти в предыдущий чат"
 }

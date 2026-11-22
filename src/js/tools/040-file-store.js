@@ -928,6 +928,26 @@ async function resolveFile(fileId) {
     var blob = c.blob.type === mime ? c.blob : c.blob.slice(0, c.blob.size, mime);
     return { id: fileId, kind: 'pointer', blob: blob, name: f.name || null, mime: mime, size: blob.size, width: f.width || null, height: f.height || null };
 }
+// Metadata-only variant for callers that only need {name, mime, size}
+// (display 'file' cards): a folder pointer is answered from its store record
+// (no byte read, so no maxReadBytes TOO_LARGE); a blob record carries its
+// Blob reference without reading it. Legacy location pointers fall back to
+// resolveFile. Returns {id, kind, name, mime, size, blob?, folder?, path?,
+// lastModified?} | null.
+async function resolveFileMeta(fileId) {
+    if (!fileId) return null;
+    if (!fileIndex.has(fileId)) {
+        var rec = await _ufsGetRecord(fileId);
+        if (rec) {
+            _ufsTouch(rec);
+            if (rec.kind === 'folder') return { id: fileId, kind: 'folder', name: rec.name, mime: rec.mime, size: rec.size, folder: rec.folder, path: rec.path, lastModified: rec.lastModified || null };
+            var b = rec.blob;
+            if (b && b.type !== rec.mime && b.slice) b = b.slice(0, b.size, rec.mime);
+            return { id: fileId, kind: 'blob', blob: b, name: rec.name, mime: rec.mime, size: rec.size, width: rec.width || null, height: rec.height || null };
+        }
+    }
+    return resolveFile(fileId);
+}
 // ─── thumbnails ───
 // thumbnail arg (get_file / local_folder read): true → 512 px, a number, or
 // {max}. Returns the clamped long-edge px, or 0 when not requested.
@@ -982,6 +1002,18 @@ function _ufsCollectIds(v, set, depth) {
     if (typeof v !== 'object' || (typeof Blob !== 'undefined' && v instanceof Blob)) return;
     for (var k in v) { if (Object.prototype.hasOwnProperty.call(v, k)) _ufsCollectIds(v[k], set, (depth || 0) + 1); }
 }
+// File ids shown by a chat's display 'file' cards (chat.displays, saved by
+// executeDisplay, tools/090). Only that template's args are scanned: the
+// rest of the chat must not pin every id it ever mentioned.
+function _ufsCollectDisplayIds(chat, set) {
+    var d = chat && chat.displays;
+    if (!d || typeof d !== 'object') return;
+    for (var k in d) {
+        if (!Object.prototype.hasOwnProperty.call(d, k)) continue;
+        var en = d[k];
+        if (en && en.template === 'file' && en.args) _ufsCollectIds(en.args, set, 0);
+    }
+}
 async function _ufsReferencedIds() {
     var set = new Set();
     if (_ufsDeps.referencedIds) { (await _ufsDeps.referencedIds() || []).forEach(function(id) { set.add(id); }); return set; }
@@ -1000,6 +1032,19 @@ async function _ufsReferencedIds() {
             rq.onsuccess = function() { res(rq.result || []); }; rq.onerror = function() { rej(rq.error); };
         });
         rows.forEach(function(r) { _ufsCollectIds(r, set, 0); });
+    }
+    // Chats: cursor (one record at a time), display 'file' cards only.
+    var chatStore = typeof chatStoreName !== 'undefined' ? chatStoreName : 'chats';
+    if (db.objectStoreNames.contains(chatStore)) {
+        await new Promise(function(res, rej) {
+            var rq = db.transaction(chatStore, 'readonly').objectStore(chatStore).openCursor();
+            rq.onsuccess = function() { var c = rq.result; if (!c) return res(); _ufsCollectDisplayIds(c.value, set); c.continue(); };
+            rq.onerror = function() { rej(rq.error); };
+        });
+    }
+    // In-memory chats (page realm): displays not yet persisted.
+    if (typeof chats !== 'undefined' && chats && typeof chats === 'object') {
+        for (var cid in chats) { if (Object.prototype.hasOwnProperty.call(chats, cid)) _ufsCollectDisplayIds(chats[cid], set); }
     }
     return set;
 }

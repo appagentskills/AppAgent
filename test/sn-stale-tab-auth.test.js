@@ -10,7 +10,7 @@ function extractFn(src, name) {
     return src.slice(f.start, f.end);
 }
 
-var FNS = ['snTimeoutMs', 'snWithTimeout', 'snInjectBounded', 'snFetchWithTimeout', 'snLoginProbeState', 'snLoginLooksSignedIn', 'snStrictTokenOk', 'snTokenAccepted', 'snProbeTabTokenUser', 'snFetchUserName', 'snFetchUserRoles', 'snCollectTabTokens',
+var FNS = ['snTimeoutMs', 'snWithTimeout', 'snInjectBounded', 'snFetchWithTimeout', 'snLoginProbeState', 'snLoginLooksSignedIn', 'snStrictTokenOk', 'snTokenAccepted', 'snProbeTabTokenUser', 'snIsHtmlResponse', 'snResponseIsDeadInstance', 'snFetchUserName', 'snFetchUserRoles', 'snCollectTabTokens',
     'snPickTabToken', 'snResolveInstanceSession', 'snRememberInstanceToken', 'snUpdateInstanceTokens',
     'snGetInstancesDetailed', 'snInjectTabScripts', 'snTabsForOrigin', 'snNotConnectedError', 'snGetTokenForInstance', 'snGetTokenForInstanceUnbounded', 'handleRefreshToken'];
 
@@ -259,7 +259,7 @@ async function buildHeartbeat(world) {
     };
     var getSnTabList = async function() { return world.tabs.map(function(t) { return { id: t.id, origin: t.origin }; }); };
     var body = 'var _snInstanceTokensQueue = Promise.resolve();\n' + extractFn(src, 'snUpdateInstanceTokens') + '\n' +
-        ['snTimeoutMs', 'snWithTimeout', 'snInjectBounded'].map(function(n) { return extractFn(src, n); }).join('\n') + '\n' +
+        ['snTimeoutMs', 'snWithTimeout', 'snInjectBounded', 'snIsHtmlResponse', 'snResponseIsDeadInstance'].map(function(n) { return extractFn(src, n); }).join('\n') + '\n' +
         extractFn(src, 'heartbeatAllInstances') + '\nreturn heartbeatAllInstances;';
     var run = new Function('chrome', 'fetch', 'getSnTabList', body)(chrome, fetch, getSnTabList);
     return { run: run, store: store, pings: pings };
@@ -505,7 +505,8 @@ async function buildValidate(valid, recoverWith) {
         storage: { local: { set: function(o) { Object.assign(stored, o); } } }
     };
     var origFetch = { call: function(_w, url, opts) { var t = opts.headers['X-UserToken']; pings.push(t); return Promise.resolve({ status: valid.indexOf(t) !== -1 ? 200 : 401 }); } };
-    var body = 'var _snStatusState = "";\n' + extractFn(src, '_sendMessageBounded') + '\n' + extractFn(src, '_adoptRecoveredToken') + '\n' + extractFn(src, 'validateToken') +
+    var body = 'var _snStatusState = "";\nvar _snActiveDead = null;\n' + extractFn(src, '_sendMessageBounded') + '\n' + extractFn(src, '_adoptRecoveredToken') + '\n' +
+        extractFn(src, '_snIsHtmlResponse') + '\n' + extractFn(src, '_snResponseIsDeadInstance') + '\n' + extractFn(src, 'validateToken') +
         '\nreturn { run: validateToken, state: function() { return _snStatusState; } };';
     var api = new Function('window', 'chrome', 'Platform', '_origFetch', 'updateSnStatus', body)(w, chrome, { instanceUrl: O }, origFetch, function() {});
     api.w = w; api.stored = stored; api.msgs = msgs; api.pings = pings;

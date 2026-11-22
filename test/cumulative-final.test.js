@@ -3,7 +3,7 @@
 // hook wording (worker/020-page-stubs). Real source files via loadModules;
 // globals stub only chrome/DOM/storage/runtime plumbing.
 var T = { tags: ['unit'], timeout: 5000 };
-var REMINDER = "Reminder: your final message must be a cumulative digest of everything since the user's last message.";
+var REMINDER = "Reminder: while other sub-agents are still running, reply with a 1-3 line interim update; after the last report, your final message must be a brief cumulative digest of everything since the user's last message.";
 function count(s, sub) { return String(s).split(sub).length - 1; }
 var quiet = { log: function() {}, warn: function() {}, error: function() {}, info: function() {} };
 
@@ -23,8 +23,12 @@ describe('C1 CUMULATIVE FINAL policy (core/110-system-prompt.js)', function() {
         assert.strictEqual(cf.length, 1, 'exactly one CUMULATIVE FINAL line');
         assert.ok(/after any wake run/.test(cf[0]) && /everything since the user's last real message/.test(cf[0]) && /earlier wake runs/.test(cf[0]) && /Never assume the user read/.test(cf[0]));
         var fan = m.ORCHESTRATOR_POLICY_LINES.filter(function(l) { return l.indexOf('FAN-OUT:') === 0; })[0];
-        assert.ok(/Interim answers as reports arrive are cumulative: restate all results so far, not only the newest report\./.test(fan));
+        assert.ok(/Interim answers while other subs are still running are 1-3 lines/.test(fan) && /never restate the full digest each time/.test(fan));
+        assert.ok(/brief digest/.test(cf[0]) && /every outcome/.test(cf[0]) && /Brevity wins over detail/.test(cf[0]), 'CUMULATIVE FINAL is brief');
+        var prov = m.ORCHESTRATOR_POLICY_LINES.filter(function(l) { return l.indexOf('PROVENANCE:') === 0; })[0];
+        assert.ok(/one short line, not per item/.test(prov), 'PROVENANCE is a single line');
         assert.ok(m.DEFAULT_SYSTEM_PROMPT_TEMPLATE.indexOf("from mid-run or from earlier wake runs since the user's last message") !== -1);
+        assert.ok(m.DEFAULT_SYSTEM_PROMPT_TEMPLATE.indexOf('Exception: while your sub-agents are still running, a wake-run answer is the 1-3 line interim update (see the fan-out rule).') !== -1, 'OUTPUT carve-out for interim wake updates');
     }, T);
     test('policy appears exactly ONCE for default, custom and placeholder-custom prompts; never for subs', async function() {
         var m = await load();

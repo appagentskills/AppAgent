@@ -1934,5 +1934,7 @@
   "Go to the new chat": "新しいチャットへ移動",
   "Send here anyway": "このまま送信",
   "This chat continues in \"{title}\". Workers, PRs and widgets now live there.": "このチャットは「{title}」に引き継がれています。ワーカー、PR、ウィジェットは現在そちらにあります。",
-  "deleted chat": "削除されたチャット"
+  "deleted chat": "削除されたチャット",
+  "Go to new chat": "新しいチャットへ移動",
+  "Go to previous chat": "前のチャットへ移動"
 }

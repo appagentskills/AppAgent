@@ -15,7 +15,11 @@ describe('Visual results prompt rule', function() {
         var out = tpl.indexOf('OUTPUT:'), next = tpl.indexOf('VERIFY YOUR WORK:');
         assert.ok(out !== -1 && next > out);
         var section = tpl.slice(out, next);
-        assert.match(section, /- Visual results \(generated or edited images, before\/after, galleries, renders\) go in an html_widget, which opens in the split pane/);
+        assert.match(section, /- Custom, interactive or image visuals \(generated or edited images, before\/after, galleries, renders\) go in an html_widget, which opens in the split pane/);
+        assert.match(section, /- Structured content goes through `display`, not markdown: 5\+ same-shape rows → table/);
+        assert.match(section, /<!--display:ID-->/);
+        assert.match(section, /re-render their tables\/lists via display/);
+        assert.ok(section.indexOf('`display`') < section.indexOf('html_widget'), 'display rule precedes the html_widget rule');
         assert.match(section, /never only as file paths or links/);
         assert.match(section, /patch it as each result arrives/);
         var briefs = m.ORCHESTRATOR_POLICY_LINES.filter(function(l) { return l.indexOf('BRIEFS:') === 0; })[0];
@@ -29,5 +33,12 @@ describe('Visual results prompt rule', function() {
         assert.ok(start !== -1 && end > start);
         var block = src.slice(start, end);
         assert.match(block, /- Visual results: if your task names the parent\\'s widget \(widget_id\), patch that widget \(html_widget action=patch\)/);
+        assert.match(block, /never put `<!--display:…-->` placeholders in report_to_parent/);
+        assert.match(block, /Structured content \(tables, code, diffs, charts\) goes through `display`/);
+    }, T);
+
+    test('sub-agent tool profile includes display', async function() {
+        var m = await loadModules(['src/js/core/078-tool-profiles.js'], { lenient: true, globals: { window: fakeWindow(), console: quiet } });
+        assert.ok(m.TOOL_PROFILES['sub-agent'].tools.indexOf('display') !== -1);
     }, T);
 });

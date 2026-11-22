@@ -1934,5 +1934,7 @@
   "Go to the new chat": "Aller à la nouvelle conversation",
   "Send here anyway": "Envoyer ici quand même",
   "This chat continues in \"{title}\". Workers, PRs and widgets now live there.": "Cette conversation se poursuit dans « {title} ». Les workers, les PR et les widgets s’y trouvent désormais.",
-  "deleted chat": "conversation supprimée"
+  "deleted chat": "conversation supprimée",
+  "Go to new chat": "Aller à la nouvelle conversation",
+  "Go to previous chat": "Aller à la conversation précédente"
 }

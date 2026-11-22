@@ -1934,5 +1934,7 @@
   "Go to the new chat": "Ugrás az új csevegésre",
   "Send here anyway": "Küldés mégis ide",
   "This chat continues in \"{title}\". Workers, PRs and widgets now live there.": "Ez a csevegés itt folytatódik: „{title}”. A workerek, PR-ek és widgetek mostantól ott vannak.",
-  "deleted chat": "törölt csevegés"
+  "deleted chat": "törölt csevegés",
+  "Go to new chat": "Ugrás az új csevegésre",
+  "Go to previous chat": "Ugrás az előző csevegésre"
 }

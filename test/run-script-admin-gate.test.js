@@ -16,14 +16,14 @@ describe('servicenow_run_script admin gate', function() {
     var URL = 'https://dev1.service-now.com';
 
     test('cached direct admin role allows without a network lookup', async function() {
-        var f = await fixture([{ url: URL, shortName: 'dev1', userName: 'alice', roles: ['admin'] }],
+        var f = await fixture([{ url: URL, shortName: 'dev1', userName: 'alice', roles: ['admin'], token: 'tok' }],
             function() { throw new Error('should not fetch'); });
         var r = await f.m._rsCheckAdmin(URL, 'tok');
         assert.strictEqual(r.ok, true);
         assert.strictEqual(f.calls.length, 0);
     });
     test('inherited admin found by Table API lookup is allowed', async function() {
-        var f = await fixture([{ url: URL, shortName: 'dev1', userName: 'bob', roles: ['itil'] }],
+        var f = await fixture([{ url: URL, shortName: 'dev1', userName: 'bob', roles: ['itil'], token: 'tok' }],
             function() { return jsonRes(200, { result: [{ sys_id: 'x' }] }); });
         var r = await f.m._rsCheckAdmin(URL, 'tok');
         assert.strictEqual(r.ok, true);
@@ -31,14 +31,14 @@ describe('servicenow_run_script admin gate', function() {
         assert.ok(decodeURIComponent(f.calls[0]).indexOf('inherited') === -1, 'effective admin: no inherited filter');
     });
     test('non-admin is refused with the Table API hint', async function() {
-        var f = await fixture([{ url: URL, shortName: 'dev1', userName: 'carol', roles: ['itil'] }],
+        var f = await fixture([{ url: URL, shortName: 'dev1', userName: 'carol', roles: ['itil'], token: 'tok' }],
             function() { return jsonRes(200, { result: [] }); });
         var r = await f.m._rsCheckAdmin(URL, 'tok');
         assert.strictEqual(r.ok, false);
         assert.strictEqual(r.error, 'User carol lacks the admin role on dev1; server scripts require admin \u2014 use servicenow_api (Table API) instead.');
     });
     test('lookup failure fails safe (refuses)', async function() {
-        var f = await fixture([{ url: URL, shortName: 'dev1', userName: 'dave', roles: [] }],
+        var f = await fixture([{ url: URL, shortName: 'dev1', userName: 'dave', roles: [], token: 'tok' }],
             function() { return jsonRes(403, {}); });
         var r = await f.m._rsCheckAdmin(URL, 'tok');
         assert.strictEqual(r.ok, false);

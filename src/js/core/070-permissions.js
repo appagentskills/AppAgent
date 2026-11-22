@@ -43,6 +43,9 @@ var GLOBAL_READ_KEYS = [
     'prompt_user',
     // split_view only changes panel layout (shows/closes a widget pane).
     'split_view',
+    // continue_in_new_chat only validates + acknowledges (the page creates the
+    // new chat); refused outside a "Continue in a new chat" handoff turn.
+    'continue_in_new_chat',
     'take_screenshot',
     'screenshot_by_id',
     'get_file',
@@ -431,6 +434,12 @@ var _chatLineagePrev = {};
 // dropped by the running/cleanup guard. Never overwrites a different LIVE
 // link; a dead one (tombstoned, or — with opts.missingIsDead — absent from
 // the chats map) is replaced.
+// Stamping a NEW continuedTo also stamps chats[from].continuedAt (handoff
+// time; ui/165 isContinuedHandoffActivity suppresses unseen/bell activity only
+// up to it). Both realms stamp it here: the page copy alone is lost when its
+// 'update-chat' push is dropped by the SW running/cleanup guard and the next
+// SW snapshot replaces it (app/045 adoptChatRow). An idempotent re-register
+// of the same link never moves it, so a legacy link stays legacy.
 // opts.missingIsDead: the caller's chats map is authoritative (the page), so
 // a linked chat missing from it is dead too. NOT set by the SW: its chats map
 // lags the page (see _lineageIsDead), where a missing chat may still be live.
@@ -453,7 +462,10 @@ function registerLineageLink(fromChatId, toChatId, opts) {
         try {
             if (typeof chats !== 'undefined' && chats) {
                 // Past the fork guard any different existing field is dead.
-                if (chats[f] && !chats[f]._deleted && String(chats[f].continuedTo || '') !== t) chats[f].continuedTo = t;
+                if (chats[f] && !chats[f]._deleted && String(chats[f].continuedTo || '') !== t) {
+                    chats[f].continuedTo = t;
+                    chats[f].continuedAt = Date.now();
+                }
                 if (chats[t] && !chats[t]._deleted && String(chats[t].continuedFrom || '') !== f) chats[t].continuedFrom = f;
             }
         } catch (e) { /* in-memory link above still resolves */ }

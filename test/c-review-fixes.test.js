@@ -5,7 +5,7 @@
 // hook rows are not turns for the progress-card key (app/030).
 // Real source files via loadModules; globals stub only runtime plumbing.
 var T = { tags: ['unit'], timeout: 5000 };
-var REMINDER = "Reminder: your final message must be a cumulative digest of everything since the user's last message.";
+var REMINDER = "Reminder: while other sub-agents are still running, reply with a 1-3 line interim update; after the last report, your final message must be a brief cumulative digest of everything since the user's last message.";
 function count(s, sub) { return String(s).split(sub).length - 1; }
 var quiet = { log: function() {}, warn: function() {}, error: function() {}, info: function() {} };
 

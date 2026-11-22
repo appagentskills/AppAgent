@@ -263,7 +263,7 @@ var SUB_AGENT_PREAMBLE = [
     '- Need parent input mid-task? `report_to_parent({status:"need_input", ...})` settles the parent\'s handle and parks you until it wakes you with instructions.',
     '- Plan-approval gate: a report proposing further work beyond your task goes out as `status:"need_input"`; wait for approval — never self-approve and continue.',
     '- Idle and waiting? Call `sleep_self` to free your worker pool slot.',
-    '- Visual results: if your task names the parent\'s widget (widget_id), patch that widget (html_widget action=patch) as results arrive instead of creating a new one; list the widget_id in `artifacts`.',
+    '- Visual results: if your task names the parent\'s widget (widget_id), patch that widget (html_widget action=patch) as results arrive instead of creating a new one; list the widget_id in `artifacts`. Structured content (tables, code, diffs, charts) goes through `display`; keep `summary` itself plain markdown so the parent can re-render it — never put `<!--display:…-->` placeholders in report_to_parent (they do not resolve in the parent chat); return the data/markdown instead.',
     '',
     'Reporting (`report_to_parent` — the parent sees only this, never your transcript):',
     '- Summarize; never echo raw tool output. `summary` is concise markdown (rendered to the user in the parent chat), ≤ 4 KB by default — the parent may set another cap via spawn `summary_cap_kb` (1–16 KB); longer summaries are truncated by the registry.',
@@ -3453,7 +3453,9 @@ function _subNoticeMeta(kind, agentId, name, status, summary, text) {
 // it. Own line AFTER the notice body, so SUB_NOTICE_RE's summary capture
 // (terminated by the await_handle line) and the single-line lifecycle
 // headline are unchanged.
-// (Literal kept inside the function so it is self-contained.)
+// (Literal kept inside the function so it is self-contained.) ONE wording
+// covers both the interim (subs still running, core/110 FAN-OUT) and the
+// final case, so app/020 _wakeFinalReminderLine dedupe stays exact.
 // C-REVIEW Fix 1: TOP-LEVEL parents only. Pass the recipient parent chat
 // id: a sub-agent parent (nested) gets NO CUMULATIVE FINAL policy (core/110)
 // and has no user, so its text comes back UNCHANGED. Nested = chats[id]
@@ -3475,7 +3477,7 @@ function _withWakeFinalReminder(text, parentChatId) {
             }
         } catch (_) { /* unreadable -> top-level default */ }
     }
-    return s + '\nReminder: your final message must be a cumulative digest of everything since the user\'s last message.';
+    return s + '\nReminder: while other sub-agents are still running, reply with a 1-3 line interim update; after the last report, your final message must be a brief cumulative digest of everything since the user\'s last message.';
 }
 function _subNoticeList(prior, add) {
     var out = Array.isArray(prior) ? prior.slice() : [];
