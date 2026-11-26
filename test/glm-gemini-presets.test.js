@@ -26,7 +26,10 @@ async function _migrator() {
 }
 var OR = 'https://openrouter.ai/api/v1/chat/completions';
 var GLM53 = { name: 'GLM 5.3', model: 'z-ai/glm-5.3', endpoint: OR, apiKey: '', provider: 'z-ai' };
-var GEM38 = { name: 'Gemini 3.8 Flash', model: 'google/gemini-3.8-flash', endpoint: OR, apiKey: '' };
+// Nov 26 2026: Gemini 4 Neon supersedes Gemini 3.8 Flash (older Flash seeds chain-collapse to it).
+var GEM38 = { name: 'Gemini 4 Neon', model: 'google/gemini-4-neon', endpoint: OR, apiKey: '' };
+var CARBON = { name: 'Gemini 4 Carbon', model: 'google/gemini-4-carbon', endpoint: OR, apiKey: '', provider: 'google-vertex' };
+var OLD38 = { name: 'Gemini 3.8 Flash', model: 'google/gemini-3.8-flash', endpoint: OR, apiKey: '' };
 var GLM_BASE = { name: 'GLM 5.2', model: 'z-ai/glm-5.2', provider: 'z-ai' };
 var GEM_BASE = { name: 'Gemini 3.5 Flash', model: 'google/gemini-3.5-flash' };
 // Every historical seed vintage (030-config.js git history since 2026-07-02).
@@ -50,13 +53,16 @@ describe('GLM 5.3 / Gemini 3.8 Flash presets', function() {
         var c = await _config();
         var by = {}; c.defaults.forEach(function(d) { by[d.name] = d; });
         assert.deepStrictEqual(by['GLM 5.3'], GLM53);
-        assert.deepStrictEqual(by['Gemini 3.8 Flash'], GEM38);
+        assert.deepStrictEqual(by['Gemini 4 Neon'], GEM38);
+        assert.deepStrictEqual(by['Gemini 4 Carbon'], CARBON);
+        assert.strictEqual(by['Gemini 3.8 Flash'], undefined);
+        assert.strictEqual(c.renames['Gemini 3.8 Flash'], 'Gemini 4 Neon');
         assert.strictEqual(by['GLM 5.2'], undefined);
         assert.strictEqual(by['Gemini 3.5 Flash'], undefined);
         assert.strictEqual(c.renames['GLM 5.2'], 'GLM 5.3');
         assert.strictEqual(c.renames['Kimi K2.5'], 'GLM 5.3');
-        assert.strictEqual(c.renames['Gemini 3.5 Flash'], 'Gemini 3.8 Flash');
-        assert.strictEqual(c.renames['Gemini 3 Flash Preview'], 'Gemini 3.8 Flash');
+        assert.strictEqual(c.renames['Gemini 3.5 Flash'], 'Gemini 4 Neon');
+        assert.strictEqual(c.renames['Gemini 3 Flash Preview'], 'Gemini 4 Neon');
         Object.keys(c.renames).forEach(function(k) {
             if (/GLM|Gemini|Kimi/.test(k)) assert.ok(by[c.renames[k]], k + ' → ' + c.renames[k] + ' exists');
         });
@@ -101,5 +107,18 @@ describe('GLM 5.3 / Gemini 3.8 Flash presets', function() {
         var r = run([kimi, g3], 'Kimi K2.5');
         assert.deepStrictEqual(r.providers, [GLM53, GEM38]);
         assert.strictEqual(r.stored, 'GLM 5.3');
+    }, { tags: ['unit'] });
+
+    test('untouched Gemini 3.8 Flash seed → Gemini 4 Neon (key + selection carried); tuned copy kept', async function() {
+        var run = await _migrator();
+        var r = run([Object.assign({}, OLD38, { apiKey: 'sk-or-user' })], 'Gemini 3.8 Flash');
+        assert.strictEqual(r.changed, true);
+        assert.deepStrictEqual(r.providers, [Object.assign({}, GEM38, { apiKey: 'sk-or-user' })]);
+        assert.strictEqual(r.current, 'Gemini 4 Neon');
+        assert.strictEqual(r.stored, 'Gemini 4 Neon');
+        var kept = run([Object.assign({}, OLD38, { effort: 'high' })], 'Gemini 3.8 Flash');
+        assert.strictEqual(kept.changed, false);
+        assert.strictEqual(kept.providers[0].model, 'google/gemini-3.8-flash');
+        assert.strictEqual(kept.stored, 'Gemini 3.8 Flash');
     }, { tags: ['unit'] });
 });

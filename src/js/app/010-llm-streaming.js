@@ -17,6 +17,76 @@ async function callLLMStreaming(chatMessages, onThinking, onContent, onToolCall,
     }
 }
 
+// Local OpenAI-compatible servers (LM Studio, llama.cpp, Ollama) on
+// localhost / private networks. Only these get stream_options.include_usage
+// added below: hosted providers are left byte-identical.
+function isLocalLLMEndpoint(url) {
+    var host = '';
+    try { host = new URL(String(url || '')).hostname.toLowerCase(); } catch (e) { return false; }
+    host = host.replace(/^\[|\]$/g, '');
+    return host === 'localhost' || host === '::1' || /\.local(host)?$/.test(host)
+        || /^127\./.test(host) || /^10\./.test(host) || /^192\.168\./.test(host)
+        || /^172\.(1[6-9]|2\d|3[01])\./.test(host);
+}
+
+// Usage estimate (~4 chars/token, same ratio as estimateTokens in
+// ui/240-layout.js) for providers that return no usage. Text only:
+// images/files count a flat 1000 tokens instead of their base64 length.
+var USAGE_EST_CHARS_PER_TOKEN = 4;
+function _estContentChars(c) {
+    if (typeof c === 'string') return c.length;
+    if (!Array.isArray(c)) return 0;
+    var n = 0;
+    for (var i = 0; i < c.length; i++) {
+        var p = c[i];
+        if (!p) continue;
+        if (typeof p.text === 'string') n += p.text.length;
+        else if (p.type === 'image_url' || p.type === 'file' || p.type === 'image') n += 1000 * USAGE_EST_CHARS_PER_TOKEN;
+    }
+    return n;
+}
+function estimateRequestTokens(body) {
+    if (!body) return 0;
+    var chars = 0, msgs = body.messages || [];
+    for (var i = 0; i < msgs.length; i++) {
+        var m = msgs[i];
+        if (!m) continue;
+        chars += _estContentChars(m.content) + 8; // + role/framing overhead
+        if (Array.isArray(m.tool_calls)) {
+            for (var j = 0; j < m.tool_calls.length; j++) {
+                var fn = m.tool_calls[j] && m.tool_calls[j].function;
+                if (fn) chars += String(fn.name || '').length + String(fn.arguments || '').length;
+            }
+        }
+    }
+    if (Array.isArray(body.tools) && body.tools.length) {
+        try { chars += JSON.stringify(body.tools).length; } catch (e) {}
+    }
+    return Math.ceil(chars / USAGE_EST_CHARS_PER_TOKEN);
+}
+function estimateOutputTokens(content, thinking, toolCalls) {
+    var chars = String(content || '').length + String(thinking || '').length;
+    (toolCalls || []).forEach(function(tc) {
+        var fn = tc && tc.function;
+        if (fn) chars += String(fn.name || '').length + String(fn.arguments || '').length;
+    });
+    return Math.ceil(chars / USAGE_EST_CHARS_PER_TOKEN);
+}
+// Fill est_input_tokens / est_output_tokens ONLY when the provider returned
+// no (or zero) usage. Real input_tokens/output_tokens are never touched.
+function applyUsageEstimates(reqMetrics, requestBody, content, thinking, toolCalls) {
+    if (!reqMetrics) return reqMetrics;
+    if (!(reqMetrics.input_tokens > 0)) {
+        var ei = estimateRequestTokens(requestBody);
+        if (ei > 0) reqMetrics.est_input_tokens = ei;
+    }
+    if (!(reqMetrics.output_tokens > 0)) {
+        var eo = estimateOutputTokens(content, thinking, toolCalls);
+        if (eo > 0) reqMetrics.est_output_tokens = eo;
+    }
+    return reqMetrics;
+}
+
 async function callOpenRouterStreaming(currentProvider, messages, onThinking, onContent, onToolCall, onDone, onStreamStatus, abortController, chatId, metrics) {
     var provider = getProviderById(currentProvider);
 
@@ -246,6 +316,11 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
         requestBody = adaptRequestBodyForHuggingFace(requestBody, provider, getCachedHuggingFaceModelCatalog());
     }
     var hfRoutedProvider = '';
+    // Local OpenAI-compatible servers only stream a usage chunk when asked
+    // (LM Studio otherwise reports nothing). Hosted providers: unchanged.
+    if (!isHuggingFace && !provider.isClaudeOAuth && !provider.isChatGPTOAuth && isLocalLLMEndpoint(provider.endpoint)) {
+        requestBody.stream_options = { include_usage: true };
+    }
 
     // Store request body in metrics for debugging
     reqMetrics.requestBody = requestBody;
@@ -427,7 +502,7 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
         };
         if (abortController && abortController.signal) fetchOpts.signal = abortController.signal;
         if (isHuggingFace) delete fetchOpts.headers['HTTP-Referer'];
-        var res = await fetch(provider.endpoint, fetchOpts);
+        var res = await fetch(_llmRequestUrl(provider), fetchOpts);
         if (isHuggingFace) {
             try { hfRoutedProvider = (res.headers && res.headers.get && res.headers.get('x-inference-provider')) || ''; } catch (eH) {}
             if (hfRoutedProvider) reqMetrics.routedProvider = hfRoutedProvider;
@@ -657,6 +732,10 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
 
                 var delta = choice.delta;
                 var thinkingChunk = null;
+                // First generated token (tok/s is measured from here).
+                if (delta && !reqMetrics.firstTokenTime && (delta.content || delta.reasoning || delta.reasoning_content || delta.reasoning_details || delta.tool_calls)) {
+                    reqMetrics.firstTokenTime = Date.now();
+                }
 
                 // Check for thinking/reasoning in delta
                 if (delta) {
@@ -882,6 +961,9 @@ async function callOpenRouterStreaming(currentProvider, messages, onThinking, on
         // The synthetic notice replays as its own trailing text block.
         if (blockOrder) blockOrder.push({ t: 'x', s: preRefusalLen, e: content.length });
     }
+
+    // No usage from the provider (e.g. LM Studio): estimate it ourselves.
+    try { applyUsageEstimates(reqMetrics, requestBody, content, thinking, toolCalls); } catch (eEst) {}
 
     // Adaptive pool: a completed call is a success-streak signal.
     if (!_poolReported) _poolReport(chatId, { kind: 'ok' });
@@ -1285,7 +1367,7 @@ function sendCacheHeartbeat(chatId) {
                 ? Platform.getReferer()
                 : (Platform.instanceUrl || (typeof window !== 'undefined' ? window.location.href : ''));
         }
-        fetch(provider.endpoint, {
+        fetch(_llmRequestUrl(provider), {
             method: 'POST',
             headers: hbHeaders,
             body: JSON.stringify(body)
@@ -1306,3 +1388,13 @@ function sendCacheHeartbeat(chatId) {
 // Expose for the SW alarm handler in background.js (importScripts shares the
 // worker global scope, but be explicit like Handles/SubAgents are).
 if (typeof self !== 'undefined') { self.sendCacheHeartbeat = sendCacheHeartbeat; }
+
+// URL actually requested for an OpenAI-format provider: a saved bare base
+// (http://host:1234, .../v1) is completed to .../v1/chat/completions at
+// request time (completeOpenAIChatUrl, core/030-config.js), so older saved
+// records work without a migration. OAuth providers are never touched.
+function _llmRequestUrl(provider) {
+    var ep = provider && provider.endpoint;
+    if (!provider || provider.isChatGPTOAuth || provider.isClaudeOAuth || typeof completeOpenAIChatUrl !== 'function') return ep;
+    return completeOpenAIChatUrl(ep);
+}

@@ -250,7 +250,7 @@ function renderSettingsPage() {
                 '<input type="checkbox" id="settings-keep-awake" ' + ((typeof window.getKeepAwakeForeverDisabled === 'function' && window.getKeepAwakeForeverDisabled()) ? '' : 'checked') + ' onchange="toggleKeepAwake(this.checked)">' +
             '</div>' +
             '<div class="settings-page-row">' +
-                '<div><div class="settings-page-row-label">' + t('Notifications') + '</div><div class="settings-page-row-hint">' + t('Silent: no notifications. Notify: show a desktop notification. With sound: also play a short chime. Default: Notify.') + '</div></div>' +
+                '<div><div class="settings-page-row-label">' + t('Notifications') + '</div><div class="settings-page-row-hint">' + t('Silent: no notifications. Notify: show a desktop notification. With sound: also play a short chime. Default: With sound.') + '</div></div>' +
                 (typeof notificationModeSwitchHtml === 'function' ? notificationModeSwitchHtml('settings-page-notif-mode', t) : '') +
             '</div>' +
 
@@ -2526,6 +2526,7 @@ function showLlmEndpointModal(editingEndpoint) {
                     '<label class="form-label">' + t('Endpoint URL') + ' <span class="required">*</span></label>' +
                     '<input type="text" id="llm-endpoint-url" class="form-input" value="' + escapeHtml(ep.url) + '" placeholder="https://openrouter.ai/api/v1/chat/completions">' +
                     '<div class="settings-page-row-hint">' + t('OpenAI-compatible chat-completions URL, e.g. OpenRouter or Hugging Face (https://router.huggingface.co/v1/chat/completions).') + '</div>' +
+                    '<div class="settings-page-row-hint" id="llm-endpoint-url-resolved"></div>' +
                 '</div>' +
                 '<div class="form-field">' +
                     '<label class="form-label">' + t('API Key') + '</label>' +
@@ -2539,6 +2540,18 @@ function showLlmEndpointModal(editingEndpoint) {
         '</div>';
 
     document.body.appendChild(overlay);
+    // Live preview of the URL actually requested: a bare local/OpenAI base
+    // (http://host:1234, .../v1) is completed to .../v1/chat/completions.
+    var urlInput = document.getElementById('llm-endpoint-url');
+    var resolvedHint = document.getElementById('llm-endpoint-url-resolved');
+    function updateResolvedHint() {
+        if (!urlInput || !resolvedHint) return;
+        var typed = urlInput.value.trim();
+        var done = typeof completeOpenAIChatUrl === 'function' ? completeOpenAIChatUrl(typed) : typed;
+        resolvedHint.textContent = (typed && done !== typed) ? t('Requests go to: {url}', { url: done }) : '';
+    }
+    if (urlInput) urlInput.addEventListener('input', updateResolvedHint);
+    updateResolvedHint();
 }
 
 function closeLlmEndpointModal() {
@@ -2549,6 +2562,8 @@ function closeLlmEndpointModal() {
 async function saveLlmEndpointFromModal(editingId) {
     var name = document.getElementById('llm-endpoint-name').value.trim();
     var url = document.getElementById('llm-endpoint-url').value.trim();
+    // Bare local/OpenAI base -> .../v1/chat/completions (full URLs unchanged).
+    if (typeof completeOpenAIChatUrl === 'function') url = completeOpenAIChatUrl(url);
     var apiKey = document.getElementById('llm-endpoint-apikey').value.trim();
 
     if (!name || !url) {
@@ -2580,12 +2595,28 @@ async function saveLlmEndpointFromModal(editingId) {
     }
 
     // Re-sync detached provider clones so endpoints + affected rows commit atomically.
+    // Linked = same endpointId, OR (legacy URL-only models, no endpointId) the
+    // same URL fallback findEndpointForProvider uses to count them on this card.
+    // prevEp is the record still in the live llmEndpoints global (replaced only
+    // after persist below), so the URL match uses the PRE-edit url.
+    var prevEp = editingId ? getLlmEndpointById(editingId) : null;
     var touched = 0;
     var affectedProviders = [];
     var nextProviders = apiProviders.map(function(p) {
-        if (p.endpointId !== endpoint.id) return p;
-        touched++;
-        var copy = Object.assign({}, p, { endpoint: endpoint.url, apiKey: endpoint.apiKey || '' });
+        var linked = p.endpointId === endpoint.id || (!!prevEp && findEndpointForProvider(p) === prevEp);
+        if (!linked) return p;
+        // A legacy URL-only model carrying its own key (different from the
+        // endpoint's pre-edit key) keeps it when this save did NOT change the
+        // endpoint key (the key field is prefilled, so a rename/URL-only save
+        // resends it): it follows the URL but stays unlinked, since an
+        // endpointId would make inlineLegacyEndpointProviders overwrite its key
+        // on every load. A deliberate key change re-syncs and links it.
+        var prevKey = (prevEp && prevEp.apiKey) || '';
+        var keepOwnKey = apiKey === prevKey && !p.endpointId && !!p.apiKey && p.apiKey !== prevKey;
+        if (!keepOwnKey) touched++;
+        var copy = keepOwnKey
+            ? Object.assign({}, p, { endpoint: endpoint.url })
+            : Object.assign({}, p, { endpointId: endpoint.id, endpoint: endpoint.url, apiKey: endpoint.apiKey || '' });
         affectedProviders.push(copy);
         return copy;
     });

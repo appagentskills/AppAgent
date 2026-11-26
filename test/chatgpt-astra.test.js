@@ -14,8 +14,8 @@ async function runAstraTests(sources) {
     var normalize = slice(bg, 'function _openaiNormalizeModelSlug(', 'self._openaiNormalizeModelSlug');
     var api = new Function(predicate + normalize + 'var _openaiModelQuirks = {};\n' + transform + '\nreturn { transform: transformToResponses };')();
     var convert = api.transform;
-    check('Astra seed is subscription-only', /name: 'GPT-6 Astra \(ChatGPT\)'[\s\S]*?model: 'gpt-6-astra'[\s\S]*?isChatGPTOAuth: true/.test(cfg));
-    check('Astra fallback catalog', /OPENAI_FALLBACK_MODELS = \['gpt-6-astra'/.test(bg));
+    check('Astra seed is subscription-only', /name: 'GPT-6.2 Astra \(ChatGPT\)'[\s\S]*?model: 'gpt-6.2-astra'[\s\S]*?isChatGPTOAuth: true/.test(cfg));
+    check('Astra fallback catalog', /OPENAI_FALLBACK_MODELS = \[[^\]]*'gpt-6\.2-astra'[^\]]*'gpt-6-astra'/.test(bg));
     ['low', 'medium', 'high', 'xhigh', 'max'].forEach(function(effort) {
         var out = convert({ model: 'openai/gpt-6-astra', reasoning: { effort: effort } });
         check('Astra effort ' + effort, out.reasoning.effort === effort && out.reasoning.summary === 'auto' && out.model === 'gpt-6-astra');

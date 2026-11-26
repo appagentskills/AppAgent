@@ -41,10 +41,15 @@ describe('GPT-6 Sol/Luna presets', function() {
     test('seeds GPT-6 Sol/Luna, drops Terra and every GPT-5.6 ChatGPT seed', async function() {
         var cfg = _config(await _sources());
         var byName = {}; cfg.defaults.forEach(function(d) { byName[d.name] = d; });
-        assert.strictEqual(byName['GPT-6.1 Sol (ChatGPT)'].model, 'gpt-6.1-sol');
+        assert.strictEqual(byName['GPT-6.2 Sol (ChatGPT)'].model, 'gpt-6.2-sol');
+        assert.strictEqual(byName['GPT-6.2 Astra (ChatGPT)'].model, 'gpt-6.2-astra');
+        assert.strictEqual(byName['GPT-6.2 Astra (ChatGPT)'].isChatGPTOAuth, true);
+        assert.strictEqual(byName['GPT-6.1 Sol (ChatGPT)'], undefined);
+        assert.strictEqual(byName['GPT-6 Astra (ChatGPT)'], undefined);
         assert.strictEqual(byName['GPT-6 Luna (ChatGPT)'].model, 'gpt-6-luna');
-        assert.strictEqual(byName['GPT-6.1 Sol (ChatGPT)'].isChatGPTOAuth, true);
-        assert.strictEqual(byName['gpt-6.1-sol'].model, 'openai/gpt-6.1-sol');
+        assert.strictEqual(byName['GPT-6.2 Sol (ChatGPT)'].isChatGPTOAuth, true);
+        assert.strictEqual(byName['gpt-6.2-sol'].model, 'openai/gpt-6.2-sol');
+        assert.strictEqual(byName['gpt-6.1-sol'], undefined);
         assert.strictEqual(byName['gpt-6-sol'], undefined);
         assert.strictEqual(byName['GPT-6 Sol (ChatGPT)'], undefined);
         assert.deepStrictEqual(cfg.defaults.filter(function(d) { return /5\.6|terra/i.test(d.name + ' ' + d.model); }), []);
@@ -53,13 +58,16 @@ describe('GPT-6 Sol/Luna presets', function() {
         var cfg = _config(await _sources());
         var names = cfg.defaults.map(function(d) { return d.name; });
         Object.keys(cfg.renames).forEach(function(k) { assert.ok(names.indexOf(cfg.renames[k]) >= 0, k + ' -> ' + cfg.renames[k]); });
-        assert.strictEqual(cfg.renames['GPT-5.6 Terra (ChatGPT)'], 'GPT-6.1 Sol (ChatGPT)');
-        assert.strictEqual(cfg.renames['GPT-5.6 Sol (ChatGPT)'], 'GPT-6.1 Sol (ChatGPT)');
-        assert.strictEqual(cfg.renames['GPT-6 Sol (ChatGPT)'], 'GPT-6.1 Sol (ChatGPT)');
+        assert.strictEqual(cfg.renames['GPT-5.6 Terra (ChatGPT)'], 'GPT-6.2 Sol (ChatGPT)');
+        assert.strictEqual(cfg.renames['GPT-5.6 Sol (ChatGPT)'], 'GPT-6.2 Sol (ChatGPT)');
+        assert.strictEqual(cfg.renames['GPT-6 Sol (ChatGPT)'], 'GPT-6.2 Sol (ChatGPT)');
         assert.strictEqual(cfg.renames['GPT-5.6 Luna (ChatGPT)'], 'GPT-6 Luna (ChatGPT)');
-        assert.strictEqual(cfg.renames['GPT-5.1'], 'GPT-6.1 Sol (ChatGPT)');
-        assert.strictEqual(cfg.renames['gpt-5.6-sol'], 'gpt-6.1-sol');
-        assert.strictEqual(cfg.renames['gpt-6-sol'], 'gpt-6.1-sol');
+        assert.strictEqual(cfg.renames['GPT-5.1'], 'GPT-6.2 Sol (ChatGPT)');
+        assert.strictEqual(cfg.renames['GPT-6.1 Sol (ChatGPT)'], 'GPT-6.2 Sol (ChatGPT)');
+        assert.strictEqual(cfg.renames['GPT-6 Astra (ChatGPT)'], 'GPT-6.2 Astra (ChatGPT)');
+        assert.strictEqual(cfg.renames['gpt-5.6-sol'], 'gpt-6.2-sol');
+        assert.strictEqual(cfg.renames['gpt-6-sol'], 'gpt-6.2-sol');
+        assert.strictEqual(cfg.renames['gpt-6.1-sol'], 'gpt-6.2-sol');
     }, { tags: ['unit'] });
     test('capability predicates are exact-slug', async function() {
         var cfg = _config(await _sources());
@@ -75,7 +83,14 @@ describe('GPT-6 Sol/Luna presets', function() {
         });
         ['gpt-6.1-sol-pro', 'gpt-6-sol', 'gpt-6.1-luna', '', null].forEach(function(m) { assert.strictEqual(cfg.sol61(m), false, String(m)); });
         assert.strictEqual(cfg.required('gpt-6-astra'), true);
-        ['gpt-6-sol', 'gpt-6-luna'].forEach(function(m) { assert.strictEqual(cfg.required(m), false, m); });
+        ['gpt-6-sol', 'gpt-6-luna', 'gpt-6.2-sol-pro'].forEach(function(m) { assert.strictEqual(cfg.required(m), false, m); });
+        ['gpt-6.2-sol', 'openai/gpt-6.2-sol'].forEach(function(m) { assert.strictEqual(cfg.required(m), true, m); });
+        ['gpt-6.2-sol', 'gpt-6.2-astra', 'openai/gpt-6.2-astra'].forEach(function(m) {
+            assert.strictEqual(cfg.required(m), true, m);
+            assert.strictEqual(cfg.extended(m), true, m);
+        });
+        assert.strictEqual(cfg.sol61('gpt-6.2-sol'), true);
+        ['gpt-6.2-astra-pro', 'gpt-6.2-luna', 'gpt-6.3-sol'].forEach(function(m) { assert.strictEqual(cfg.required(m), false, m); });
     }, { tags: ['unit'] });
 });
 
@@ -84,10 +99,10 @@ describe('GPT-5.6 → GPT-6 provider migration (real loadApiProviders block)', f
         var s = await _sources(), cfg = _config(s);
         var r = _migrate(s, cfg, [_copy(OLD.sol), _copy(OLD.terra), _copy(OLD.luna), _copy(OLD.orSol)], 'GPT-5.6 Terra (ChatGPT)');
         var names = r.providers.map(function(p) { return p.name; }).sort();
-        assert.deepStrictEqual(names, ['GPT-6 Luna (ChatGPT)', 'GPT-6.1 Sol (ChatGPT)', 'gpt-6.1-sol']);
-        assert.strictEqual(r.current, 'GPT-6.1 Sol (ChatGPT)');
-        assert.strictEqual(r.stored, 'GPT-6.1 Sol (ChatGPT)');
-        assert.strictEqual(r.providers.find(function(p) { return p.name === 'gpt-6.1-sol'; }).apiKey, 'sk-or-user');
+        assert.deepStrictEqual(names, ['GPT-6 Luna (ChatGPT)', 'GPT-6.2 Sol (ChatGPT)', 'gpt-6.2-sol']);
+        assert.strictEqual(r.current, 'GPT-6.2 Sol (ChatGPT)');
+        assert.strictEqual(r.stored, 'GPT-6.2 Sol (ChatGPT)');
+        assert.strictEqual(r.providers.find(function(p) { return p.name === 'gpt-6.2-sol'; }).apiKey, 'sk-or-user');
         assert.strictEqual(r.providers.find(function(p) { return p.name === 'GPT-6 Luna (ChatGPT)'; }).model, 'gpt-6-luna');
         assert.strictEqual(r.changed, true);
     }, { tags: ['unit'] });
@@ -95,16 +110,37 @@ describe('GPT-5.6 → GPT-6 provider migration (real loadApiProviders block)', f
         var s = await _sources(), cfg = _config(s);
         var r = _migrate(s, cfg, [_copy(OLD.sol6), _copy(OLD.orSol6)], 'GPT-6 Sol (ChatGPT)');
         var byName = {}; r.providers.forEach(function(p) { byName[p.name] = p; });
-        assert.deepStrictEqual(Object.keys(byName).sort(), ['GPT-6.1 Sol (ChatGPT)', 'gpt-6.1-sol']);
-        assert.strictEqual(byName['GPT-6.1 Sol (ChatGPT)'].model, 'gpt-6.1-sol');
-        assert.strictEqual(byName['gpt-6.1-sol'].model, 'openai/gpt-6.1-sol');
-        assert.strictEqual(byName['gpt-6.1-sol'].apiKey, 'sk-or-user');
-        assert.strictEqual(r.current, 'GPT-6.1 Sol (ChatGPT)');
-        assert.strictEqual(r.stored, 'GPT-6.1 Sol (ChatGPT)');
+        assert.deepStrictEqual(Object.keys(byName).sort(), ['GPT-6.2 Sol (ChatGPT)', 'gpt-6.2-sol']);
+        assert.strictEqual(byName['GPT-6.2 Sol (ChatGPT)'].model, 'gpt-6.2-sol');
+        assert.strictEqual(byName['gpt-6.2-sol'].model, 'openai/gpt-6.2-sol');
+        assert.strictEqual(byName['gpt-6.2-sol'].apiKey, 'sk-or-user');
+        var or61 = _migrate(s, cfg, [{ name: 'gpt-6.1-sol', model: 'openai/gpt-6.1-sol', endpoint: 'https://openrouter.ai/api/v1/chat/completions', apiKey: 'sk-or-user', effort: 'low' }], 'gpt-6.1-sol');
+        assert.strictEqual(or61.providers[0].name, 'gpt-6.2-sol');
+        assert.strictEqual(or61.providers[0].model, 'openai/gpt-6.2-sol');
+        assert.strictEqual(or61.providers[0].apiKey, 'sk-or-user');
+        assert.strictEqual(or61.stored, 'gpt-6.2-sol');
+        assert.strictEqual(r.current, 'GPT-6.2 Sol (ChatGPT)');
+        assert.strictEqual(r.stored, 'GPT-6.2 Sol (ChatGPT)');
         var tuned = Object.assign(_copy(OLD.sol6), { effort: 'max' });
         var kept = _migrate(s, cfg, [tuned], 'GPT-6 Sol (ChatGPT)');
         assert.strictEqual(kept.changed, false);
         assert.strictEqual(kept.providers[0].model, 'gpt-6-sol');
+    }, { tags: ['unit'] });
+    test('untouched GPT-6.1 Sol / GPT-6 Astra seeds migrate to GPT-6.2; customized kept', async function() {
+        var s = await _sources(), cfg = _config(s);
+        var ep = 'https://chatgpt.com/backend-api/codex/responses';
+        var sol61 = { name: 'GPT-6.1 Sol (ChatGPT)', model: 'gpt-6.1-sol', endpoint: ep, apiKey: 'oauth', effort: 'high', isChatGPTOAuth: true };
+        var astra = { name: 'GPT-6 Astra (ChatGPT)', model: 'gpt-6-astra', endpoint: ep, apiKey: 'oauth', effort: 'high', isChatGPTOAuth: true };
+        var r = _migrate(s, cfg, [_copy(sol61), _copy(astra)], 'GPT-6 Astra (ChatGPT)');
+        var byName = {}; r.providers.forEach(function(p) { byName[p.name] = p; });
+        assert.deepStrictEqual(Object.keys(byName).sort(), ['GPT-6.2 Astra (ChatGPT)', 'GPT-6.2 Sol (ChatGPT)']);
+        assert.strictEqual(byName['GPT-6.2 Sol (ChatGPT)'].model, 'gpt-6.2-sol');
+        assert.strictEqual(byName['GPT-6.2 Astra (ChatGPT)'].model, 'gpt-6.2-astra');
+        assert.strictEqual(r.current, 'GPT-6.2 Astra (ChatGPT)');
+        assert.strictEqual(r.stored, 'GPT-6.2 Astra (ChatGPT)');
+        var kept = _migrate(s, cfg, [Object.assign(_copy(sol61), { effort: 'max' })], 'GPT-6.1 Sol (ChatGPT)');
+        assert.strictEqual(kept.changed, false);
+        assert.strictEqual(kept.providers[0].model, 'gpt-6.1-sol');
     }, { tags: ['unit'] });
     test('idempotent and never touches customized entries', async function() {
         var s = await _sources(), cfg = _config(s);
@@ -131,15 +167,15 @@ describe('Sub-agent tier aliases follow GPT-6 renames (real loadTierAliases)', f
     test('alias kept when the legacy preset still exists (customized, kept by migration)', async function() {
         var s = await _sources(), cfg = _config(s);
         var tuned = Object.assign(_copy(OLD.terra), { effort: 'high' });
-        var out = await _tierAliases(s, cfg, [tuned, { name: 'GPT-6.1 Sol (ChatGPT)' }], { small: 'GPT-5.6 Terra (ChatGPT)', medium: 'GPT-5.6 Luna (ChatGPT)' });
+        var out = await _tierAliases(s, cfg, [tuned, { name: 'GPT-6.2 Sol (ChatGPT)' }], { small: 'GPT-5.6 Terra (ChatGPT)', medium: 'GPT-5.6 Luna (ChatGPT)' });
         assert.strictEqual(out.small, 'GPT-5.6 Terra (ChatGPT)');
         assert.strictEqual(out.medium, 'GPT-6 Luna (ChatGPT)');
     }, { tags: ['unit'] });
     test('alias renamed when the legacy preset no longer exists', async function() {
         var s = await _sources(), cfg = _config(s);
-        var out = await _tierAliases(s, cfg, [{ name: 'GPT-6.1 Sol (ChatGPT)' }, { name: 'GPT-6 Luna (ChatGPT)' }],
+        var out = await _tierAliases(s, cfg, [{ name: 'GPT-6.2 Sol (ChatGPT)' }, { name: 'GPT-6 Luna (ChatGPT)' }],
             { small: 'GPT-5.6 Terra (ChatGPT)', medium: 'GPT-5.6 Luna (ChatGPT)', large: 'GPT-6 Sol (ChatGPT)' });
-        assert.deepStrictEqual(out, { small: 'GPT-6.1 Sol (ChatGPT)', medium: 'GPT-6 Luna (ChatGPT)', large: 'GPT-6.1 Sol (ChatGPT)' });
+        assert.deepStrictEqual(out, { small: 'GPT-6.2 Sol (ChatGPT)', medium: 'GPT-6 Luna (ChatGPT)', large: 'GPT-6.2 Sol (ChatGPT)' });
     }, { tags: ['unit'] });
 });
 
@@ -189,10 +225,21 @@ describe('Codex request shaping for GPT-6 Sol/Luna', function() {
         assert.strictEqual(a.convert({ model: 'openai/gpt-6.1-sol' }).model, 'gpt-6.1-sol');
         assert.strictEqual(a.convert({ model: 'gpt-6.1-sol-pro', reasoning: { effort: 'max' } }).reasoning.effort, 'high');
     }, { tags: ['unit'] });
+    test('GPT-6.2 Sol/Astra: xhigh/max pass; none/thinking-off → low', async function() {
+        var a = await api();
+        ['gpt-6.2-sol', 'gpt-6.2-astra', 'openai/gpt-6.2-astra'].forEach(function(m) {
+            ['low', 'medium', 'high', 'xhigh', 'max'].forEach(function(e) {
+                assert.strictEqual(a.convert({ model: m, reasoning: { effort: e } }).reasoning.effort, e, m + ' ' + e);
+            });
+            assert.strictEqual(a.convert({ model: m, reasoning: { effort: 'none' } }).reasoning.effort, 'low', m);
+            assert.strictEqual(a.convert({ model: m, reasoning: { enabled: false } }).reasoning.effort, 'low', m);
+        });
+        assert.strictEqual(a.convert({ model: 'openai/gpt-6.2-sol' }).model, 'gpt-6.2-sol');
+    }, { tags: ['unit'] });
     test('fallback catalog and default slug are GPT-6 only', async function() {
         var a = await api();
         var m = a.bg.match(/var OPENAI_FALLBACK_MODELS = (\[[^\]]*\]);/);
-        assert.deepStrictEqual(JSON.parse(m[1].replace(/'/g, '"')), ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna']);
-        assert.strictEqual(a.convert({ messages: [] }).model, 'gpt-6.1-sol');
+        assert.deepStrictEqual(JSON.parse(m[1].replace(/'/g, '"')), ['gpt-6.2-sol', 'gpt-6.2-astra', 'gpt-6-luna', 'gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-sol']);
+        assert.strictEqual(a.convert({ messages: [] }).model, 'gpt-6.2-sol');
     }, { tags: ['unit'] });
 });

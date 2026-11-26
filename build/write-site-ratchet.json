@@ -128,7 +128,7 @@
       "src/js/ui/130-data-management.js": 1,
       "src/js/ui/270-iframe-panel.js": 1,
       "src/js/worker/010-platform-stub.js": 1,
-      "src/platform/extension/background.js": 17,
+      "src/platform/extension/background.js": 18,
       "src/platform/extension/platform-bridge.js": 7
     }
   }

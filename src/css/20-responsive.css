@@ -35,7 +35,7 @@
     .main-header { padding: var(--space-5) var(--space-6); }
     .header-controls { gap: var(--space-4); }
     .browser-controls { display: none !important; }
-    .credits-display, .storage-display { font-size: var(--text-caption); padding: var(--space-2) var(--space-4); }
+    .storage-display { font-size: var(--text-caption); padding: var(--space-2) var(--space-4); }
 
     /* Settings panel - full width */
     .settings-panel { width: 100%; max-width: 360px; inset-inline-end: 0; inset-inline-start: auto; }
@@ -124,8 +124,8 @@
     .header-chat-title { font-size: var(--text-body); }
     .settings-btn { padding: var(--space-2) var(--space-3); }
     .model-name { font-size: var(--text-caption); }
-    /* credits-display + storage-display used to be force-hidden on mobile. They
-       now collapse into the header More dropdown via the priority-plus logic
+    /* storage-display (and the model pill with its usage segment) used to be
+       force-hidden on mobile. They now collapse into the header More dropdown via the priority-plus logic
        in 53e-actions.js, so the user can still reach them. */
 
     /* Settings panel - full screen on mobile */

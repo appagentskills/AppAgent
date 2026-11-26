@@ -63,7 +63,7 @@
 /* Hide alongside the rename button when there is no title (general-sibling
    combinator — the pin button sits after the rename button). */
 .header-chat-title:empty ~ .header-pin-btn { display: none; }
-/* Model name status pill — matches credits-display sizing */
+/* Model name status pill (also hosts the usage segment, see .model-name .credits-display) */
 .model-name { font-size: var(--text-body-sm); color: var(--text-secondary); font-weight: var(--font-medium); display: inline-flex; align-items: center; gap: var(--space-2); cursor: pointer; padding: var(--space-2) var(--space-5); border-radius: var(--radius-xl); border: 1px solid var(--border); background: var(--bg-code); transition: all var(--transition-fast); white-space: nowrap; }
 .model-name:hover { background: var(--bg-hover); color: var(--text-primary); border-color: var(--border-dark); }
 .model-name.connected { color: var(--success-hover); background: var(--success-lighter); border-color: var(--success-light); }
@@ -112,6 +112,16 @@
 .model-status-dot.unknown { background: var(--text-muted); }
 .model-login-btn { border: 0; border-inline-start: 1px solid currentColor; background: transparent; color: inherit; font: inherit; font-size: var(--text-caption); font-weight: var(--font-semibold); padding-block: 1px; padding-inline: var(--space-3) 0; cursor: pointer; }
 .model-login-btn:hover, .model-login-btn:focus-visible { text-decoration: underline; outline: none; }
+/* Usage segment merged into the model pill (#credits-display / #home-credits-display
+   live inside #model-name / #home-model-name): "Model | 42% for 3h". Same divider
+   as .model-login-btn; inherits the pill's state colour, red only above 80%.
+   Hidden (display:none inline style) when there is no usage data. */
+.model-name .credits-display { background: transparent; border: 0; border-inline-start: 1px solid currentColor; border-radius: 0; padding-block: 0; padding-inline: var(--space-3) 0; min-width: 0; color: inherit; font-size: inherit; flex-shrink: 0; gap: 0; transition: none; }
+.model-name .credits-display:hover { background: transparent; color: inherit; }
+.model-name .credits-display.loading { background: transparent; color: var(--text-muted); border-color: currentColor; }
+.model-name .credits-display.error { background: transparent; color: var(--danger-hover); border-color: currentColor; }
+.model-name .credits-display .credits-icon { display: none; }
+.model-name .model-name-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .model-login-btn.pending { cursor: progress; opacity: .8; }
 .header-controls { display: flex; align-items: center; gap: var(--space-6); align-self: center; }
 /* OAuth button styles removed — model-name pill handles connection status */
@@ -250,9 +260,11 @@
 .credits-display:hover { background: var(--success-light); color: var(--success-hover); }
 .credits-display.loading { color: var(--text-secondary); background: var(--bg-code); border-color: var(--border); }
 .credits-display.error { color: var(--danger-hover); background: var(--danger-lighter); border-color: var(--danger-light); }
-/* Rich usage tooltip on the credits pill (session / weekly / per-model bars) */
-/* Chrome (bg/border/radius/shadow) comes from the shared .header-menu class above. */
-.usage-tooltip { position: fixed; z-index: var(--z-overlay-base); width: 286px; padding: 0 0 var(--space-2); display: none; overflow: hidden; }
+/* Usage detail at the top of the model menu (session / weekly / per-model bars,
+   HF billing link), separated from the reasoning/model sections below. */
+.model-menu-usage { padding-bottom: var(--space-2); border-bottom: 1px solid var(--secondary-border); }
+.usage-tt-link { display: inline-block; margin-top: var(--space-2); font-size: var(--text-body-sm); color: var(--primary); text-decoration: none; }
+.usage-tt-link:hover, .usage-tt-link:focus-visible { text-decoration: underline; }
 .usage-tt-row { padding: var(--space-2) var(--space-4); }
 .usage-tt-row-head { display: flex; justify-content: space-between; align-items: baseline; gap: var(--space-3); margin-bottom: 4px; }
 .usage-tt-label { font-size: var(--text-body-sm); font-weight: var(--font-medium); color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

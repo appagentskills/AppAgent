@@ -1,5 +1,5 @@
 // Notifications mode (PR #1276; header pill + dropdown E3): chrome.storage.local.notificationMode
-// 'silent' | 'notify' (default) | 'sound'. background.js appagentCreateNotification
+// 'silent' | 'notify' (unset fallback) | 'sound' (seeded on fresh install). background.js appagentCreateNotification
 // is the central gate; 010-platform-stub.js fallback honors 'silent' and
 // chimes for 'sound'; legacy approvalSoundEnabled===true reads as 'sound'
 // (never rewritten: no new storage write site). Page: ui/240-layout.js (header pill
@@ -20,7 +20,7 @@ describe('notification mode: background.js central gate (REAL slice)', function(
     async function bgEnv(stored) {
         var bg = await loadFile('src/platform/extension/background.js');
         var slice = between(bg, 'var NOTIFICATION_MODES =', 'function _takeNotificationChatId(');
-        var e = { creates: [], helperCalls: [], listeners: [], session: [], data: Object.assign({}, stored || {}), removed: [] };
+        var e = { creates: [], helperCalls: [], listeners: [], installed: [], session: [], data: Object.assign({}, stored || {}), removed: [] };
         var chrome = {
             storage: {
                 local: {
@@ -31,7 +31,7 @@ describe('notification mode: background.js central gate (REAL slice)', function(
                 session: { set: function(o) { e.session.push(o); } }
             },
             notifications: { create: function(id, opts) { e.creates.push({ id: id, opts: opts }); } },
-            runtime: { onMessage: { addListener: function(fn) { e.listeners.push(fn); } } }
+            runtime: { onMessage: { addListener: function(fn) { e.listeners.push(fn); } }, onInstalled: { addListener: function(fn) { e.installed.push(fn); } } }
         };
         var helper = function(type, payload, ms) { e.helperCalls.push({ type: type, ms: ms }); return Promise.resolve({ ok: true }); };
         var self = {};
@@ -78,6 +78,29 @@ describe('notification mode: background.js central gate (REAL slice)', function(
         assert.strictEqual(e.removed.length, 0);
         e.api.create('T', 'M', ''); await flush();
         assert.deepStrictEqual(e.helperCalls, [{ type: 'play-notification-sound', ms: 5000 }], 'legacy true chimes');
+    }, { tags: ['unit'] });
+    test('fresh install seeds notificationMode=sound (new users default to With sound)', async function() {
+        var e = await bgEnv({});
+        assert.strictEqual(e.installed.length, 1, 'onInstalled listener registered');
+        e.installed[0]({ reason: 'install' }); await flush();
+        assert.strictEqual(e.data.notificationMode, 'sound');
+        e.api.create('T', 'M', ''); await flush();
+        assert.strictEqual(e.creates.length, 1);
+        assert.deepStrictEqual(e.helperCalls, [{ type: 'play-notification-sound', ms: 5000 }], 'new user chimes');
+    }, { tags: ['unit'] });
+    test('update / chrome_update never seed: existing users keep their mode or the notify fallback', async function() {
+        var e = await bgEnv({});
+        e.installed[0]({ reason: 'update', previousVersion: '1.0' }); e.installed[0]({ reason: 'chrome_update' }); e.installed[0](undefined); await flush();
+        assert.ok(!('notificationMode' in e.data), 'no write on update');
+        assert.strictEqual(e.api.resolve(e.data), 'notify');
+    }, { tags: ['unit'] });
+    test('install never overwrites an existing mode or legacy key', async function() {
+        var cases = [{ notificationMode: 'silent' }, { notificationMode: 'notify' }, { approvalSoundEnabled: false }, { approvalSoundEnabled: true }];
+        for (var c of cases) {
+            var e = await bgEnv(c);
+            e.installed[0]({ reason: 'install' }); await flush();
+            assert.deepStrictEqual(e.data, c, 'untouched: ' + JSON.stringify(c));
+        }
     }, { tags: ['unit'] });
     test('preview-notification-sound message plays without the setting check', async function() {
         var e = await bgEnv({ notificationMode: 'silent' });

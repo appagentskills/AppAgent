@@ -225,12 +225,14 @@ describe('wiring', function() {
         var fn = _cut(idb, 'function mergeNewDefaultLlmEndpoints(', '\n}\n') + '\n}';
         var merge = new Function('DEFAULT_LLM_ENDPOINTS', fn + '\nreturn mergeNewDefaultLlmEndpoints;')(m.DEFAULT_LLM_ENDPOINTS);
         var list = [{ id: 'openrouter', url: 'https://openrouter.ai/api/v1/chat/completions' }];
-        assert.strictEqual(merge(list, ['openrouter']).length, 1);
+        // huggingface + local (OpenAI-compatible) are both post-launch defaults.
+        assert.strictEqual(merge(list, ['openrouter']).length, 2);
         assert.strictEqual(list[1].id, 'huggingface');
+        assert.strictEqual(list[2].id, 'local');
         var deleted = [{ id: 'openrouter' }];
-        assert.strictEqual(merge(deleted, ['openrouter', 'huggingface']).length, 0);
+        assert.strictEqual(merge(deleted, ['openrouter', 'huggingface', 'local']).length, 0);
         var byUrl = [{ id: 'my-hf', url: 'https://router.huggingface.co/v1/chat/completions' }];
-        assert.strictEqual(merge(byUrl, ['openrouter']).length, 0);
+        assert.deepStrictEqual(merge(byUrl, ['openrouter', 'local']).map(function(e) { return e.id; }), []);
     }, { tags: ['unit'] });
     test('streaming path applies the adapter and computes HF cost', async function() {
         var src = await loadFile('src/js/app/010-llm-streaming.js');

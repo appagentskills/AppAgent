@@ -96,19 +96,19 @@ async function init() {
         });
     }
 
-    // Setup credits display click handler and initialize with cached value
+    // Initialize the credits display (usage segment of the model pill) with the
+    // cached value. It has no click handler of its own: clicking the pill opens
+    // the model menu, which refreshes usage and shows the detail at its top.
     var creditsDisplay = document.getElementById('credits-display');
     var homeCreditsDisplay = document.getElementById('home-credits-display');
     // Provider-scoped restore (core/020-bootstrap.js helper) — never paint
     // another provider's cached usage.
     var cachedCreditsVal = getBootCachedCredits();
     if (creditsDisplay) {
-        creditsDisplay.onclick = function() { refreshClaudeOAuthUsage(true); fetchCredits(); };
         // cachedCredits already embeds its unit ('$12.34' or '57% for 2h') — no '$' prefix
         if (cachedCreditsVal) creditsDisplay.innerHTML = '<span class="credits-icon">' + UI_ICONS.money + '</span>' + cachedCreditsVal;
     }
     if (homeCreditsDisplay) {
-        homeCreditsDisplay.onclick = function() { refreshClaudeOAuthUsage(true); fetchCredits(); };
         if (cachedCreditsVal) {
             homeCreditsDisplay.innerHTML = '<span class="credits-icon">' + UI_ICONS.money + '</span>' + cachedCreditsVal;
             homeCreditsDisplay.style.display = '';
@@ -240,6 +240,8 @@ async function init() {
     // Surfaces that register their OWN document-level Escape handler are
     // deliberately NOT handled here (double-close / leaked listeners):
     //   #tool-inspector-modal  ui/040-tools-settings.js:62-68 — skipped explicitly below
+    //   #claude-browser-modal  ui/160-notifications.js showClaudeBrowserModal
+    //                          (_claudeBrowserKeyHandler) — skipped explicitly below
     //   #chatgpt-browser-modal ui/160-notifications.js showChatGPTBrowserModal
     //                          (_chatGPTBrowserKeyHandler) — skipped explicitly below
     //   #chatgpt-device-modal  ui/160-notifications.js showChatGPTDeviceCodeModal
@@ -297,7 +299,7 @@ async function init() {
             // #tool-inspector-modal wires its own Escape listener at open time and
             // removes it in closeToolInspectorModal(); closing it from here would
             // both double-close and leak that listener.
-            if (ov.id === 'tool-inspector-modal' || ov.id === 'chatgpt-device-modal' || ov.id === 'chatgpt-browser-modal') return;
+            if (ov.id === 'tool-inspector-modal' || ov.id === 'chatgpt-device-modal' || ov.id === 'chatgpt-browser-modal' || ov.id === 'claude-browser-modal') return;
             if (typeof ov.onclick === 'function') {
                 try {
                     ov.onclick({ target: ov, currentTarget: ov,
@@ -373,7 +375,7 @@ async function init() {
         // exclusive, so one class-first visibility probe plus the shared registry
         // closes whichever is open: closeAllHeaderMenus (ui/240-layout.js:115)
         // fans out to closeSettingsPanel / closeJobsDropdown / _closeModelMenu /
-        // hideWorkspaceDropdown / hideUsageTooltipNow / hideInstancePicker, each
+        // hideWorkspaceDropdown / hideInstancePicker, each
         // behind a typeof guard. Visibility is probed with getComputedStyle().display
         // rather than offsetParent (null for these position:fixed panels even when
         // they ARE visible) or getClientRects() (layout-dependent); every one of these

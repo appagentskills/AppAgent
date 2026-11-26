@@ -124,13 +124,11 @@ async function fetchCredits() {
                 var cgHtml = '<span class="credits-icon">' + UI_ICONS.money + '</span>' + cgText;
                 if (creditsEl) { creditsEl.innerHTML = cgHtml; creditsEl.className = cgClass; creditsEl.title = cgTitle; creditsEl.style.display = ''; }
                 if (homeCreditsEl) { homeCreditsEl.innerHTML = cgHtml; homeCreditsEl.className = cgClass; homeCreditsEl.title = cgTitle; homeCreditsEl.style.display = ''; }
-                // Rich click dropdown — reuse the Claude tooltip renderer by feeding
+                // Usage section of the model menu — reuse the Claude renderer by feeding
                 // it the normalized appagent-usage-limits shape claudeUsageModelFromRl
                 // parses (session bucket = primary 5h window, weekly = secondary).
                 if (cu.limits.length) {
-                    var cgRlLike = { 'appagent-usage-limits': JSON.stringify(cu.limits), 'appagent-extra-usage-enabled': 'false' };
-                    attachUsageTooltip(creditsEl, cgRlLike);
-                    attachUsageTooltip(homeCreditsEl, cgRlLike);
+                    setUsageDetail(providerName, { 'appagent-usage-limits': JSON.stringify(cu.limits), 'appagent-extra-usage-enabled': 'false' });
                 }
                 return;
             } catch (e) {
@@ -205,10 +203,9 @@ async function fetchCredits() {
                 var creditHtml = '<span class="credits-icon">' + UI_ICONS.money + '</span>' + displayText;
                 if (creditsEl) { creditsEl.innerHTML = creditHtml; creditsEl.className = cssClass; creditsEl.title = creditTitle; creditsEl.style.display = ''; }
                 if (homeCreditsEl) { homeCreditsEl.innerHTML = creditHtml; homeCreditsEl.className = cssClass; homeCreditsEl.title = creditTitle; homeCreditsEl.style.display = ''; }
-                // Rich click dropdown (per-limit bars). The native title stays
-                // for hover ('Click to refresh'); clicking refreshes + opens it.
-                attachUsageTooltip(creditsEl, rl);
-                attachUsageTooltip(homeCreditsEl, rl);
+                // Per-limit bars shown at the top of the model menu (pill click
+                // opens the menu and refreshes usage).
+                setUsageDetail(providerName, rl);
             }
         } catch(e) {
             if (!_creditsRequestStillCurrent(generation, providerName)) return;
@@ -218,10 +215,11 @@ async function fetchCredits() {
     }
 
     // Hugging Face Inference Providers: no public credits/balance API
-    // (<base>/v1/credits would 404). Show a link to the HF billing page.
+    // (<base>/v1/credits would 404). The pill says "Billing"; the actual link to
+    // the HF billing page lives in the model menu's usage section
+    // (buildModelMenuUsageHtml) — a link nested in the pill would just open the menu.
     if (typeof isHuggingFaceEndpoint === 'function' && isHuggingFaceEndpoint(provider.endpoint)) {
-        var hfHtml = '<span class="credits-icon">' + UI_ICONS.money + '</span>' +
-            '<a href="' + HF_BILLING_URL + '" target="_blank" rel="noopener noreferrer" style="color:inherit;text-decoration:none">' + t('Billing') + '</a>';
+        var hfHtml = '<span class="credits-icon">' + UI_ICONS.money + '</span>' + t('Billing');
         var hfTitle = t('Hugging Face has no balance API — open billing settings. Per-request cost is computed from provider pricing.');
         [creditsEl, homeCreditsEl].forEach(function(el) {
             if (!el) return;
@@ -269,15 +267,14 @@ async function fetchCredits() {
             displayText = resetStr ? t('{percent}% for {time}', { percent: Math.round(fiveHour), time: resetStr }) : Math.round(fiveHour) + '%';
             creditTitle = t('{percent}% used', { percent: fiveHour.toFixed(1) }) + (resetStr ? ' \u00b7 ' + t('resets in {time}', { time: resetStr }) : '') + ' | ' + t('Click to refresh');
             if (fiveHour > 80) cssClass += ' error';
-            // Same rich tooltip for the direct claude-usage-format endpoint —
+            // Same usage bars for the direct claude-usage-format endpoint —
             // its limits array is raw (ISO resets_at, scope.model.display_name),
             // which claudeUsageModelFromRl also understands.
             if (Array.isArray(data.limits) && data.limits.length) {
                 var rlLike = { 'appagent-usage-limits': JSON.stringify(data.limits) };
                 setTimeout(function() {
                     if (!_creditsRequestStillCurrent(generation, providerName)) return;
-                    attachUsageTooltip(creditsEl, rlLike);
-                    attachUsageTooltip(homeCreditsEl, rlLike);
+                    setUsageDetail(providerName, rlLike);
                 }, 0);
             }
         }
@@ -317,12 +314,12 @@ async function fetchCredits() {
 }
 
 // ---------------------------------------------------------------------------
-// Rich usage tooltip on the credits pill — one progress bar per rate limit
-// (current session, weekly all-models, weekly per-model scoped, extra usage),
-// modeled after claude.ai's own usage panel.
+// Rich usage detail at the top of the model menu — one progress bar per rate
+// limit (current session, weekly all-models, weekly per-model scoped, extra
+// usage), modeled after claude.ai's own usage panel.
 // ---------------------------------------------------------------------------
-var _usageTooltipEl = null;
-var _usageTooltipOwner = null;
+// Last usage snapshot, scoped to the provider it was fetched for.
+var _usageDetail = null; // { provider, rl }
 
 // Parse stored usage keys into { session, weekly: [], extra }. Accepts both the
 // normalized limits shape written by normalizeClaudeUsage in background.js
@@ -504,83 +501,50 @@ function buildUsageTooltipHtml(model) {
     return html;
 }
 
-// Attach (or refresh the data behind) the rich dropdown on a credits pill.
-// Hover shows the native title ('Click to refresh'); clicking the pill
-// refreshes usage (pill onclick in 120-init.js) AND opens this dropdown.
-// When the refreshed data lands while the dropdown is open, it re-renders
-// in place. Returns true when rich data is available.
-function attachUsageTooltip(el, rl) {
-    if (!el || !rl) return false;
-    el._usageRl = rl;
-    var model = claudeUsageModelFromRl(rl);
-    if (!model.session && !model.weekly.length && !model.extra) return false;
-    if (!el._usageTooltipWired) {
-        el._usageTooltipWired = true;
-        el.addEventListener('click', function() { showUsageTooltip(el); });
-        // Keyboard access: the pill has role=button/tabindex — Enter/Space must
-        // open the dropdown like a click does.
-        el.addEventListener('keydown', function(e) {
-            if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); showUsageTooltip(el); }
-        });
-    }
-    // Live-update an open dropdown when fresh data arrives after the click
-    if (_usageTooltipEl && _usageTooltipOwner === el && _usageTooltipEl.style.display === 'block') {
-        _usageTooltipEl.innerHTML = buildUsageTooltipHtml(model);
-    }
-    return true;
-}
-
-function showUsageTooltip(el) {
-    var rl = el._usageRl;
+// Store the latest usage snapshot (provider-scoped) and re-render the usage
+// section of the model menu in place if it is open (fresh data typically lands
+// after the pill click that opened the menu kicked a refresh).
+function setUsageDetail(providerName, rl) {
     if (!rl) return;
-    var model = claudeUsageModelFromRl(rl);
-    if (!model.session && !model.weekly.length && !model.extra) return;
-    // Only one header dropdown open at a time (shared registry in ui/240-layout.js)
-    if (typeof closeAllHeaderMenus === 'function') closeAllHeaderMenus('usage');
-    if (!_usageTooltipEl) {
-        _usageTooltipEl = document.createElement('div');
-        // Chrome (bg/border/radius/shadow) comes from the shared .header-menu
-        // class (04-header.css) so all header pill dropdowns match.
-        _usageTooltipEl.className = 'usage-tooltip header-menu';
-        document.body.appendChild(_usageTooltipEl);
-        // Dropdown behavior: close on any click outside the pill/dropdown
-        document.addEventListener('click', function(e) {
-            if (!_usageTooltipEl || _usageTooltipEl.style.display !== 'block') return;
-            if (_usageTooltipEl.contains(e.target)) return;
-            if (_usageTooltipOwner && _usageTooltipOwner.contains(e.target)) return;
-            hideUsageTooltipNow();
-        });
-        // Escape closes the dropdown (keyboard parity with click-outside)
-        document.addEventListener('keydown', function(e) {
-            if (e.key !== 'Escape') return;
-            if (!_usageTooltipEl || _usageTooltipEl.style.display !== 'block') return;
-            hideUsageTooltipNow();
-        });
-    }
-    _usageTooltipOwner = el;
-    _usageTooltipEl.innerHTML = buildUsageTooltipHtml(model);
-    // Position exactly like the other header menus (model menu 160-notifications.js,
-    // settings panel 130-data-management.js, ws dropdown 040-tools-settings.js,
-    // instance picker platform-bridge.js): fixed, 4px below the pill, right edge
-    // aligned to the pill's right edge (clamped 8px from the viewport edge).
-    var r = el.getBoundingClientRect();
-    _usageTooltipEl.style.display = 'block';
-    _usageTooltipEl.style.top = (r.bottom + 4) + 'px';
-    // Rule 10 (i18n): the dropdown is end-aligned under the pill, so mirror the
-    // edge in RTL (the pill's left edge instead of its right edge). The element
-    // is reused, so reset the opposite edge on every open.
-    if (typeof i18nDir === 'function' && i18nDir() === 'rtl') {
-        _usageTooltipEl.style.right = 'auto';
-        _usageTooltipEl.style.left = Math.max(8, r.left) + 'px';
-    } else {
-        _usageTooltipEl.style.left = 'auto';
-        _usageTooltipEl.style.right = Math.max(8, window.innerWidth - r.right) + 'px';
-    }
+    _usageDetail = { provider: providerName, rl: rl };
+    refreshModelMenuUsage();
 }
 
-function hideUsageTooltipNow() {
-    if (_usageTooltipEl) _usageTooltipEl.style.display = 'none';
-    _usageTooltipOwner = null;
+function _usageSegmentShown() {
+    return ['credits-display', 'home-credits-display'].some(function(id) {
+        var el = document.getElementById(id);
+        return !!(el && el.style.display !== 'none');
+    });
+}
+
+// HTML for the usage section at the top of the model menu (toggleModelMenu,
+// ui/160-notifications.js). '' = no usage data for the current provider, and
+// the section is hidden.
+function buildModelMenuUsageHtml() {
+    var provider = getProviderByName(currentProvider);
+    if (!provider || !provider.endpoint) return '';
+    // Hugging Face: no balance API — explain and link to the billing page.
+    // The link sits in the menu (not in the pill) so it opens normally.
+    if (typeof isHuggingFaceEndpoint === 'function' && isHuggingFaceEndpoint(provider.endpoint)) {
+        return '<div class="usage-tt-section menu-section-title"><span class="section-icon">' + UI_ICONS.money + '</span>' + escapeHtml(t('Billing')) + '</div>' +
+            '<div class="usage-tt-row">' +
+                '<div class="usage-tt-sub">' + escapeHtml(t('Hugging Face has no balance API — open billing settings. Per-request cost is computed from provider pricing.')) + '</div>' +
+                '<a class="usage-tt-link" href="' + escapeHtml(HF_BILLING_URL) + '" target="_blank" rel="noopener noreferrer">' + escapeHtml(HF_BILLING_URL.replace(/^https?:\/\//, '')) + '</a>' +
+            '</div>';
+    }
+    if (!_usageDetail || _usageDetail.provider !== currentProvider || !_usageSegmentShown()) return '';
+    var model = claudeUsageModelFromRl(_usageDetail.rl);
+    if (!model.session && !model.weekly.length && !model.extra) return '';
+    return buildUsageTooltipHtml(model);
+}
+
+// Re-render the open model menu's usage section (no-op when the menu is closed).
+function refreshModelMenuUsage() {
+    var sec = document.getElementById('model-menu-usage');
+    if (!sec) return;
+    var html = buildModelMenuUsageHtml();
+    sec.innerHTML = html;
+    sec.style.display = html ? '' : 'none';
 }
 
 // Build a renderable extra-usage summary from the stored claude usage keys

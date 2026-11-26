@@ -5479,7 +5479,7 @@ var _headerOriginalParents = []; // [{el, parent, nextSibling}] for restoring st
 // 100 so they remain visible. Selectors are matched in order; the first
 // matching selector wins.
 var HEADER_COLLAPSE_PRIORITY = [
-    { sel: '#credits-display',           priority: 5  },
+    // #credits-display (usage) lives inside #model-name and collapses with it.
     { sel: '#storage-display',           priority: 10 },
     { sel: '#ws-header-status',          priority: 15 },
     { sel: '#active-tab-indicator',      priority: 20 },
@@ -5601,7 +5601,7 @@ function _stashItem(el, panel, fromActions) {
     panel.appendChild(row);
     row.appendChild(el);
     // The element may have been forcibly hidden by a media query (e.g.
-    // .credits-display on mobile). Inside the dropdown we always want it visible.
+    // a status pill on mobile). Inside the dropdown we always want it visible.
     el.style.display = '';
 }
 

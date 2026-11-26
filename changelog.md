@@ -1,5 +1,19 @@
 # Changelog
 
+## v1.1.46
+
+### New
+- Usage now shows in the model pill, with details at the top of the model menu.
+- New default models: Gemini 4 Neon and Carbon, GPT-6.2 Sol and Astra.
+- Local LLMs work out of the box with the OpenAI format, and show a context gauge even when the server reports no usage.
+
+### Fixes
+- Claude sign-in works again.
+- Edited LLM endpoint URLs no longer revert after reload.
+- The notification sound plays when an approval is waiting behind the Keep-awake popup.
+
+---
+
 ## v1.1.45
 
 ### New

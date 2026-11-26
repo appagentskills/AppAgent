@@ -96,7 +96,7 @@ describe('RG-B2 part 3: settings focus return (ui/130) and ?doc= boot (core/120-
         var realClose = await realFn('src/js/ui/130-data-management.js', 'closeSettingsPanel', doc,
             { closeSettingsPanelOnOutsideClick: noop }, 'var settingsPanelOpen = true;\n');
         var realCloseAll = await realFn('src/js/ui/240-layout.js', 'closeAllHeaderMenus', doc,
-            { closeSettingsPanel: realClose, _closeModelMenu: noop, closeJobsDropdown: noop, hideWorkspaceDropdown: noop, hideUsageTooltipNow: noop, window: {} });
+            { closeSettingsPanel: realClose, _closeModelMenu: noop, closeJobsDropdown: noop, hideWorkspaceDropdown: noop, window: {} });
         var win = { getComputedStyle: function(el) { return { display: el && el.classList && el.classList.contains('visible') ? 'block' : 'none' }; } };
         var h = await installEscape(doc, win, { closeAllHeaderMenus: realCloseAll });
 

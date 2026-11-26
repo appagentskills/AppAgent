@@ -408,7 +408,7 @@ describe('TA4-3: Claude OAuth logout fences an in-flight login/renew (background
 
         var g = await oauthHarness({});
         await g.logout();
-        var login = g.post({ type: 'claude-oauth-login' });
+        var login = g.post({ type: 'claude-oauth-login', method: 'headless' });
         await g.fetched(1);
         g.fetches[0].resolve(okJson(AUTH_OK));
         await g.fetched(2);
@@ -659,7 +659,7 @@ describe('TA4-3: Claude OAuth logout fences an in-flight login/renew (background
         var renew = h.post({ type: 'claude-oauth-refresh' });
         await h.fetched(1);
         await h.logout();
-        var login = h.post({ type: 'claude-oauth-login' });
+        var login = h.post({ type: 'claude-oauth-login', method: 'headless' });
         await h.fetched(2);
         assert.match(h.fetches[1].url, /authorize$/, 'login does not wait on the fenced renewal');
         h.fetches[0].resolve(okJson({ access_token: 'late', refresh_token: 'rt-late', expires_in: 28800 }));
@@ -679,7 +679,7 @@ describe('TA4-3: Claude OAuth logout fences an in-flight login/renew (background
         var h = await oauthHarness(expiredWithRefresh());
         var renew = h.post({ type: 'claude-oauth-refresh' });
         await h.fetched(1);
-        var login = h.post({ type: 'claude-oauth-login' });
+        var login = h.post({ type: 'claude-oauth-login', method: 'headless' });
         await tick();
         assert.strictEqual(h.fetches.length, 1, 'login does not race the in-flight refresh');
         var joiner = h.bg.renewClaudeToken(h.store.claudeOAuth);
@@ -761,7 +761,7 @@ describe('TA4-3: Claude OAuth logout fences an in-flight login/renew (background
         assert.ok(rec.body.length <= 300);
         assert.strictEqual('claudeOAuthRefreshPending' in h.store, false, 'an HTTP rejection settles the marker');
         // A successful login does NOT overwrite the evidence.
-        var login = h.post({ type: 'claude-oauth-login' });
+        var login = h.post({ type: 'claude-oauth-login', method: 'headless' });
         await h.fetched(3);
         h.fetches[2].resolve(okJson(AUTH_OK));
         await h.fetched(4);
@@ -813,7 +813,7 @@ describe('TA4-3: Claude OAuth logout fences an in-flight login/renew (background
         var r = settle(h.bg.renewClaudeToken(h.store.claudeOAuth));
         await h.fetched(1);
         var q = h.post({ type: 'claude-oauth-quiesce' });
-        var login = await h.post({ type: 'claude-oauth-login' }).wait();
+        var login = await h.post({ type: 'claude-oauth-login', method: 'headless' }).wait();
         assert.match(login.error, /extension is reloading/, 'a NEW login is refused fast');
         assert.strictEqual(h.fetches.length, 1, 'and makes no request');
         assert.strictEqual(q.done, false, 'quiesce waits for the in-flight refresh');
@@ -903,7 +903,7 @@ describe('TA4-3: Claude OAuth logout fences an in-flight login/renew (background
         var h = await oauthHarness(expiredWithRefresh());
         var renew = h.post({ type: 'claude-oauth-refresh' });
         await h.fetched(1);
-        var login = h.post({ type: 'claude-oauth-login' });
+        var login = h.post({ type: 'claude-oauth-login', method: 'headless' });
         await tick();
         await h.logout();
         h.fetches[0].resolve(okJson({ access_token: 'late', expires_in: 100 }));

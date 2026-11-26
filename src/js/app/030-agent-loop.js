@@ -154,8 +154,10 @@ function getChatContextTokens(chat) {
     if (!chat || !chat.messages) return 0;
     for (var i = chat.messages.length - 1; i >= 0; i--) {
         var m = chat.messages[i];
-        if (m && m.role === 'assistant' && m.metrics && m.metrics.input_tokens && !m.metrics.isAggregate) {
-            return m.metrics.input_tokens;
+        // Real usage first; else our estimate (providers with no usage,
+        // app/010-llm-streaming.js applyUsageEstimates).
+        if (m && m.role === 'assistant' && m.metrics && !m.metrics.isAggregate && (m.metrics.input_tokens || m.metrics.est_input_tokens)) {
+            return m.metrics.input_tokens || m.metrics.est_input_tokens;
         }
     }
     return 0;
@@ -1356,6 +1358,8 @@ async function runAgent(overrideChatId) {
         reasoning_tokens: 0,
         cost: 0,
         duration: 0,
+        est_input_tokens: 0,
+        est_output_tokens: 0,
         callCount: 0
     };
     
@@ -1397,6 +1401,8 @@ async function runAgent(overrideChatId) {
                 aggregateMetrics.reasoning_tokens += m.metrics.reasoning_tokens || 0;
                 aggregateMetrics.cost += m.metrics.cost || 0;
                 aggregateMetrics.duration += m.metrics.duration || 0;
+                aggregateMetrics.est_input_tokens += m.metrics.est_input_tokens || 0;
+                aggregateMetrics.est_output_tokens += m.metrics.est_output_tokens || 0;
                 callNumber = Math.max(callNumber, m.metrics.callNumber || 0);
             }
         }
@@ -2042,6 +2048,10 @@ async function runAgent(overrideChatId) {
             aggregateMetrics.cache_write_tokens += reqMetrics.cache_write_tokens || 0;
             aggregateMetrics.reasoning_tokens += reqMetrics.reasoning_tokens || 0;
             aggregateMetrics.cost += reqMetrics.cost || 0;
+            // Estimates (provider returned no usage) — summed separately so
+            // real totals stay real (formatMetrics shows them with "~").
+            aggregateMetrics.est_input_tokens = (aggregateMetrics.est_input_tokens || 0) + (reqMetrics.est_input_tokens || 0);
+            aggregateMetrics.est_output_tokens = (aggregateMetrics.est_output_tokens || 0) + (reqMetrics.est_output_tokens || 0);
             
             // Copy metrics but exclude requestBody to prevent memory bloat
             // (requestBody contains full conversation history with base64 images)
@@ -2368,6 +2378,8 @@ async function runAgent(overrideChatId) {
             reasoning_tokens: aggregateMetrics.reasoning_tokens || undefined,
             cost: aggregateMetrics.cost || undefined,
             duration: aggregateMetrics.duration,
+            est_input_tokens: aggregateMetrics.est_input_tokens || undefined,
+            est_output_tokens: aggregateMetrics.est_output_tokens || undefined,
             isAggregate: true,
             callCount: aggregateMetrics.callCount
         };

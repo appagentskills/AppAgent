@@ -19,7 +19,7 @@ body.sidepanel-mode .ext-active-tab .ext-status-dot { background: var(--primary)
 body.sidepanel-mode #active-tab-url { overflow: hidden; text-overflow: ellipsis; }
 
 /* Model name — compact in sidepanel mode */
-body.sidepanel-mode .model-name { font-size: var(--text-caption); padding: var(--space-1) var(--space-3); max-width: 160px; overflow: hidden; }
+body.sidepanel-mode .model-name { font-size: var(--text-caption); padding: var(--space-1) var(--space-3); max-width: 220px; overflow: hidden; }
 
 /* --- Expand / Side Panel toggle buttons --- */
 .ext-panel-btn { background: none; border: 1px solid var(--border); border-radius: var(--radius-md); cursor: pointer; padding: var(--space-2) var(--space-3); color: var(--text-secondary); display: inline-flex; align-items: center; justify-content: center; transition: all var(--transition-fast); }

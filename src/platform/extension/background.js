@@ -2475,8 +2475,9 @@ self.snAutoLogin = snAutoLogin;
 var _notifChatIds = {};
 function _notifStorageKey(id) { return 'notifChat:' + id; }
 // Notification mode (chrome.storage.local.notificationMode), the single gate
-// for every AppAgent notification: 'silent' = none at all, 'notify' (default)
-// = the toast, 'sound' = the toast + a chime. Set by the 3-position switch in
+// for every AppAgent notification: 'silent' = none at all, 'notify' (fallback
+// when unset) = the toast, 'sound' = the toast + a chime. New installs are
+// seeded with 'sound' (seedNotificationModeOnInstall below). Set by the 3-position switch in
 // ui/240-layout.js (setNotificationMode). A pre-release approvalSoundEnabled===true
 // still reads as 'sound' until a mode is picked (read-only, never rewritten).
 var NOTIFICATION_MODES = ['silent', 'notify', 'sound'];
@@ -2487,6 +2488,24 @@ function resolveNotificationMode(d) {
     return 'notify';
 }
 self.resolveNotificationMode = resolveNotificationMode;
+// New users get 'With sound' by default: on a FRESH install only (reason
+// 'install'; never 'update' / 'chrome_update', so an unpacked Reload or a
+// version bump is a no-op) and only when neither notificationMode nor the
+// legacy approvalSoundEnabled key exists, so an existing user's stored choice
+// (or implicit 'notify' fallback) is never changed. The unset fallback above
+// stays 'notify' for exactly that reason.
+function seedNotificationModeOnInstall(details) {
+    if (!details || details.reason !== 'install') return;
+    try {
+        chrome.storage.local.get(['notificationMode', 'approvalSoundEnabled'], function(d) {
+            d = d || {};
+            if ('notificationMode' in d || 'approvalSoundEnabled' in d) return;
+            chrome.storage.local.set({ notificationMode: 'sound' });
+        });
+    } catch (e) { console.warn('[AppAgent] notification mode seed failed:', e && e.message); }
+}
+self.seedNotificationModeOnInstall = seedNotificationModeOnInstall;
+if (chrome.runtime && chrome.runtime.onInstalled) chrome.runtime.onInstalled.addListener(seedNotificationModeOnInstall);
 function appagentCreateNotification(title, message, chatId) {
     // 'appagent-' prefix is REQUIRED (onClicked below filters on it). Random
     // suffix: two notifications in the same millisecond would share an id and
@@ -3992,6 +4011,7 @@ chrome.tabs.onRemoved.addListener(function(tabId) {
 var CLAUDE_OAUTH = {
     clientId: '9d1c250a-e61b-44d9-88ed-5944d1962f5e',
     apiHost: 'https://api.anthropic.com',
+    authorizeUrl: 'https://claude.ai/oauth/authorize',
     redirectUri: 'https://platform.claude.com/oauth/code/callback',
     scopes: 'user:profile user:inference user:sessions:claude_code user:mcp_servers'
 };
@@ -4555,7 +4575,7 @@ function _claudeRefreshCauseSuffix(rec) {
 // User-facing text for a failed renewal on the stream paths (pre-stream check
 // and 401 retry). session_stale_relogin already carries its own instructions.
 function _claudeRenewErrorText(e, prefix) {
-    return (e && e.claudeSessionStale) ? e.message
+    return (e && (e.claudeSessionStale || e.claudeInteractiveRequired)) ? e.message
         : prefix + ((e && e.message) || e) + '. Open https://claude.ai, sign in, then retry.';
 }
 
@@ -4603,6 +4623,14 @@ async function startClaudeOAuth(epoch) {
             var staleErr = new Error('Your claude.ai session needs a fresh sign-in (session_stale_relogin). Sign out of https://claude.ai and back in, then retry.');
             staleErr.claudeSessionStale = true;
             throw staleErr;
+        }
+        if (/missing_client_attestation/.test(aErr)) {
+            // Anthropic now requires a browser-minted hCaptcha client_attestation
+            // token on /v1/oauth/{orgId}/authorize; silent cookie authorize cannot
+            // mint it, so the user must sign in interactively via the browser tab.
+            var interactiveErr = new Error('Claude requires interactive browser sign-in (missing_client_attestation). Click Sign in to authenticate.');
+            interactiveErr.claudeInteractiveRequired = true;
+            throw interactiveErr;
         }
         throw new Error('Authorize failed: ' + authRes.status + ' ' + aErr);
     }
@@ -4789,10 +4817,10 @@ async function _renewClaudeTokenOnce(oauth, epoch, info) {
         // claudeOAuthLastRefreshError.
         // It gets the refresh cause appended, so the user (and a bug report)
         // can tell a reload-lost token from a revoked one.
-        if (refreshRec && e2 && e2.claudeSessionStale && e2.message) {
+        if (refreshRec && e2 && (e2.claudeSessionStale || e2.claudeInteractiveRequired) && e2.message) {
             e2.message += _claudeRefreshCauseSuffix(refreshRec);
             e2.claudeRefreshCause = refreshRec.cause;
-        } else if (refreshErr && e2 && !e2.claudeOAuthStale && !e2.claudeSessionStale && e2.message) {
+        } else if (refreshErr && e2 && !e2.claudeOAuthStale && !e2.claudeSessionStale && !e2.claudeInteractiveRequired && e2.message) {
             e2.message += ' (refresh token also rejected: ' + String(refreshErr.message || refreshErr).slice(0, 200) + ')';
         }
         throw e2;
@@ -4832,16 +4860,448 @@ async function saveOAuthCreds(tokenData, existingRefresh, epoch) {
     return creds;
 }
 
+// --- Claude Interactive Browser OAuth (PKCE via claude.ai/oauth/authorize) ---
+//
+// Anthropic enforces a browser-minted invisible hCaptcha client_attestation
+// token on POST /v1/oauth/{orgId}/authorize, which a background service worker
+// cannot mint. User-initiated sign-in therefore opens claude.ai/oauth/authorize
+// in a browser tab with PKCE (same Claude Code CLI client_id), captures the
+// callback redirect on platform.claude.com/oauth/code/callback, closes the tab,
+// and exchanges the authorization code at api.anthropic.com/v1/oauth/token.
+// Rotating refresh tokens continue to renew headlessly via refreshClaudeToken().
+var CLAUDE_BROWSER_OAUTH_PENDING_KEY = 'claudeBrowserOAuthPending';
+var CLAUDE_BROWSER_OAUTH_TTL_MS = 5 * 60 * 1000;
+var claudeBrowserOAuthGeneration = 0;
+var claudeBrowserOAuthStartInFlight = null;
+var claudeBrowserOAuthExchange = null;
+var claudeBrowserOAuthStorageQueue = Promise.resolve();
+var claudeBrowserOAuthTimeoutTimer = null;
+
+function _claudeQueueBrowserStorage(fn) {
+    var next = claudeBrowserOAuthStorageQueue.then(fn, fn);
+    claudeBrowserOAuthStorageQueue = next.then(function() {}, function() {});
+    return next;
+}
+
+function _claudeSessionGet(key) {
+    try {
+        if (chrome.storage && chrome.storage.session && typeof chrome.storage.session.get === 'function') {
+            return Promise.resolve(chrome.storage.session.get(key));
+        }
+    } catch (e) {}
+    return Promise.resolve({});
+}
+
+function _claudeSessionSet(obj) {
+    try {
+        if (chrome.storage && chrome.storage.session && typeof chrome.storage.session.set === 'function') {
+            return Promise.resolve(chrome.storage.session.set(obj));
+        }
+    } catch (e) {}
+    return Promise.resolve();
+}
+
+function _claudeSessionRemove(key) {
+    try {
+        if (chrome.storage && chrome.storage.session && typeof chrome.storage.session.remove === 'function') {
+            return Promise.resolve(chrome.storage.session.remove(key));
+        }
+    } catch (e) {}
+    return Promise.resolve();
+}
+
+function _claudeCloseTabQuietly(tabId) {
+    if (!Number.isInteger(tabId)) return Promise.resolve();
+    try {
+        if (chrome.tabs && typeof chrome.tabs.remove === 'function') {
+            return Promise.resolve(chrome.tabs.remove(tabId)).catch(function() {});
+        }
+    } catch (e) {}
+    return Promise.resolve();
+}
+
+function _claudeClearBrowserTimeout() {
+    if (claudeBrowserOAuthTimeoutTimer) {
+        clearTimeout(claudeBrowserOAuthTimeoutTimer);
+        claudeBrowserOAuthTimeoutTimer = null;
+    }
+}
+
+function _claudeBrowserPublic(pending) {
+    return { pending: true, method: 'browser', expiresAt: pending.expiresAt };
+}
+
+function _claudeBroadcastBrowserStatus(payload) {
+    try {
+        var p = chrome.runtime.sendMessage(Object.assign({ type: 'claude-oauth-browser-status' }, payload));
+        if (p && typeof p.catch === 'function') p.catch(function() {});
+    } catch (e) {}
+}
+
+function _claudeScheduleBrowserTimeout(pending) {
+    _claudeClearBrowserTimeout();
+    if (!pending || typeof setTimeout !== 'function') return;
+    var delay = Math.max(0, pending.expiresAt - Date.now());
+    var expectedState = pending.state;
+    claudeBrowserOAuthTimeoutTimer = setTimeout(function() {
+        claudeBrowserOAuthTimeoutTimer = null;
+        _claudeQueueBrowserStorage(async function() {
+            var stored = await _claudeSessionGet(CLAUDE_BROWSER_OAUTH_PENDING_KEY);
+            var current = stored && stored[CLAUDE_BROWSER_OAUTH_PENDING_KEY];
+            if (!current || current.state !== expectedState) return;
+            await _claudeSessionRemove(CLAUDE_BROWSER_OAUTH_PENDING_KEY);
+            await _claudeCloseTabQuietly(current.tabId);
+            var msg = 'Claude sign-in timed out. Click Sign in to try again.';
+            _claudeBroadcastBrowserStatus({ pending: false, error: msg });
+            chrome.runtime.sendMessage({ type: 'claude-oauth-updated', error: msg }).catch(function() {});
+        }).catch(function() {});
+    }, delay);
+}
+
+function _claudeAssertBrowserGeneration(generation, epoch, signal) {
+    if (generation !== claudeBrowserOAuthGeneration || (signal && signal.aborted)) {
+        var abortErr = new Error('Claude browser sign-in was cancelled.');
+        abortErr.name = 'AbortError';
+        abortErr.claudeBrowserCancelled = true;
+        throw abortErr;
+    }
+    if (typeof epoch === 'number' && epoch !== claudeOAuthEpoch) {
+        throw _claudeOAuthStaleError();
+    }
+}
+
+async function _claudeCancelPendingBrowserOAuth(opts) {
+    opts = opts || {};
+    claudeBrowserOAuthGeneration++;
+    _claudeClearBrowserTimeout();
+    claudeBrowserOAuthStartInFlight = null;
+    var exchange = claudeBrowserOAuthExchange;
+    if (exchange && exchange.controller) {
+        try { exchange.controller.abort(); } catch (e) {}
+    }
+    claudeBrowserOAuthExchange = null;
+    await _claudeQueueBrowserStorage(async function() {
+        var stored = await _claudeSessionGet(CLAUDE_BROWSER_OAUTH_PENDING_KEY);
+        var pending = stored && stored[CLAUDE_BROWSER_OAUTH_PENDING_KEY];
+        await _claudeSessionRemove(CLAUDE_BROWSER_OAUTH_PENDING_KEY);
+        var tabId = pending ? pending.tabId : (exchange && exchange.tabId);
+        if (Number.isInteger(tabId)) await _claudeCloseTabQuietly(tabId);
+    });
+    if (!opts.silent) _claudeBroadcastBrowserStatus({ pending: false });
+}
+
+function _claudeBuildBrowserAuthorizeUrl(pkce) {
+    var url = new URL(CLAUDE_OAUTH.authorizeUrl || 'https://claude.ai/oauth/authorize');
+    url.search = new URLSearchParams({
+        code: 'true',
+        client_id: CLAUDE_OAUTH.clientId,
+        response_type: 'code',
+        redirect_uri: CLAUDE_OAUTH.redirectUri,
+        scope: CLAUDE_OAUTH.scopes,
+        code_challenge: pkce.challenge,
+        code_challenge_method: 'S256',
+        state: pkce.state
+    }).toString();
+    return url.href;
+}
+
+async function startClaudeBrowserOAuth() {
+    if (_claudeOAuthQuiescing()) throw _claudeOAuthQuiescingError();
+    if (!chrome.tabs || typeof chrome.tabs.create !== 'function') {
+        throw new Error('Browser tabs API is unavailable for Claude sign-in.');
+    }
+    // Manual login re-enables auto-login and clears any stale failed-cookie guard.
+    chrome.storage.local.remove(['claudeOAuthSuppressAutoLogin', 'claudeAutoLoginFailedFor']);
+    claudeRenewLastFailure = null;
+
+    var epoch = claudeOAuthEpoch;
+    // Cancel any stale pending auth tab/exchange before starting a new flow.
+    await _claudeCancelPendingBrowserOAuth({ silent: true });
+    if (epoch !== claudeOAuthEpoch) throw _claudeOAuthStaleError();
+
+    var generation = claudeBrowserOAuthGeneration;
+    var tab = null;
+    var attempt = { generation: generation, promise: null };
+    claudeBrowserOAuthStartInFlight = attempt;
+    attempt.promise = (async function() {
+        try {
+            var pkce = await makePkce();
+            _claudeAssertBrowserGeneration(generation, epoch);
+            // Open an owned tab at about:blank and persist pending state BEFORE
+            // navigating to authorizeUrl so a fast consent redirect cannot race storage.
+            tab = await chrome.tabs.create({ url: 'about:blank', active: true });
+            _claudeAssertBrowserGeneration(generation, epoch);
+            if (!tab || !Number.isInteger(tab.id)) throw new Error('Could not open Claude sign-in tab.');
+            var now = Date.now();
+            var pending = {
+                state: pkce.state,
+                verifier: pkce.verifier,
+                tabId: tab.id,
+                startedAt: now,
+                expiresAt: now + CLAUDE_BROWSER_OAUTH_TTL_MS,
+                epoch: epoch,
+                sw: typeof CLAUDE_SW_LIFETIME_ID === 'string' ? CLAUDE_SW_LIFETIME_ID : ''
+            };
+            await _claudeQueueBrowserStorage(async function() {
+                _claudeAssertBrowserGeneration(generation, epoch);
+                var obj = {};
+                obj[CLAUDE_BROWSER_OAUTH_PENDING_KEY] = pending;
+                await _claudeSessionSet(obj);
+                _claudeAssertBrowserGeneration(generation, epoch);
+            });
+            var authHref = _claudeBuildBrowserAuthorizeUrl(pkce);
+            _claudeAssertBrowserGeneration(generation, epoch);
+            await chrome.tabs.update(tab.id, { url: authHref });
+            _claudeAssertBrowserGeneration(generation, epoch);
+            _claudeScheduleBrowserTimeout(pending);
+            var pub = _claudeBrowserPublic(pending);
+            _claudeBroadcastBrowserStatus(pub);
+            return pub;
+        } catch (e) {
+            if (generation === claudeBrowserOAuthGeneration) {
+                await _claudeCancelPendingBrowserOAuth({ silent: true });
+            } else if (tab && Number.isInteger(tab.id)) {
+                await _claudeCloseTabQuietly(tab.id);
+            }
+            throw e;
+        } finally {
+            if (claudeBrowserOAuthStartInFlight === attempt) claudeBrowserOAuthStartInFlight = null;
+        }
+    })();
+    return attempt.promise;
+}
+
+function _claudeParseBrowserCallbackUrl(url, pending) {
+    if (!pending || !pending.state || pending.expiresAt <= Date.now()) return null;
+    var parsed, expected;
+    try {
+        parsed = new URL(url);
+        expected = new URL(CLAUDE_OAUTH.redirectUri);
+    } catch (e) { return null; }
+    if (parsed.origin !== expected.origin || parsed.pathname !== expected.pathname) return null;
+    var params = parsed.searchParams;
+    if (params.getAll('state').length !== 1 || params.get('state') !== pending.state) return null;
+    if (params.has('error')) {
+        return { denied: true, error: params.get('error'), errorDescription: params.get('error_description') || '' };
+    }
+    if (params.getAll('code').length !== 1 || !params.get('code')) return null;
+    return { code: params.get('code'), state: params.get('state') };
+}
+
+function _claudeParseManualCode(rawInput, pending) {
+    if (!pending || !pending.state || pending.expiresAt <= Date.now()) return null;
+    var trimmed = String(rawInput || '').trim();
+    if (!trimmed) return null;
+    if (/^https?:\/\//i.test(trimmed)) return _claudeParseBrowserCallbackUrl(trimmed, pending);
+    var hashIdx = trimmed.indexOf('#');
+    if (hashIdx >= 0) {
+        var codePart = trimmed.slice(0, hashIdx).trim();
+        var statePart = trimmed.slice(hashIdx + 1).trim();
+        if (!codePart || statePart !== pending.state) return null;
+        return { code: codePart, state: statePart };
+    }
+    return { code: trimmed, state: pending.state };
+}
+
+async function _claudeExchangeBrowserCode(code, verifier, state, signal) {
+    var opts = {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        body: JSON.stringify({
+            grant_type: 'authorization_code',
+            client_id: CLAUDE_OAUTH.clientId,
+            code: code,
+            redirect_uri: CLAUDE_OAUTH.redirectUri,
+            code_verifier: verifier,
+            state: state
+        })
+    };
+    if (signal) opts.signal = signal;
+    var tokRes = await fetch(CLAUDE_OAUTH.apiHost + '/v1/oauth/token', opts);
+    if (!tokRes.ok) {
+        var tErr = await tokRes.text();
+        throw new Error('Token exchange failed: ' + tokRes.status + ' ' + tErr);
+    }
+    return await tokRes.json();
+}
+
+async function _claudeHandleBrowserCallback(tabId, url, manualInput) {
+    var generation = claudeBrowserOAuthGeneration;
+    var claimedTabId = null;
+    var exchange = null;
+    var claim = null;
+    try {
+        claim = await _claudeQueueBrowserStorage(async function() {
+            var stored = await _claudeSessionGet(CLAUDE_BROWSER_OAUTH_PENDING_KEY);
+            var pending = stored && stored[CLAUDE_BROWSER_OAUTH_PENDING_KEY];
+            if (!pending) return null;
+            var sameSw = !pending.sw || (typeof CLAUDE_SW_LIFETIME_ID === 'string' && pending.sw === CLAUDE_SW_LIFETIME_ID);
+            if (sameSw && typeof pending.epoch === 'number' && pending.epoch !== claudeOAuthEpoch) {
+                await _claudeSessionRemove(CLAUDE_BROWSER_OAUTH_PENDING_KEY);
+                return null;
+            }
+            var claimEpoch = sameSw && typeof pending.epoch === 'number' ? pending.epoch : claudeOAuthEpoch;
+            var parsed = manualInput != null
+                ? _claudeParseManualCode(manualInput, pending)
+                : _claudeParseBrowserCallbackUrl(url, pending);
+            if (!parsed) return null;
+            _claudeAssertBrowserGeneration(generation, claimEpoch);
+            claimedTabId = Number.isInteger(tabId) ? tabId : pending.tabId;
+            exchange = {
+                tabId: pending.tabId,
+                callbackTabId: claimedTabId,
+                controller: typeof AbortController === 'function' ? new AbortController() : null,
+                epoch: claimEpoch
+            };
+            claudeBrowserOAuthExchange = exchange;
+            _claudeClearBrowserTimeout();
+            await _claudeSessionRemove(CLAUDE_BROWSER_OAUTH_PENDING_KEY);
+            _claudeAssertBrowserGeneration(generation, claimEpoch, exchange.controller && exchange.controller.signal);
+            return { pending: pending, callback: parsed, exchange: exchange, claimEpoch: claimEpoch };
+        });
+    } catch (e) {
+        if (claudeBrowserOAuthExchange === exchange) claudeBrowserOAuthExchange = null;
+        if (Number.isInteger(claimedTabId)) await _claudeCloseTabQuietly(claimedTabId);
+        return { ok: false, error: (e && e.message) || 'Claude sign-in was cancelled.' };
+    }
+    if (!claim) return { ok: false, matched: false };
+
+    var signal = claim.exchange.controller ? claim.exchange.controller.signal : undefined;
+    try {
+        if (claim.callback.denied) {
+            var deniedMsg = 'Claude sign-in was declined. Click Sign in to try again.';
+            if (generation === claudeBrowserOAuthGeneration && (!signal || !signal.aborted)) {
+                _claudeBroadcastBrowserStatus({ pending: false, error: deniedMsg });
+                chrome.runtime.sendMessage({ type: 'claude-oauth-updated', error: deniedMsg }).catch(function() {});
+            }
+            return { ok: false, matched: true, error: deniedMsg };
+        }
+        _claudeAssertBrowserGeneration(generation, claim.claimEpoch, signal);
+        var tokenData = await _claudeExchangeBrowserCode(
+            claim.callback.code,
+            claim.pending.verifier,
+            claim.callback.state,
+            signal
+        );
+        _claudeAssertBrowserGeneration(generation, claim.claimEpoch, signal);
+        var creds = await saveOAuthCreds(tokenData, undefined, claim.claimEpoch);
+        claudeRenewLastFailure = null;
+        chrome.storage.local.remove('claudeAutoLoginFailedFor');
+        _recordClaudeRenew('browser', 'login');
+        _claudeBroadcastBrowserStatus({ pending: false });
+        return { ok: true, matched: true, claudeOAuth: creds };
+    } catch (e) {
+        var cancelled = !!(e && (e.claudeBrowserCancelled || e.claudeOAuthStale || e.name === 'AbortError'));
+        if (!cancelled && generation === claudeBrowserOAuthGeneration && (!signal || !signal.aborted)) {
+            var failMsg = 'Claude sign-in failed: ' + _redactClaudeOAuthError(e);
+            _recordClaudeRenew('failed', 'login', e);
+            _claudeBroadcastBrowserStatus({ pending: false, error: failMsg });
+            chrome.runtime.sendMessage({ type: 'claude-oauth-updated', error: failMsg }).catch(function() {});
+        }
+        return { ok: false, matched: true, error: (e && e.message) || 'Claude token exchange failed.' };
+    } finally {
+        if (claudeBrowserOAuthExchange === claim.exchange) claudeBrowserOAuthExchange = null;
+        if (Number.isInteger(claimedTabId)) await _claudeCloseTabQuietly(claimedTabId);
+        if (Number.isInteger(claim.pending.tabId) && claim.pending.tabId !== claimedTabId) {
+            await _claudeCloseTabQuietly(claim.pending.tabId);
+        }
+    }
+}
+
+async function _claudeBrowserOAuthStatus() {
+    var stored = await _claudeSessionGet(CLAUDE_BROWSER_OAUTH_PENDING_KEY);
+    var pending = stored && stored[CLAUDE_BROWSER_OAUTH_PENDING_KEY];
+    if (!pending) return null;
+    var sameSw = !pending.sw || (typeof CLAUDE_SW_LIFETIME_ID === 'string' && pending.sw === CLAUDE_SW_LIFETIME_ID);
+    if (pending.expiresAt <= Date.now() || (sameSw && typeof pending.epoch === 'number' && pending.epoch !== claudeOAuthEpoch)) {
+        await _claudeQueueBrowserStorage(async function() {
+            var current = (await _claudeSessionGet(CLAUDE_BROWSER_OAUTH_PENDING_KEY))[CLAUDE_BROWSER_OAUTH_PENDING_KEY];
+            if (current && current.state === pending.state) {
+                await _claudeSessionRemove(CLAUDE_BROWSER_OAUTH_PENDING_KEY);
+                await _claudeCloseTabQuietly(current.tabId);
+            }
+        });
+        return null;
+    }
+    return _claudeBrowserPublic(pending);
+}
+
+if (chrome.tabs && chrome.tabs.onUpdated && typeof chrome.tabs.onUpdated.addListener === 'function') {
+    chrome.tabs.onUpdated.addListener(function(tabId, changeInfo) {
+        if (changeInfo && changeInfo.url && changeInfo.url.indexOf(CLAUDE_OAUTH.redirectUri) === 0) {
+            _claudeHandleBrowserCallback(tabId, changeInfo.url).catch(function() {});
+        }
+    });
+}
+if (chrome.tabs && chrome.tabs.onRemoved && typeof chrome.tabs.onRemoved.addListener === 'function') {
+    chrome.tabs.onRemoved.addListener(function(tabId) {
+        _claudeQueueBrowserStorage(async function() {
+            var stored = await _claudeSessionGet(CLAUDE_BROWSER_OAUTH_PENDING_KEY);
+            var pending = stored && stored[CLAUDE_BROWSER_OAUTH_PENDING_KEY];
+            if (!pending || pending.tabId !== tabId) return;
+            _claudeClearBrowserTimeout();
+            await _claudeSessionRemove(CLAUDE_BROWSER_OAUTH_PENDING_KEY);
+            var msg = 'Claude sign-in window was closed.';
+            _claudeBroadcastBrowserStatus({ pending: false, error: msg });
+            chrome.runtime.sendMessage({ type: 'claude-oauth-updated', error: msg }).catch(function() {});
+        }).catch(function() {});
+    });
+}
+
 // Handle OAuth messages from side panel and content script
 chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
     if (message.type === 'claude-oauth-login') {
-        // Manual login re-enables auto-login and clears any stale failed-cookie guard.
-        chrome.storage.local.remove(['claudeOAuthSuppressAutoLogin', 'claudeAutoLoginFailedFor']);
-        claudeRenewLastFailure = null;
-        loginClaudeOAuth().then(function(creds) {
-            sendResponse({ success: true, claudeOAuth: creds });
+        // Explicit user-triggered login launches the interactive browser OAuth flow
+        // (required because Anthropic enforces hCaptcha client_attestation on
+        // headless /v1/oauth/{orgId}/authorize). method:'headless' is retained for
+        // legacy diagnostics/tests exercising the cookie-authorize single-flight.
+        if (message.method === 'headless') {
+            chrome.storage.local.remove(['claudeOAuthSuppressAutoLogin', 'claudeAutoLoginFailedFor']);
+            claudeRenewLastFailure = null;
+            loginClaudeOAuth().then(function(creds) {
+                sendResponse({ success: true, claudeOAuth: creds });
+            }).catch(function(err) {
+                sendResponse({ error: err.message });
+            });
+            return true;
+        }
+        startClaudeBrowserOAuth().then(function(info) {
+            sendResponse(Object.assign({ success: true }, info));
         }).catch(function(err) {
-            sendResponse({ error: err.message });
+            sendResponse({ error: (err && err.message) || 'Could not start Claude sign-in.' });
+        });
+        return true;
+    }
+    if (message.type === 'claude-oauth-browser-start') {
+        startClaudeBrowserOAuth().then(function(info) {
+            sendResponse(Object.assign({ success: true }, info));
+        }).catch(function(err) {
+            sendResponse({ error: (err && err.message) || 'Could not start Claude sign-in.' });
+        });
+        return true;
+    }
+    if (message.type === 'claude-oauth-browser-cancel') {
+        _claudeCancelPendingBrowserOAuth().then(function() {
+            sendResponse({ success: true });
+        }).catch(function(err) {
+            sendResponse({ error: (err && err.message) || 'Could not cancel Claude sign-in.' });
+        });
+        return true;
+    }
+    if (message.type === 'claude-oauth-browser-status') {
+        _claudeBrowserOAuthStatus().then(function(info) {
+            sendResponse(info || { pending: false });
+        }).catch(function() {
+            sendResponse({ pending: false });
+        });
+        return true;
+    }
+    if (message.type === 'claude-oauth-browser-complete') {
+        _claudeHandleBrowserCallback(null, null, message.code).then(function(res) {
+            if (res && res.ok) sendResponse({ success: true, claudeOAuth: res.claudeOAuth });
+            else sendResponse({ error: (res && res.error) || 'Invalid or expired authorization code. Start a new sign-in and try again.' });
+        }).catch(function(err) {
+            sendResponse({ error: (err && err.message) || 'Could not complete Claude sign-in.' });
         });
         return true;
     }
@@ -4866,6 +5326,13 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
             // Additive diagnostics fields on logged-in replies (no tokens).
             function lastRenew() { return claudeOAuthLastRenew || data.claudeOAuthLastRenew || null; }
             function lastRefreshError() { return claudeOAuthLastRefreshError || data.claudeOAuthLastRefreshError || null; }
+            try {
+                var claudeBrowserPending = await _claudeBrowserOAuthStatus();
+                if (claudeBrowserPending) {
+                    sendResponse(Object.assign({ loggedIn: false }, claudeBrowserPending));
+                    return;
+                }
+            } catch (e) {}
             if (!data.claudeOAuth) {
                 // AUTO-LOGIN: no token stored yet. If the user is signed into
                 // claude.ai (sessionKey cookie present) and has not manually
@@ -4942,6 +5409,8 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
     if (message.type === 'claude-oauth-logout') {
         // TA4-3: bump the epoch FIRST so an in-flight login/renew can't re-write the token.
         claudeOAuthEpoch++;
+        // Cancel any pending interactive browser OAuth flow and close its tab best-effort.
+        _claudeCancelPendingBrowserOAuth().catch(function() {});
         // Never share an in-flight renewal across a logout (it is fenced anyway).
         claudeRenewInFlight = null;
         claudeRenewLastFailure = null;
@@ -5776,7 +6245,11 @@ var _openaiModelQuirks = {};
 // Terra); Codex migrates gpt-5.6-terra/-sol → gpt-6-sol, gpt-5.6-luna → gpt-6-luna.
 // 2026-09-30: GPT-6.1-Sol is Codex's new default; GPT-6-Sol stays listed as
 // "previous generation" (codex-rs model_selection_popup snapshot).
-var OPENAI_FALLBACK_MODELS = ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna'];
+// 2026-11-26: Codex models.json ranks gpt-6.2-sol priority 1 and gpt-6.2-astra
+// priority 2; gpt-6.1-sol / gpt-6-astra are "Previous generation". Newest
+// first, previous generations kept after (the list mirrors the picker, which
+// still offers them).
+var OPENAI_FALLBACK_MODELS = ['gpt-6.2-sol', 'gpt-6.2-astra', 'gpt-6-luna', 'gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-sol'];
 var OPENAI_MODEL_CATALOG_TTL_MS = 10 * 60 * 1000;
 var _openaiModelCatalog = null;
 var _openaiModelCatalogAt = 0;
@@ -6893,7 +7366,7 @@ function transformToResponses(body) {
     // are both this value, and runChatGPTOAuthStream keys the degrade-and-retry
     // memo off responsesBody.model — so key parity is structural, not a
     // convention two call sites have to remember.
-    var modelSlug = _openaiNormalizeModelSlug(body && body.model) || 'gpt-6.1-sol';
+    var modelSlug = _openaiNormalizeModelSlug(body && body.model) || 'gpt-6.2-sol';
     var quirks = _openaiModelQuirks[modelSlug] || {};
     if (reasoning && quirks.reasoningSummary === 'omit') delete reasoning.summary;
     else if (reasoning && quirks.reasoningSummary === 'auto') reasoning.summary = 'auto';
@@ -7013,7 +7486,7 @@ async function runChatGPTOAuthStream(requestBody, sink, abortSignal) {
     var created = Math.floor(Date.now() / 1000);
     // Echoed back in every chat.completion.chunk — normalise so the UI shows
     // the slug we actually sent upstream.
-    var model = _openaiNormalizeModelSlug(requestBody && requestBody.model) || 'gpt-6.1-sol';
+    var model = _openaiNormalizeModelSlug(requestBody && requestBody.model) || 'gpt-6.2-sol';
     function emit(payload) {
         sink({ type: 'sse', data: 'data: ' + JSON.stringify(payload) + '\n\n' });
     }

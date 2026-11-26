@@ -64,7 +64,9 @@ function syncApiStatsCheckboxes() {
     });
 }
 
-// Notifications pill (Silent / Notify / With sound). Default 'notify'. The
+// Notifications pill (Silent / Notify / With sound). Fresh installs are seeded
+// with 'sound' by background.js seedNotificationModeOnInstall; an unset key
+// (existing users who never picked) still falls back to 'notify'. The
 // single store is chrome.storage.local.notificationMode because the service
 // worker (background.js appagentCreateNotification, the central gate) reads it
 // and cannot reach appStorage/IndexedDB. Header pills (#header-notif-mode,
@@ -384,8 +386,8 @@ function setAppTheme(value) {
 }
 
 // Mutual exclusion for the header pill dropdowns: gear settings panel, model
-// menu, jobs dropdown, workspace dropdown, usage (credits pill) dropdown and
-// the ServiceNow instance picker. Every toggle calls this with its own name
+// menu (which also hosts the usage detail), jobs dropdown, workspace dropdown
+// and the ServiceNow instance picker. Every toggle calls this with its own name
 // before opening, so opening any one closes all the others.
 // NOTE: hideInstancePicker lives in platform-bridge.js (extension-only IIFE)
 // and is exposed on window there; the typeof guards keep every closer optional.
@@ -394,7 +396,6 @@ function closeAllHeaderMenus(except) {
     if (except !== 'model' && typeof _closeModelMenu === 'function') _closeModelMenu();
     if (except !== 'jobs' && typeof closeJobsDropdown === 'function') closeJobsDropdown();
     if (except !== 'workspace' && typeof hideWorkspaceDropdown === 'function') hideWorkspaceDropdown();
-    if (except !== 'usage' && typeof hideUsageTooltipNow === 'function') hideUsageTooltipNow();
     if (except !== 'instances' && typeof window.hideInstancePicker === 'function') window.hideInstancePicker();
     if (except !== 'notif' && typeof _closeNotificationModeMenu === 'function') _closeNotificationModeMenu();
     if (typeof syncHeaderMenuExpanded === 'function') syncHeaderMenuExpanded();
@@ -510,14 +511,17 @@ function updateContextIndicator() {
 
     // Get last known input_tokens from most recent assistant message with metrics (skip aggregate totals)
     var totalTokens = 0;
+    var estimated = false;
     var chat = chats[currentChatId];
     if (chat && chat.messages) {
         for (var i = chat.messages.length - 1; i >= 0; i--) {
             var m = chat.messages[i];
             // Skip aggregate metrics (Total X calls) - we want the last individual call
-            if (m.role === 'assistant' && m.metrics && m.metrics.input_tokens && !m.metrics.isAggregate) {
-                totalTokens = m.metrics.input_tokens;
-                break;
+            if (m.role === 'assistant' && m.metrics && !m.metrics.isAggregate) {
+                if (m.metrics.input_tokens) { totalTokens = m.metrics.input_tokens; break; }
+                // Provider returned no usage (e.g. LM Studio): our estimate
+                // (est_input_tokens, app/010-llm-streaming.js applyUsageEstimates).
+                if (m.metrics.est_input_tokens) { totalTokens = m.metrics.est_input_tokens; estimated = true; break; }
             }
         }
     }
@@ -588,7 +592,7 @@ function updateContextIndicator() {
     indicator.setAttribute('aria-label', showContinue ? continueText : t('Summarize and start new chat'));
 
     // Show percentage and token count in tooltip
-    var tokenDisplay = totalTokens >= 1000 ? Math.round(totalTokens / 1000) + 'k' : totalTokens;
+    var tokenDisplay = (estimated ? '~' : '') + (totalTokens >= 1000 ? Math.round(totalTokens / 1000) + 'k' : totalTokens);
     if (draftTokens > 0) {
         var draftDisplay = draftTokens >= 1000 ? Math.round(draftTokens / 1000) + 'k' : draftTokens;
         indicator.title = t('{percent}% context used ({tokens} tokens, incl. ~{draft} in draft)', { percent: percentage, tokens: tokenDisplay, draft: draftDisplay });

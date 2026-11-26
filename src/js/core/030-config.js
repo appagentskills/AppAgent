@@ -14,11 +14,13 @@
 // adaptive-only-Claude legacy branch in app/010-llm-streaming.js which
 // keys off the RAW stored thinkingBudget to send an explicit default
 // effort.
-// 64000 = highest safe universal max_tokens: it sits under Gemini 3.8
-// Flash's 65,536 completion cap on OpenRouter (verified 2026-10-07 in
-// openrouter.ai/api/v1/models/google/gemini-3.8-flash/endpoints) — endpoints 400-error rather
-// than clamp when max_tokens exceeds the model's limit, so the default must
-// be under the lowest cap among the default models.
+// 64000 = highest safe universal max_tokens: it sits under Gemini 4
+// Neon's 65,536 completion cap on its google-ai-studio endpoint (verified
+// 2026-11-26 in openrouter.ai/api/v1/models/google/gemini-4-neon/endpoints) —
+// endpoints 400-error rather than clamp when max_tokens exceeds the model's
+// limit, so the default must be under the lowest cap among the default
+// models' routable endpoints (Gemini 4 Carbon's 32,768 AI Studio endpoint is
+// excluded by its google-vertex provider pin, see its seed below).
 // 32000 = doc-recommended reasoning budget ceiling (batch processing is
 // advised above 32k). Ignored by adaptive-only Claude models (Opus 4.7+,
 // Sonnet 5+, Fable/Mythos 5) which use `effort` instead — see
@@ -181,30 +183,46 @@ var DEFAULT_API_PROVIDERS = [
         effort: 'medium'
     },
     {
-        // GPT-6.1 Sol (2026-09-30) replaces the gpt-6-sol OpenRouter default
-        // (untouched copies are renamed by loadApiProviders, core/130-indexeddb.js).
-        // 1.05M context, 128K max output (OpenRouter + developers.openai.com/
-        // api/docs/models/gpt-6.1-sol) — both covered by the global defaults.
-        // Effort low|medium|high|xhigh|max only: NO 'none'/'minimal'
-        // (isGpt6ReasoningRequiredModel below).
-        name: 'gpt-6.1-sol',
-        model: 'openai/gpt-6.1-sol',
+        // GPT-6.2 Sol (OpenRouter added 2026-11-17) replaces the gpt-6.1-sol
+        // OpenRouter default (untouched copies are renamed by loadApiProviders,
+        // core/130-indexeddb.js). Non-Pro Sol slot kept (Astra = flagship).
+        // 1.05M context, 128K max output on every endpoint (verified
+        // 2026-11-26 in openrouter.ai/api/v1/models/openai/gpt-6.2-sol/endpoints)
+        // — both covered by the global defaults. The API rejects effort
+        // 'none' (developers.openai.com/api/docs/models/gpt-6.2-sol) →
+        // isGpt6ReasoningRequiredModel below.
+        name: 'gpt-6.2-sol',
+        model: 'openai/gpt-6.2-sol',
         endpoint: 'https://openrouter.ai/api/v1/chat/completions',
         apiKey: '',
         effort: 'low'
     },
     {
-        // Gemini 3.8 Flash (Stable/GA, OpenRouter added 2026-09-02) replaces
-        // the Gemini 3.5 Flash default, now legacy per Google (untouched
-        // copies are renamed by loadApiProviders, core/130-indexeddb.js).
-        // 1M context. OpenRouter caps its completions at 65,536 tokens on
-        // every endpoint (verified 2026-10-07 in
-        // openrouter.ai/api/v1/models/google/gemini-3.8-flash/endpoints) —
-        // the global 64k default was chosen to fit under exactly this cap
-        name: 'Gemini 3.8 Flash',
-        model: 'google/gemini-3.8-flash',
+        // Gemini 4 Neon (OpenRouter added 2026-11-18; fast, mid-priced
+        // Gemini 4 coding/agentic model) replaces the Gemini 3.8 Flash
+        // default (untouched copies are renamed by loadApiProviders,
+        // core/130-indexeddb.js). 1,048,576 context, reasoning supported.
+        // Completion cap 943,718 on Vertex / AI Studio flex+priority but
+        // 65,536 on the plain google-ai-studio endpoint (verified 2026-11-26 in
+        // openrouter.ai/api/v1/models/google/gemini-4-neon/endpoints) — the
+        // global 64k default fits under that lowest cap, so no pin needed.
+        name: 'Gemini 4 Neon',
+        model: 'google/gemini-4-neon',
         endpoint: 'https://openrouter.ai/api/v1/chat/completions',
         apiKey: ''
+    },
+    {
+        // Gemini 4 Carbon (OpenRouter added 2026-11-10; frontier Gemini 4
+        // model). 1,048,576 context, reasoning supported. Its plain
+        // google-ai-studio endpoint caps completions at 32,768 (< the global
+        // 64k default, which would 400) while Vertex caps at 943,718 (verified
+        // 2026-11-26 in openrouter.ai/api/v1/models/google/gemini-4-carbon/
+        // endpoints) — so routing is pinned to Google Vertex (provider below).
+        name: 'Gemini 4 Carbon',
+        model: 'google/gemini-4-carbon',
+        endpoint: 'https://openrouter.ai/api/v1/chat/completions',
+        apiKey: '',
+        provider: 'google-vertex'
     },
     {
         // Opus 5.5 (Sept 2026, Claude Code 2.1.280+) — dateless pinned id, 1M
@@ -305,17 +323,22 @@ var DEFAULT_API_PROVIDERS = [
     // gpt-5.6-terra/-sol → gpt-6-sol and gpt-5.6-luna → gpt-6-luna migration.
     // Sept 30 2026: GPT-6.1 Sol supersedes the GPT-6 Sol seed (Codex's model
     // picker lists GPT-6.1-Sol as default, GPT-6-Sol as previous generation).
+    // Nov 26 2026: GPT-6.2 Astra/Sol supersede the GPT-6 Astra / GPT-6.1 Sol
+    // seeds (Codex bundled catalog codex-rs/models-manager/models.json lists
+    // gpt-6.2-sol priority 1 and gpt-6.2-astra priority 2; gpt-6.1-sol and
+    // gpt-6-astra are "Previous generation"). gpt-6-luna is still the newest
+    // Luna there, and no Pro slug is offered on the subscription.
     {
-        name: 'GPT-6 Astra (ChatGPT)',
-        model: 'gpt-6-astra',
+        name: 'GPT-6.2 Astra (ChatGPT)',
+        model: 'gpt-6.2-astra',
         endpoint: 'https://chatgpt.com/backend-api/codex/responses',
         apiKey: 'oauth',
         effort: 'high',
         isChatGPTOAuth: true
     },
     {
-        name: 'GPT-6.1 Sol (ChatGPT)',
-        model: 'gpt-6.1-sol',
+        name: 'GPT-6.2 Sol (ChatGPT)',
+        model: 'gpt-6.2-sol',
         endpoint: 'https://chatgpt.com/backend-api/codex/responses',
         apiKey: 'oauth',
         effort: 'high',
@@ -332,8 +355,10 @@ var DEFAULT_API_PROVIDERS = [
 ];
 
 // Shared slug predicate; callers scope the capability to ChatGPT subscription.
+// GPT-6 Astra and GPT-6.2 Astra (Codex catalog: low|medium|high|xhigh|max
+// [+ultra], no none). Exact slugs only — '-pro' variants are not assumed.
 function isChatGPTAstraModel(model) {
-    return String(model || '').trim().replace(/^[A-Za-z0-9_.-]+\//, '') === 'gpt-6-astra';
+    return /^gpt-6(?:\.2)?-astra$/.test(String(model || '').trim().replace(/^[A-Za-z0-9_.-]+\//, ''));
 }
 // GPT-6 Sol / Luna (2026-09-22): reasoning.effort none|low|medium(default)|
 // high|xhigh|max (developers.openai.com/api/docs/models/gpt-6-sol, gpt-6-luna).
@@ -344,19 +369,29 @@ function isChatGPTGpt6SolLunaModel(model) {
 }
 // GPT-6.1 Sol (2026-09-30): reasoning.effort low|medium(default)|high|xhigh|max;
 // 'none' and 'minimal' are NOT supported (developers.openai.com/api/docs/
-// models/gpt-6.1-sol). Exact slug only (the '-pro' variant is not assumed).
+// models/gpt-6.1-sol). Also matches GPT-6.2 Sol (2026-11-17), which has the
+// same effort set in Codex's catalog and rejects none — so the SW request
+// shaping (background.js) and the effort UI treat both alike.
+// Exact slugs only (the '-pro' variants are not assumed).
 function isChatGPTGpt61SolModel(model) {
-    return String(model || '').trim().replace(/^[A-Za-z0-9_.-]+\//, '') === 'gpt-6.1-sol';
+    return /^gpt-6\.[12]-sol$/.test(String(model || '').trim().replace(/^[A-Za-z0-9_.-]+\//, ''));
+}
+// GPT-6.2 Sol (2026-11-17): "The API rejects requests that set reasoning
+// effort to none" (developers.openai.com/api/docs/models/gpt-6.2-sol).
+// Exact slug only (the '-pro' variant is not assumed).
+function isGpt62SolModel(model) {
+    return String(model || '').trim().replace(/^[A-Za-z0-9_.-]+\//, '') === 'gpt-6.2-sol';
 }
 // GPT-6 models that cannot turn reasoning off: none/minimal → low, and the
 // thinking-off switch must not send none / enabled:false (Astra, GPT-6.1 Sol —
-// latest-model guide: "GPT-6 Astra and GPT-6.1 Sol do not support none").
+// latest-model guide: "GPT-6 Astra and GPT-6.1 Sol do not support none";
+// GPT-6.2 Sol rejects none too).
 function isGpt6ReasoningRequiredModel(model) {
-    return isChatGPTAstraModel(model) || isChatGPTGpt61SolModel(model);
+    return isChatGPTAstraModel(model) || isChatGPTGpt61SolModel(model) || isGpt62SolModel(model);
 }
 // Models whose Codex request keeps xhigh/max as-is (no legacy clamp to high).
 function chatGPTSupportsExtendedEffort(model) {
-    return isChatGPTAstraModel(model) || isChatGPTGpt61SolModel(model) || isChatGPTGpt6SolLunaModel(model);
+    return isChatGPTAstraModel(model) || isChatGPTGpt61SolModel(model) || isGpt62SolModel(model) || isChatGPTGpt6SolLunaModel(model);
 }
 
 // API providers (loaded from IndexedDB, initialized with defaults on first load)
@@ -367,9 +402,40 @@ function chatGPTSupportsExtendedEffort(model) {
 // after PR #824 removed the section (endpoints were inlined into providers).
 var DEFAULT_LLM_ENDPOINTS = [
     { id: 'openrouter', name: 'OpenRouter', url: 'https://openrouter.ai/api/v1/chat/completions', apiKey: '' },
-    { id: 'huggingface', name: 'Hugging Face', url: 'https://router.huggingface.co/v1/chat/completions', apiKey: '' }
+    { id: 'huggingface', name: 'Hugging Face', url: 'https://router.huggingface.co/v1/chat/completions', apiKey: '' },
+    // Local OpenAI-compatible server (LM Studio default port; Ollama :11434,
+    // vLLM, llama.cpp all serve /v1/chat/completions too). Inert until the user
+    // adds a model on it: endpoints are never probed or auto-selected.
+    { id: 'local', name: 'Local (OpenAI-compatible)', url: 'http://localhost:1234/v1/chat/completions', apiKey: '' }
 ];
 var llmEndpoints = [];
+
+// Complete a bare OpenAI-compatible base URL to its chat-completions route so
+// a local server works without the user knowing the path format:
+//   http://192.168.1.17:1234      -> http://192.168.1.17:1234/v1/chat/completions
+//   http://localhost:1234/v1(/)   -> http://localhost:1234/v1/chat/completions
+//   localhost:1234 / 10.0.0.5:8080 (no scheme, local host) -> http:// + the above
+// Anything else is returned unchanged: URLs already ending in /chat/completions,
+// any other path (/responses, /messages, /openai/deployments/...), query/hash
+// URLs, and the OpenRouter / Hugging Face / OAuth backends (OPENAI_URL_KEEP_HOSTS).
+var OPENAI_URL_KEEP_HOSTS = /(^|\.)(openrouter\.ai|huggingface\.co|chatgpt\.com|anthropic\.com|claude\.ai)$/i;
+function completeOpenAIChatUrl(url) {
+    var raw = String(url == null ? '' : url).trim();
+    if (!raw) return raw;
+    var src = raw;
+    if (src.indexOf('://') < 0 && /^(localhost|127\.\d+\.\d+\.\d+|0\.0\.0\.0|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|[a-z0-9-]+\.local)(:\d+)?(\/|$)/i.test(src)) {
+        src = 'http://' + src;
+    }
+    var parsed;
+    try { parsed = new URL(src); } catch (e) { return raw; }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return raw;
+    if (parsed.search || parsed.hash || OPENAI_URL_KEEP_HOSTS.test(parsed.hostname)) return raw;
+    var path = parsed.pathname.replace(/\/+$/, '');
+    var base = src.replace(/\/+$/, '');
+    if (path === '') return base + '/v1/chat/completions';
+    if (/\/v1$/i.test(path)) return base + '/chat/completions';
+    return src === raw ? raw : src;
+}
 
 function getLlmEndpointById(id) {
     if (!id) return null;
@@ -904,18 +970,22 @@ var PROVIDER_RENAMES = {
     // retired 2026-10-07)
     'Kimi K2.5': 'GLM 5.3',
     // Oct 7 2026: GLM 5.3 / Gemini 3.8 Flash supersede the GLM 5.2 /
-    // Gemini 3.5 Flash OpenRouter defaults
+    // Gemini 3.5 Flash OpenRouter defaults (Gemini targets chain-collapsed
+    // to 'Gemini 4 Neon': the Gemini 3.8 Flash seed retired 2026-11-26)
     'GLM 5.2': 'GLM 5.3',
-    'Gemini 3.5 Flash': 'Gemini 3.8 Flash',
-    // (gpt-5.2 / gpt-5.5 / gpt-5.6-sol chain-collapse straight to gpt-6.1-sol:
-    // the old gpt-5.5 / gpt-5.6-sol / gpt-6-sol targets no longer exist in the
+    'Gemini 3.5 Flash': 'Gemini 4 Neon',
+    // Nov 26 2026: Gemini 4 Neon supersedes the Gemini 3.8 Flash default
+    'Gemini 3.8 Flash': 'Gemini 4 Neon',
+    // (gpt-5.2 / gpt-5.5 / gpt-5.6-sol / gpt-6-sol chain-collapse straight to
+    // gpt-6.2-sol: the old intermediate targets no longer exist in the
     // defaults)
-    'gpt-5.2': 'gpt-6.1-sol',
-    'gpt-5.5': 'gpt-6.1-sol',
-    'gpt-5.6-sol': 'gpt-6.1-sol',
-    // Sept 30 2026: GPT-6.1 Sol supersedes the gpt-6-sol OpenRouter default
-    'gpt-6-sol': 'gpt-6.1-sol',
-    'Gemini 3 Flash Preview': 'Gemini 3.8 Flash',
+    'gpt-5.2': 'gpt-6.2-sol',
+    'gpt-5.5': 'gpt-6.2-sol',
+    'gpt-5.6-sol': 'gpt-6.2-sol',
+    'gpt-6-sol': 'gpt-6.2-sol',
+    // Nov 26 2026: GPT-6.2 Sol supersedes the gpt-6.1-sol OpenRouter default
+    'gpt-6.1-sol': 'gpt-6.2-sol',
+    'Gemini 3 Flash Preview': 'Gemini 4 Neon',
     'Sonnet 4.6 OAuth': 'Sonnet 5.5',
     // July 2026: the ' OAuth' suffix was dropped from the user-facing
     // default names (same providers, friendlier labels)
@@ -923,15 +993,20 @@ var PROVIDER_RENAMES = {
     'Sonnet 5 OAuth': 'Sonnet 5.5',
     // ChatGPT-OAuth seeds: the assumed gpt-5.1* slugs never existed on the
     // Codex backend for ChatGPT accounts
-    // (chain-collapsed to GPT-6.1 Sol: the GPT-6 Sol seed retired 2026-09-30)
-    'GPT-5.1 Codex': 'GPT-6.1 Sol (ChatGPT)',
-    'GPT-5.1': 'GPT-6.1 Sol (ChatGPT)',
+    // (chain-collapsed to GPT-6.2 Sol: the GPT-6 Sol seed retired 2026-09-30,
+    // the GPT-6.1 Sol seed 2026-11-26)
+    'GPT-5.1 Codex': 'GPT-6.2 Sol (ChatGPT)',
+    'GPT-5.1': 'GPT-6.2 Sol (ChatGPT)',
     // Sept 2026: GPT-6 Sol/Luna supersede the GPT-5.6 seeds; Terra has no
     // GPT-6 successor and folds into Sol (Codex's own migration target)
-    'GPT-5.6 Sol (ChatGPT)': 'GPT-6.1 Sol (ChatGPT)',
-    'GPT-5.6 Terra (ChatGPT)': 'GPT-6.1 Sol (ChatGPT)',
+    'GPT-5.6 Sol (ChatGPT)': 'GPT-6.2 Sol (ChatGPT)',
+    'GPT-5.6 Terra (ChatGPT)': 'GPT-6.2 Sol (ChatGPT)',
     // Sept 30 2026: GPT-6.1 Sol supersedes the GPT-6 Sol seed
-    'GPT-6 Sol (ChatGPT)': 'GPT-6.1 Sol (ChatGPT)',
+    'GPT-6 Sol (ChatGPT)': 'GPT-6.2 Sol (ChatGPT)',
+    // Nov 26 2026: GPT-6.2 Sol / GPT-6.2 Astra supersede the GPT-6.1 Sol /
+    // GPT-6 Astra seeds (Codex bundled catalog)
+    'GPT-6.1 Sol (ChatGPT)': 'GPT-6.2 Sol (ChatGPT)',
+    'GPT-6 Astra (ChatGPT)': 'GPT-6.2 Astra (ChatGPT)',
     'GPT-5.6 Luna (ChatGPT)': 'GPT-6 Luna (ChatGPT)'
 };
 

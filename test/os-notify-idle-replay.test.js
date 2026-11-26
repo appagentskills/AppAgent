@@ -53,19 +53,55 @@ describe('IDLE-REPLAY: missed OS notifications fire when the user goes idle', fu
         env.idle.fire('locked');
         env.idle.fire('active');
         env.idle.fire('idle');
-        assert.strictEqual(env.notes.length, 1, 'once per item, not per idle period');
+        assert.strictEqual(env.notes.length, 1, 'same idle burst (inside the remind gap): no second toast');
         assert.strictEqual(p.approvalNotificationQueue[0].osNotified, true);
     }, { tags: ['unit'], timeout: 4000 });
 
-    test('fan-out copy (osEligible false), already-notified and dismissed approvals never replay', async function() {
+    test('IDLE-REMIND: approval still pending behind the Keep-awake popup reminds once per idle period', async function() {
+        var env = makeIdleReplayEnv();
+        var p = await loadPanel(env, { c1: { id: 'c1', title: 'Deploy', messages: [] } });
+        // Already OS-notified at arrival (user was in another window).
+        p.approvalNotificationQueue.push(approvalEntry({ osNotified: true }));
+        p.noteOsNotified('approval:c1:tc1');
+        env.idle.fire('idle');
+        assert.deepStrictEqual(env.notes, [{ title: 'Tool needs approval', message: 'Updating incident \u2014 Deploy', chatId: 'c1' }]);
+        env.idle.fire('active'); env.idle.fire('idle');
+        assert.strictEqual(env.notes.length, 1, 'deduped inside the gap (another panel / same idle event)');
+        // Next real idle period (>= 15 s later): age the remind marker past the gap.
+        var st = JSON.parse(env.store.appagentOsNotified);
+        st['remind:approval:c1:tc1'] -= 20000;
+        env.store.appagentOsNotified = JSON.stringify(st);
+        p._osNotifiedMem['remind:approval:c1:tc1'] -= 20000;
+        env.idle.fire('active'); env.idle.fire('idle');
+        assert.strictEqual(env.notes.length, 2, 'one reminder per idle period');
+        env.idle.fire('locked');
+        assert.strictEqual(env.notes.length, 2, 'locked never reminds');
+    }, { tags: ['unit'], timeout: 4000 });
+
+    test('IDLE-REMIND: two panels with the same pending approval -> exactly one reminder', async function() {
+        var env = makeIdleReplayEnv();
+        var chats = { c1: { id: 'c1', title: 'Deploy', messages: [] } };
+        var a = await loadPanel(env, chats);
+        var b = await loadPanel(env, chats);
+        a.noteOsNotified('approval:c1:tc1');
+        a.approvalNotificationQueue.push(approvalEntry({ osNotified: true }));
+        b.approvalNotificationQueue.push(approvalEntry({ osEligible: false }));
+        env.idle.fire('idle');
+        assert.strictEqual(env.notes.length, 1);
+    }, { tags: ['unit'], timeout: 4000 });
+
+    test('fan-out copy (osEligible false), already-notified and dismissed approvals never replay on locked; dismissed never reminds', async function() {
         var env = makeIdleReplayEnv();
         var p = await loadPanel(env, {});
         p.approvalNotificationQueue.push(approvalEntry({ osEligible: false }));
         p.approvalNotificationQueue.push(approvalEntry({ toolCallId: 'tc2', approvalIndex: 4, osNotified: true }));
         p.approvalNotificationQueue.push(approvalEntry({ toolCallId: 'tc3', approvalIndex: 5 }));
         p._dismissedApprovalKeys['c1:5'] = true;
-        env.idle.fire('idle');
+        env.idle.fire('locked');
         assert.deepStrictEqual(env.notes, []);
+        env.idle.fire('active'); env.idle.fire('idle');
+        assert.strictEqual(env.notes.length, 1, 'idle reminds the two live approvals in one coalesced toast');
+        assert.deepStrictEqual(env.notes[0].message.split('\n').length, 2, 'dismissed approval excluded');
     }, { tags: ['unit'], timeout: 4000 });
 
     test('unseen bell replays; one coalesced notification lists approvals first, then bells', async function() {

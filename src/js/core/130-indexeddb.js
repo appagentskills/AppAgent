@@ -2843,15 +2843,32 @@ function inlineLegacyEndpointProviders(providers, endpoints, canonicalEndpoints)
     // endpoint edit re-syncs it (saveLlmEndpointFromModal matches strictly on
     // p.endpointId === endpoint.id); deleting the reference orphaned the row.
     var canonicalIds = {};
+    var canonicalById = {};
     (canonicalEndpoints || []).forEach(function(ep) {
         if (ep && typeof ep === 'object' && ep.id !== undefined && ep.id !== null && ep.id !== '') {
             canonicalIds[String(ep.id)] = true;
+            canonicalById[String(ep.id)] = ep;
         }
     });
     var changed = false;
     var result = (providers || []).map(function(provider) {
         if (!provider || !provider.endpointId) return provider;
+        // A provider referencing a LIVE endpoint (Settings → LLM Endpoints, the
+        // settings 'llmEndpoints' row) syncs from that record, never from the
+        // frozen legacy store: endpoint edits only write the settings row, so
+        // the legacy store keeps the ORIGINAL url (e.g. http://localhost:8000/…)
+        // and inlining it here reverted every edited endpoint on each load.
+        // Also covers an endpointId that hits the legacy row by its name /
+        // endpointId alias: resolve to that row's canonical id first.
         var endpoint = byId[String(provider.endpointId)];
+        var live = canonicalById[String(provider.endpointId)]
+            || (endpoint && endpoint.id !== undefined && endpoint.id !== null ? canonicalById[String(endpoint.id)] : null);
+        if (live && live.url) {
+            var liveKey = live.apiKey || '';
+            if (String(provider.endpointId) === String(live.id) && provider.endpoint === live.url && (provider.apiKey || '') === liveKey) return provider;
+            changed = true;
+            return Object.assign({}, provider, { endpointId: live.id, endpoint: live.url, apiKey: liveKey });
+        }
         if (!endpoint) return provider; // unmatched rows remain byte-for-byte intact
         var inlined = Object.assign({}, provider);
         if (Object.prototype.hasOwnProperty.call(endpoint, 'endpoint')) inlined.endpoint = endpoint.endpoint;
@@ -2924,9 +2941,9 @@ async function loadApiProviders() {
                     if (legacyInline.changed) await saveAllApiProviders();
                     // One-shot migration for renamed/removed/retuned defaults.
                     // July 2026 alignment: Kimi K2.5 → GLM 5.2 (now → GLM 5.3), sonnet-4.6 →
-                    // sonnet-5, gpt-5.2 → gpt-6.1-sol (chain-collapsed through the
-                    // retired gpt-5.5 / gpt-5.6-sol / gpt-6-sol defaults), Gemini 3 Flash Preview →
-                    // Gemini 3.5 Flash (now → Gemini 3.8 Flash), Sonnet 4.6 OAuth → Sonnet 5 (now → Sonnet 5.5), and the
+                    // sonnet-5, gpt-5.2 → gpt-6.2-sol (chain-collapsed through the
+                    // retired gpt-5.5 / gpt-5.6-sol / gpt-6-sol / gpt-6.1-sol defaults), Gemini 3 Flash Preview →
+                    // Gemini 3.5 Flash (now → Gemini 4 Neon), Sonnet 4.6 OAuth → Sonnet 5 (now → Sonnet 5.5), and the
                     // ' OAuth' name suffix was dropped (Opus-4-8 OAuth → Opus-4-8,
                     // Sonnet 5 OAuth → Sonnet 5); the
                     // opus-4.8 (OpenRouter), haiku-4.5 and Proxy defaults were
@@ -2956,13 +2973,13 @@ async function loadApiProviders() {
                         { to: 'sonnet-5.5', from: { name: 'sonnet-4.5', apiKey: '', model: 'anthropic/claude-sonnet-4.5', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 200000, maxTokens: 64000, thinkingBudget: 40000 } },
                         { to: 'sonnet-5.5', from: { name: 'sonnet-4.6', apiKey: '', model: 'anthropic/claude-sonnet-4.6', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 200000, maxTokens: 64000, effort: 'high' } },
                         { to: 'GLM 5.3', from: { name: 'Kimi K2.5', apiKey: '', model: 'moonshotai/kimi-k2.5', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 262000, maxTokens: 64000, thinkingBudget: 40000, provider: 'moonshotai' } },
-                        { to: 'gpt-6.1-sol', from: { name: 'gpt-5.2', apiKey: '', model: 'openai/gpt-5.2', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 400000, maxTokens: 128000, effort: 'low' } },
-                        { to: 'gpt-6.1-sol', from: { name: 'gpt-5.5', apiKey: '', model: 'openai/gpt-5.5', endpoint: 'https://openrouter.ai/api/v1/chat/completions', effort: 'low' } },
+                        { to: 'gpt-6.2-sol', from: { name: 'gpt-5.2', apiKey: '', model: 'openai/gpt-5.2', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 400000, maxTokens: 128000, effort: 'low' } },
+                        { to: 'gpt-6.2-sol', from: { name: 'gpt-5.5', apiKey: '', model: 'openai/gpt-5.5', endpoint: 'https://openrouter.ai/api/v1/chat/completions', effort: 'low' } },
                         // Sept 2026: GPT-6 Sol supersedes the gpt-5.6-sol OpenRouter default
-                        { to: 'gpt-6.1-sol', from: { name: 'gpt-5.6-sol', model: 'openai/gpt-5.6-sol', endpoint: 'https://openrouter.ai/api/v1/chat/completions', apiKey: '', effort: 'low' } },
+                        { to: 'gpt-6.2-sol', from: { name: 'gpt-5.6-sol', model: 'openai/gpt-5.6-sol', endpoint: 'https://openrouter.ai/api/v1/chat/completions', apiKey: '', effort: 'low' } },
                         // Sept 30 2026: GPT-6.1 Sol supersedes the gpt-6-sol OpenRouter default
-                        { to: 'gpt-6.1-sol', from: { name: 'gpt-6-sol', model: 'openai/gpt-6-sol', endpoint: 'https://openrouter.ai/api/v1/chat/completions', apiKey: '', effort: 'low' } },
-                        { to: 'Gemini 3.8 Flash', from: { name: 'Gemini 3 Flash Preview', apiKey: '', model: 'google/gemini-3-flash-preview', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 1000000, maxTokens: 64000, thinkingBudget: 50000 } },
+                        { to: 'gpt-6.2-sol', from: { name: 'gpt-6-sol', model: 'openai/gpt-6-sol', endpoint: 'https://openrouter.ai/api/v1/chat/completions', apiKey: '', effort: 'low' } },
+                        { to: 'Gemini 4 Neon', from: { name: 'Gemini 3 Flash Preview', apiKey: '', model: 'google/gemini-3-flash-preview', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 1000000, maxTokens: 64000, thinkingBudget: 50000 } },
                         { to: 'Sonnet 5.5', from: { name: 'Sonnet 4.6 OAuth', model: 'claude-sonnet-4-6', endpoint: 'https://api.anthropic.com/v1/messages', apiKey: 'oauth', maxTokens: 100000, context_length: 200000, effort: 'high', isClaudeOAuth: true } },
                         // OAuth-suffix drop — same providers, friendlier names.
                         // Two Opus snapshots: effort was 'high' before the xhigh
@@ -2976,16 +2993,21 @@ async function loadApiProviders() {
                         // (gpt-5.1-codex / gpt-5.1) that the Codex backend does
                         // not serve to ChatGPT accounts — retarget onto the
                         // GPT-6 slugs the live catalog actually advertises.
-                        { to: 'GPT-6.1 Sol (ChatGPT)', from: { name: 'GPT-5.1 Codex', model: 'gpt-5.1-codex', endpoint: 'https://chatgpt.com/backend-api/codex/responses', apiKey: 'oauth', effort: 'high', isChatGPTOAuth: true } },
-                        { to: 'GPT-6.1 Sol (ChatGPT)', from: { name: 'GPT-5.1', model: 'gpt-5.1', endpoint: 'https://chatgpt.com/backend-api/codex/responses', apiKey: 'oauth', effort: 'medium', isChatGPTOAuth: true } },
+                        { to: 'GPT-6.2 Sol (ChatGPT)', from: { name: 'GPT-5.1 Codex', model: 'gpt-5.1-codex', endpoint: 'https://chatgpt.com/backend-api/codex/responses', apiKey: 'oauth', effort: 'high', isChatGPTOAuth: true } },
+                        { to: 'GPT-6.2 Sol (ChatGPT)', from: { name: 'GPT-5.1', model: 'gpt-5.1', endpoint: 'https://chatgpt.com/backend-api/codex/responses', apiKey: 'oauth', effort: 'medium', isChatGPTOAuth: true } },
                         // Sept 22 2026: GPT-6 Sol/Luna supersede the GPT-5.6 seeds;
                         // GPT-5.6 Terra has no GPT-6 successor and folds into
                         // Sol (same target Codex's own model migration uses).
-                        { to: 'GPT-6.1 Sol (ChatGPT)', from: { name: 'GPT-5.6 Sol (ChatGPT)', model: 'gpt-5.6-sol', endpoint: 'https://chatgpt.com/backend-api/codex/responses', apiKey: 'oauth', effort: 'high', isChatGPTOAuth: true } },
-                        { to: 'GPT-6.1 Sol (ChatGPT)', from: { name: 'GPT-5.6 Terra (ChatGPT)', model: 'gpt-5.6-terra', endpoint: 'https://chatgpt.com/backend-api/codex/responses', apiKey: 'oauth', effort: 'medium', isChatGPTOAuth: true } },
+                        { to: 'GPT-6.2 Sol (ChatGPT)', from: { name: 'GPT-5.6 Sol (ChatGPT)', model: 'gpt-5.6-sol', endpoint: 'https://chatgpt.com/backend-api/codex/responses', apiKey: 'oauth', effort: 'high', isChatGPTOAuth: true } },
+                        { to: 'GPT-6.2 Sol (ChatGPT)', from: { name: 'GPT-5.6 Terra (ChatGPT)', model: 'gpt-5.6-terra', endpoint: 'https://chatgpt.com/backend-api/codex/responses', apiKey: 'oauth', effort: 'medium', isChatGPTOAuth: true } },
                         // Sept 30 2026: GPT-6.1 Sol supersedes the GPT-6 Sol seed
                         // (5.6 Sol/Terra rows above chain-collapse to it too).
-                        { to: 'GPT-6.1 Sol (ChatGPT)', from: { name: 'GPT-6 Sol (ChatGPT)', model: 'gpt-6-sol', endpoint: 'https://chatgpt.com/backend-api/codex/responses', apiKey: 'oauth', effort: 'high', isChatGPTOAuth: true } },
+                        { to: 'GPT-6.2 Sol (ChatGPT)', from: { name: 'GPT-6 Sol (ChatGPT)', model: 'gpt-6-sol', endpoint: 'https://chatgpt.com/backend-api/codex/responses', apiKey: 'oauth', effort: 'high', isChatGPTOAuth: true } },
+                        // Nov 26 2026: GPT-6.2 Sol / Astra supersede the GPT-6.1 Sol /
+                        // GPT-6 Astra seeds (Codex bundled models.json; rows above
+                        // chain-collapse to GPT-6.2 Sol).
+                        { to: 'GPT-6.2 Sol (ChatGPT)', from: { name: 'GPT-6.1 Sol (ChatGPT)', model: 'gpt-6.1-sol', endpoint: 'https://chatgpt.com/backend-api/codex/responses', apiKey: 'oauth', effort: 'high', isChatGPTOAuth: true } },
+                        { to: 'GPT-6.2 Astra (ChatGPT)', from: { name: 'GPT-6 Astra (ChatGPT)', model: 'gpt-6-astra', endpoint: 'https://chatgpt.com/backend-api/codex/responses', apiKey: 'oauth', effort: 'high', isChatGPTOAuth: true } },
                         { to: 'GPT-6 Luna (ChatGPT)', from: { name: 'GPT-5.6 Luna (ChatGPT)', model: 'gpt-5.6-luna', endpoint: 'https://chatgpt.com/backend-api/codex/responses', apiKey: 'oauth', effort: 'medium', isChatGPTOAuth: true } },
                         // Sept 2026 model-list tidy-up: Opus 5 and Opus-4-8 retire
                         // into Opus 5.5, Fable 5 into Fable 5.1 (chain-collapsed
@@ -3018,18 +3040,27 @@ async function loadApiProviders() {
                         // endpointId-era G2–G4/F2–F4 are expanded below.
                         { to: 'GLM 5.3', from: { name: 'GLM 5.2', model: 'z-ai/glm-5.2', endpoint: 'https://openrouter.ai/api/v1/chat/completions', apiKey: '', provider: 'z-ai' } },
                         { to: 'GLM 5.3', from: { name: 'GLM 5.2', apiKey: '', model: 'z-ai/glm-5.2', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 1048576, maxTokens: 64000, thinkingBudget: 40000, provider: 'z-ai' } },
-                        { to: 'Gemini 3.8 Flash', from: { name: 'Gemini 3.5 Flash', model: 'google/gemini-3.5-flash', endpoint: 'https://openrouter.ai/api/v1/chat/completions', apiKey: '' } },
-                        { to: 'Gemini 3.8 Flash', from: { name: 'Gemini 3.5 Flash', apiKey: '', model: 'google/gemini-3.5-flash', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 1048576, maxTokens: 64000, thinkingBudget: 50000 } }
+                        { to: 'Gemini 4 Neon', from: { name: 'Gemini 3.5 Flash', model: 'google/gemini-3.5-flash', endpoint: 'https://openrouter.ai/api/v1/chat/completions', apiKey: '' } },
+                        { to: 'Gemini 4 Neon', from: { name: 'Gemini 3.5 Flash', apiKey: '', model: 'google/gemini-3.5-flash', endpoint: 'https://openrouter.ai/api/v1/chat/completions', context_length: 1048576, maxTokens: 64000, thinkingBudget: 50000 } },
+                        // Nov 26 2026: Gemini 4 Neon / GPT-6.2 Sol supersede the
+                        // Gemini 3.8 Flash / gpt-6.1-sol OpenRouter defaults (one
+                        // inline seed shape each, 030-config.js history). The
+                        // older Flash / gpt rows above chain-collapse to them too.
+                        { to: 'Gemini 4 Neon', from: { name: 'Gemini 3.8 Flash', model: 'google/gemini-3.8-flash', endpoint: 'https://openrouter.ai/api/v1/chat/completions', apiKey: '' } },
+                        { to: 'gpt-6.2-sol', from: { name: 'gpt-6.1-sol', model: 'openai/gpt-6.1-sol', endpoint: 'https://openrouter.ai/api/v1/chat/completions', apiKey: '', effort: 'low' } }
                     ].concat((function() {
                         // endpointId-era sonnet-5 seeds (S2 80ea667→a60322e, S3
                         // 759b9a3, S4 8aaa494→a1a0627). inlineLegacyEndpointProviders
-                        // (above) leaves each in one of THREE stored forms:
+                        // (above, plus pre-live-sync builds) leaves each in one of
+                        // FOUR stored forms:
                         //   (a) unmatched      — raw endpointId:'openrouter'
                         //   (b) matched, canonical id kept — + url/endpoint/apiKey
                         //   (c) matched, id dropped        — url/endpoint/apiKey only
+                        //   (d) live-synced    — + endpoint/apiKey, NO url key
+                        //       (current builds: 'openrouter' is a live endpoint)
                         // The legacy 'openrouter' endpoint is {url: OR, apiKey: ''}
                         // (030-config.js). apiKey:'' is listed so a user key
-                        // (renames ignore the apiKey VALUE) still matches (b)/(c).
+                        // (renames ignore the apiKey VALUE) still matches (b)/(c)/(d).
                         var OR_URL = 'https://openrouter.ai/api/v1/chat/completions';
                         // Same three vintages for GLM 5.2 (G2–G4) and Gemini 3.5
                         // Flash (F2–F4), which shipped in the same commits.
@@ -3040,15 +3071,20 @@ async function loadApiProviders() {
                             ['GLM 5.3', { name: 'GLM 5.2', model: 'z-ai/glm-5.2', endpointId: 'openrouter', context_length: 1048576, maxTokens: 64000, thinkingBudget: 40000, provider: 'z-ai' }],
                             ['GLM 5.3', { name: 'GLM 5.2', model: 'z-ai/glm-5.2', endpointId: 'openrouter', maxTokens: 64000, thinkingBudget: 40000, provider: 'z-ai' }],
                             ['GLM 5.3', { name: 'GLM 5.2', model: 'z-ai/glm-5.2', endpointId: 'openrouter', provider: 'z-ai' }],
-                            ['Gemini 3.8 Flash', { name: 'Gemini 3.5 Flash', model: 'google/gemini-3.5-flash', endpointId: 'openrouter', context_length: 1048576, maxTokens: 64000, thinkingBudget: 50000 }],
-                            ['Gemini 3.8 Flash', { name: 'Gemini 3.5 Flash', model: 'google/gemini-3.5-flash', endpointId: 'openrouter', maxTokens: 64000, thinkingBudget: 50000 }],
-                            ['Gemini 3.8 Flash', { name: 'Gemini 3.5 Flash', model: 'google/gemini-3.5-flash', endpointId: 'openrouter' }]
+                            ['Gemini 4 Neon', { name: 'Gemini 3.5 Flash', model: 'google/gemini-3.5-flash', endpointId: 'openrouter', context_length: 1048576, maxTokens: 64000, thinkingBudget: 50000 }],
+                            ['Gemini 4 Neon', { name: 'Gemini 3.5 Flash', model: 'google/gemini-3.5-flash', endpointId: 'openrouter', maxTokens: 64000, thinkingBudget: 50000 }],
+                            ['Gemini 4 Neon', { name: 'Gemini 3.5 Flash', model: 'google/gemini-3.5-flash', endpointId: 'openrouter' }]
                         ].reduce(function(rows, pair) {
                             var to = pair[0], seed = pair[1];
                             var inlined = Object.assign({}, seed, { url: OR_URL, endpoint: OR_URL, apiKey: '' });
                             var dropped = Object.assign({}, inlined);
                             delete dropped.endpointId;
-                            return rows.concat([seed, inlined, dropped].map(function(from) {
+                            // (d) live-synced: endpointId resolves to the live
+                            // 'openrouter' endpoint (DEFAULT_LLM_ENDPOINTS), so
+                            // inlineLegacyEndpointProviders adds endpoint/apiKey
+                            // but no url key.
+                            var liveSynced = Object.assign({}, seed, { endpoint: OR_URL, apiKey: '' });
+                            return rows.concat([seed, inlined, dropped, liveSynced].map(function(from) {
                                 return { to: to, from: from };
                             }));
                         }, []);

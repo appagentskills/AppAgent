@@ -159,7 +159,7 @@ function renderSnackbar(entry) {
 // offer the fix inline. Returns 'claude' | 'chatgpt' | null.
 function _snackbarLoginProvider(message) {
     var m = String(message || '');
-    if (/not logged in to claude/i.test(m)) return 'claude';
+    if (/not logged in to claude|missing_client_attestation|interactive browser sign-in/i.test(m)) return 'claude';
     if (/not logged in to chatgpt|log in to chatgpt/i.test(m)) return 'chatgpt';
     return null;
 }
@@ -357,6 +357,16 @@ function shouldSendOsNotification() {
 var OS_NOTIFIED_STORE_KEY = 'appagentOsNotified';
 var OS_NOTIFIED_TTL_MS = 24 * 60 * 60 * 1000;
 var OS_NOTIFIED_FINISH_SLACK_MS = 5000; // a finish marker covers a bell stamped within this window
+// IDLE-REMIND: the replay above is once-per-item, so an approval that WAS
+// OS-notified (user in another window at arrival) or that this panel only got
+// as a fan-out copy (osEligible false) stayed silent when the Keep-awake popup
+// appeared 15 s later with the approval still waiting behind it. On every
+// transition to 'idle' (the popup moment) a still-pending approval now also
+// gets ONE reminder notification (Sound mode = chime, gated in background.js).
+// Dedup: a 'remind:<key>' marker in the shared store; panels seeing the SAME
+// idle event fall inside the gap, while two distinct idle periods are always
+// >= 15 s apart (chrome.idle minimum), so each idle period reminds once.
+var OS_IDLE_REMIND_GAP_MS = 10000;
 var _osNotifiedMem = {};
 function _readOsNotifiedStore() {
     try {
@@ -390,17 +400,27 @@ function _osChatTitle(chatId) {
     if (!c || !c.title) return t('Chat');
     return c.title === 'New Chat' ? t('New Chat') : c.title;
 }
-function replayMissedOsNotifications() {
+function replayMissedOsNotifications(opts) {
+    var remind = !!(opts && opts.remind);
     var items = [];
     try {
         var pending = Array.isArray(currentApprovalNotification) ? currentApprovalNotification.slice() : [];
         pending = pending.concat(approvalNotificationQueue);
+        var seenKeys = {};
         pending.forEach(function(n) {
-            if (!n || !n.osEligible || n.osNotified) return;
+            if (!n) return;
             if (_dismissedApprovalKeys[n.chatId + ':' + n.approvalIndex]) return;
             var key = _approvalOsKey(n);
-            if (_osNotifiedAt(key)) { n.osNotified = true; return; }
-            items.push({ key: key, rank: 0, chatId: n.chatId, entry: n,
+            if (seenKeys[key]) return;
+            seenKeys[key] = true;
+            var missed = n.osEligible && !n.osNotified;
+            if (missed && _osNotifiedAt(key)) { n.osNotified = true; missed = false; }
+            if (!missed) {
+                // IDLE-REMIND: already notified / fan-out copy -> reminder only.
+                if (!remind) return;
+                if (Date.now() - _osNotifiedAt('remind:' + key) < OS_IDLE_REMIND_GAP_MS) return;
+            }
+            items.push({ key: key, remindKey: 'remind:' + key, rank: 0, chatId: n.chatId, entry: n,
                 title: t('Tool needs approval'),
                 message: (n.statusMessage || t(n.toolName)) + ' — ' + (n.chatTitle === 'New Chat' ? t('New Chat') : n.chatTitle) });
         });
@@ -417,7 +437,11 @@ function replayMissedOsNotifications() {
     } catch (e) {}
     if (!items.length) return 0;
     items.sort(function(a, b) { return a.rank - b.rank; });
-    items.forEach(function(it) { noteOsNotified(it.key); if (it.entry) it.entry.osNotified = true; });
+    items.forEach(function(it) {
+        noteOsNotified(it.key);
+        if (it.remindKey) noteOsNotified(it.remindKey);
+        if (it.entry && it.entry.osEligible) it.entry.osNotified = true;
+    });
     var lines = items.slice(0, 4).map(function(it) { return it.message; });
     if (items.length > 4) lines.push('…');
     try {
@@ -426,7 +450,9 @@ function replayMissedOsNotifications() {
     return items.length;
 }
 subscribeOsIdleState(function(state) {
-    if (state === 'idle' || state === 'locked') replayMissedOsNotifications();
+    // 'idle' = the Keep-awake popup moment: also remind about approvals still
+    // waiting (IDLE-REMIND). 'locked' only replays never-notified items.
+    if (state === 'idle' || state === 'locked') replayMissedOsNotifications({ remind: state === 'idle' });
 });
 
 // Show notification for tool approval with action button to go to the chat

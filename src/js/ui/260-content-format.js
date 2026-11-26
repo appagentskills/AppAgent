@@ -72,6 +72,12 @@ function formatMetrics(metrics) {
             tokenParts.push(t('Total: {tokens}', {tokens: i18nFormatNumber(total)}));
         }
         parts.push('<span class="stats-icon">' + UI_ICONS.stats + '</span> ' + tokenParts.join(' | '));
+    } else if (metrics.est_input_tokens || metrics.est_output_tokens) {
+        // Provider returned no usage (e.g. LM Studio): our own estimate, "~".
+        var estParts = [];
+        if (metrics.est_input_tokens) estParts.push(t('In: {tokens}', {tokens: '~' + i18nFormatNumber(metrics.est_input_tokens)}));
+        if (metrics.est_output_tokens) estParts.push(t('Out: {tokens}', {tokens: '~' + i18nFormatNumber(metrics.est_output_tokens)}));
+        parts.push('<span class="stats-icon">' + UI_ICONS.stats + '</span> ' + estParts.join(' | '));
     }
     
     // Cache info for Anthropic
@@ -102,6 +108,14 @@ function formatMetrics(metrics) {
         if (metrics.output_tokens && metrics.duration > 0) {
             var tps = i18nFormatNumber(metrics.output_tokens / (metrics.duration / 1000), {minimumFractionDigits: 1, maximumFractionDigits: 1});
             parts.push('<span class="stats-icon">' + UI_ICONS.stats + '</span>' + t('{rate} tok/s', {rate: tps}));
+        } else if (!metrics.output_tokens && metrics.est_output_tokens) {
+            // Estimated output over generation time (from the first token when known).
+            var genMs = metrics.duration;
+            if (!isAggregate && metrics.firstTokenTime && metrics.endTime > metrics.firstTokenTime) genMs = metrics.endTime - metrics.firstTokenTime;
+            if (genMs > 0) {
+                var estTps = i18nFormatNumber(metrics.est_output_tokens / (genMs / 1000), {minimumFractionDigits: 1, maximumFractionDigits: 1});
+                parts.push('<span class="stats-icon">' + UI_ICONS.stats + '</span>' + t('{rate} tok/s', {rate: '~' + estTps}));
+            }
         }
     }
     

@@ -674,7 +674,35 @@ function changeProvider(providerId) {
 
 function initClaudeOAuth() {
     chrome.runtime.onMessage.addListener(function(msg) {
-        if (msg.type === 'claude-oauth-updated') updateClaudeOAuthStatus();
+        if (!msg) return;
+        if (msg.type === 'claude-oauth-updated') {
+            var hadModal = !!document.getElementById('claude-browser-modal');
+            updateClaudeOAuthStatus();
+            if (msg.error) {
+                _claudeLoginGeneration++;
+                closeClaudeBrowserModal();
+            } else if (msg.claudeOAuth) {
+                _claudeLoginGeneration++;
+                closeClaudeBrowserModal();
+                if (hadModal) {
+                    try { showSnackbar(t('Logged in to Claude Subscription'), 'success'); } catch (e) {}
+                }
+            } else {
+                _claudeLoginGeneration++;
+                closeClaudeBrowserModal();
+            }
+        } else if (msg.type === 'claude-oauth-browser-status') {
+            if (msg.pending === false) {
+                _claudeLoginGeneration++;
+                closeClaudeBrowserModal();
+                updateClaudeOAuthStatus();
+                if (msg.error) {
+                    try { showSnackbar(msg.error, 'error'); } catch (e) {}
+                }
+            } else if (msg.pending === true) {
+                updateClaudeOAuthStatus();
+            }
+        }
     });
 
     updateClaudeOAuthStatus();
@@ -702,6 +730,9 @@ function updateClaudeOAuthStatus() {
         }
         if (response.loggedIn && !response.expired) {
             setLLMConnectionStatus('connected');
+        } else if (response.pending) {
+            setLLMConnectionStatus('pending');
+            if (response.method === 'browser') showClaudeBrowserModal(response);
         } else {
             setLLMConnectionStatus('disconnected');
         }
@@ -1072,7 +1103,11 @@ function toggleMenuModelSection(hdr) {
 // a single click.
 function toggleModelMenu(event) {
     if (event && event.type === 'keydown' && event.key !== 'Enter' && event.key !== ' ') return;
-    if (event && event.target && event.target.closest && event.target.closest('.model-login-btn')) return;
+    // The Connect button owns its clicks/keys. The usage segment (.credits-display)
+    // is plain text: a click on it opens this menu, whose top section shows the usage detail.
+    var _p = (event && event.composedPath) ? event.composedPath() : [];
+    if (_p.some(function(n) { return n && n.classList && n.classList.contains('model-login-btn'); })) return;
+    if (!_p.length && event && event.target && event.target.closest && event.target.closest('.model-login-btn')) return;
     if (event) { event.stopPropagation(); event.preventDefault(); }
     var existing = document.getElementById('model-menu');
     if (existing) { existing.remove(); document.removeEventListener('click', _closeModelMenuOnOutside); if (typeof syncHeaderMenuExpanded === 'function') syncHeaderMenuExpanded(); return; }
@@ -1085,7 +1120,11 @@ function toggleModelMenu(event) {
     menu.id = 'model-menu';
     menu.className = 'header-menu model-menu';
 
-    var html = '<div class="model-menu-section-title menu-section-title"><span class="section-icon">' + UI_ICONS.sparkle + '</span>' + escapeHtml(t('Reasoning effort')) + '</div>';
+    // Usage detail (bars / resets / billing link) at the top; hidden when the
+    // current provider has no usage data. Filled in place by refreshModelMenuUsage.
+    var usageHtml = (typeof buildModelMenuUsageHtml === 'function') ? buildModelMenuUsageHtml() : '';
+    var html = '<div class="model-menu-usage" id="model-menu-usage"' + (usageHtml ? '' : ' style="display:none"') + '>' + usageHtml + '</div>';
+    html += '<div class="model-menu-section-title menu-section-title"><span class="section-icon">' + UI_ICONS.sparkle + '</span>' + escapeHtml(t('Reasoning effort')) + '</div>';
     var defEffort = _providerDefaultEffort(provider);
     var curEffort = (provider && provider.effort) || defEffort;
     if (provider && provider.isChatGPTOAuth && isGpt6ReasoningRequiredModel(provider.model) && /^(none|minimal)$/i.test(curEffort)) curEffort = 'low';
@@ -1151,6 +1190,17 @@ function toggleModelMenu(event) {
     // A keyboard-opened popup starts at its first native control, not at the
     // end of the page's tab order. Mouse opening keeps the existing behavior.
     if (event && event.type === 'keydown') menu.querySelector('input, button, [tabindex="0"]').focus();
+
+    // Refresh usage like the old usage-segment click did, without blocking the
+    // open; the usage section re-renders in place when the data lands.
+    if (typeof refreshClaudeOAuthUsage === 'function') { try { refreshClaudeOAuthUsage(true); } catch (e) {} }
+    if (typeof fetchCredits === 'function') {
+        try {
+            Promise.resolve(fetchCredits()).then(function() {
+                if (typeof refreshModelMenuUsage === 'function') refreshModelMenuUsage();
+            }, function() {});
+        } catch (e) {}
+    }
 
     // Tier aliases hydrate lazily from IDB (subAgentTierAliases === null until
     // loadTierAliases runs). First open: kick hydration, then refresh the tier
@@ -1226,32 +1276,158 @@ function addModelFromMenu(event) {
 }
 
 function modelMenuOAuthToggle() {
+    var returnFocus = document.activeElement;
     _closeModelMenu();
     if (llmConnectionStatus === 'connected') {
         chrome.runtime.sendMessage({ type: 'claude-oauth-logout' }, function(response) {
             // A8A-02: an unreachable SW (lastError) or a handler error is a failed logout, not a success.
             var err = chrome.runtime.lastError ? chrome.runtime.lastError.message : (response && response.error);
+            closeClaudeBrowserModal();
             updateClaudeOAuthStatus();
             if (err) showSnackbar(t('Log out failed: {error}', { error: err }), 'error');
             else showSnackbar(t('Logged out from Claude'), 'info');
         });
     } else {
-        startClaudeOAuthLogin();
+        startClaudeOAuthLogin(returnFocus);
     }
 }
+
+var _claudeLoginGeneration = 0;
+var _claudeBrowserTimer = null;
+var _claudeBrowserKeyHandler = null;
+var _claudeBrowserReturnFocus = null;
 
 // Login-only Claude OAuth flow — used by the model menu's "Log in" row, the
 // pill's Connect button (modelPillLoginClick) and the not-logged-in error
 // toast's Log in action (snackbarLoginClick, ui/220-notification-system.js).
-// The pill dot refreshes via updateClaudeOAuthStatus in the callback.
-function startClaudeOAuthLogin() {
+// Launches the interactive browser OAuth flow and shows the waiting modal with
+// an optional manual CODE#STATE fallback.
+function startClaudeOAuthLogin(returnFocusEl) {
+    var loginGeneration = ++_claudeLoginGeneration;
+    _claudeBrowserReturnFocus = returnFocusEl || document.activeElement;
+    var p = getProviderById(currentProvider);
+    if (p && p.isClaudeOAuth) setLLMConnectionStatus('pending');
     showSnackbar(t('Logging in to Claude...'), 'info');
     chrome.runtime.sendMessage({ type: 'claude-oauth-login' }, function(response) {
-        if (chrome.runtime.lastError) { showSnackbar(t('Sign-in error: {error}', { error: chrome.runtime.lastError.message }), 'error'); }
-        else if (response && response.error) { showSnackbar(t('Sign-in error: {error}', { error: response.error }), 'error'); }
-        else { showSnackbar(t('Logged in to Claude Subscription'), 'success'); }
+        if (loginGeneration !== _claudeLoginGeneration) return;
+        if (chrome.runtime.lastError) {
+            closeClaudeBrowserModal();
+            showSnackbar(t('Sign-in error: {error}', { error: chrome.runtime.lastError.message }), 'error');
+        } else if (response && response.error) {
+            closeClaudeBrowserModal();
+            showSnackbar(t('Sign-in error: {error}', { error: response.error }), 'error');
+        } else if (response && response.pending && response.method === 'browser') {
+            showClaudeBrowserModal(response);
+        } else {
+            closeClaudeBrowserModal();
+            showSnackbar(t('Logged in to Claude Subscription'), 'success');
+        }
         updateClaudeOAuthStatus();
     });
+}
+
+function closeClaudeBrowserModal() {
+    var modal = document.getElementById('claude-browser-modal');
+    if (modal) {
+        var input = modal.querySelector('input');
+        if (input) input.value = '';
+        modal.remove();
+    }
+    if (_claudeBrowserTimer) clearInterval(_claudeBrowserTimer);
+    _claudeBrowserTimer = null;
+    if (_claudeBrowserKeyHandler) document.removeEventListener('keydown', _claudeBrowserKeyHandler);
+    _claudeBrowserKeyHandler = null;
+    if (_claudeBrowserReturnFocus && document.contains(_claudeBrowserReturnFocus)) _claudeBrowserReturnFocus.focus();
+    _claudeBrowserReturnFocus = null;
+}
+
+function cancelClaudeBrowserLogin() {
+    _claudeLoginGeneration++;
+    _oauthStatusGeneration++;
+    closeClaudeBrowserModal();
+    chrome.runtime.sendMessage({ type: 'claude-oauth-browser-cancel' }, function(response) {
+        if (chrome.runtime.lastError || !response || response.error) {
+            showSnackbar('Could not cancel Claude sign-in. Close the claude.ai tab and try again.', 'error');
+        }
+        updateClaudeOAuthStatus();
+    });
+}
+
+function submitClaudeBrowserCode() {
+    var input = document.getElementById('claude-browser-code');
+    var feedback = document.getElementById('claude-browser-feedback');
+    if (!input || !input.value.trim()) return;
+    var code = input.value.trim();
+    input.value = '';
+    var button = document.getElementById('claude-browser-submit');
+    if (button) button.disabled = true;
+    if (feedback) feedback.textContent = '';
+    chrome.runtime.sendMessage({ type: 'claude-oauth-browser-complete', code: code }, function(response) {
+        if (!document.contains(feedback)) return;
+        if (button) button.disabled = !!input.disabled;
+        if (chrome.runtime.lastError || !response || response.error) {
+            feedback.textContent = (response && response.error) || 'Invalid or expired authorization code. Start a new sign-in and try again.';
+        } else {
+            closeClaudeBrowserModal();
+            showSnackbar(t('Logged in to Claude Subscription'), 'success');
+        }
+        updateClaudeOAuthStatus();
+    });
+    code = ''; // do not retain the local code beyond the transport call
+}
+
+function showClaudeBrowserModal(info) {
+    if (document.getElementById('claude-browser-modal')) return;
+    if (!_claudeBrowserReturnFocus) _claudeBrowserReturnFocus = document.activeElement;
+    var overlay = document.createElement('div');
+    overlay.id = 'claude-browser-modal';
+    overlay.className = 'modal-overlay show chatgpt-device-modal';
+    overlay.setAttribute('data-kbd-self-focus', ''); // manages its own focus (ui/320 manager skips it)
+    overlay.setAttribute('role', 'dialog');
+    overlay.setAttribute('aria-modal', 'true');
+    overlay.setAttribute('aria-labelledby', 'claude-browser-title');
+    overlay.innerHTML = '<div class="modal-dialog"><div class="modal-header" id="claude-browser-title">' + escapeHtml('Sign in to Claude') + '</div>' +
+        '<div class="modal-body"><p>' + escapeHtml('Complete sign-in in the claude.ai tab that just opened. AppAgent will finish automatically once you authorize.') + '</p>' +
+        '<p>' + escapeHtml('If automatic capture does not finish, copy the code from platform.claude.com/oauth/code/callback and paste it here (CODE#STATE) — never into chat.') + '</p>' +
+        '<label for="claude-browser-code">' + escapeHtml('Authorization code (optional fallback)') + '</label>' +
+        '<input id="claude-browser-code" class="form-input" type="password" autocomplete="off" spellcheck="false" placeholder="CODE#STATE">' +
+        '<button type="button" class="modal-btn secondary" id="claude-browser-submit">' + escapeHtml('Submit code') + '</button>' +
+        '<p id="claude-browser-expiry" class="chatgpt-device-expiry" aria-live="off"></p>' +
+        '<p id="claude-browser-feedback" role="status" aria-live="polite"></p></div>' +
+        '<div class="modal-actions"><button type="button" class="modal-btn primary" id="claude-browser-cancel">' + escapeHtml(t('Cancel sign-in')) + '</button></div></div>';
+    document.body.appendChild(overlay);
+    overlay.querySelector('#claude-browser-submit').addEventListener('click', submitClaudeBrowserCode);
+    overlay.querySelector('#claude-browser-code').addEventListener('keydown', function(event) {
+        if (event.key === 'Enter') { event.preventDefault(); submitClaudeBrowserCode(); }
+    });
+    overlay.querySelector('#claude-browser-cancel').addEventListener('click', cancelClaudeBrowserLogin);
+    overlay.addEventListener('click', function(event) { if (event.target === overlay) cancelClaudeBrowserLogin(); });
+    _claudeBrowserKeyHandler = function(event) {
+        if (event.key === 'Escape') { event.preventDefault(); cancelClaudeBrowserLogin(); return; }
+        if (event.key !== 'Tab') return;
+        var nodes = overlay.querySelectorAll('input:not([disabled]), button:not([disabled])');
+        var first = nodes[0], last = nodes[nodes.length - 1];
+        if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+        else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    };
+    document.addEventListener('keydown', _claudeBrowserKeyHandler);
+    var expiresAt = info && info.expiresAt;
+    function expiry() {
+        var expired = !expiresAt || expiresAt <= Date.now();
+        var text = expired ? 'Sign-in expired. Cancel and click Sign in to try again.'
+            : tn(Math.ceil((expiresAt - Date.now()) / 60000), 'Waiting for approval. Sign-in expires in {count} minute.', 'Waiting for approval. Sign-in expires in {count} minutes.');
+        var line = overlay.querySelector('#claude-browser-expiry');
+        if (line.textContent !== text) line.textContent = text;
+        if (expired) {
+            overlay.querySelector('#claude-browser-feedback').textContent = text;
+            overlay.querySelector('#claude-browser-submit').disabled = true;
+            overlay.querySelector('#claude-browser-code').disabled = true;
+            if (_claudeBrowserTimer) { clearInterval(_claudeBrowserTimer); _claudeBrowserTimer = null; }
+        }
+    }
+    _claudeBrowserTimer = setInterval(expiry, 10000);
+    expiry();
+    overlay.querySelector('#claude-browser-cancel').focus();
 }
 
 // Compact Connect button inside the model pill (#model-login-btn /
